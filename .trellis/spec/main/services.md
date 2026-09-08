@@ -147,6 +147,30 @@ let lastScan: { scanId: string; byId: Map<string, Cached> } | null = null;
 （`registered` / `same-content` / `same-name`），界面上置灰且默认不勾选，
 用户仍可手动选。三层都要拦：扫描标记、collect 批内去重、store 落库前再判一次。
 
+## OAuth 订阅账号身份 claim
+
+`openai-codex` 的 access token JWT 把身份与套餐拆在两个命名空间：
+
+- `https://api.openai.com/profile.email`：账号邮箱；
+- `https://api.openai.com/auth.chatgpt_plan_type`：ChatGPT 套餐；
+- 顶层 `email` 仅作为旧格式兼容回退，不能当作当前 token 的主路径。
+
+解析集中在 `src/main/services/oauthProviders.ts` 的 `identityFromCredential()`。只接受字符串字段，
+profile 缺失、不是对象或 email 类型错误时返回缺省身份，让 Renderer 沿用账号 key 兜底；不得为此
+新增网络请求，也不得记录 JWT payload 或身份字段值。
+
+```ts
+// Wrong：真实 OpenAI token 没有顶层 email，多个账号会退回 openai-codex#n。
+const email = claims.email;
+
+// Correct：真实 profile 优先，顶层字段仅兼容旧格式。
+const profileEmail = obj(claims['https://api.openai.com/profile']).email;
+const email = typeof profileEmail === 'string' ? profileEmail : claims.email;
+```
+
+回归测试必须使用真实的命名空间形状断言 `listOauthProviders()` 返回 `OauthAccount.email`，
+并单独保留顶层 `email` 兼容用例；fixture 不得读取本机 `auth.json` 或包含真实 token。
+
 ## 网络请求按协议分派
 
 `providerApi.ts` 按 `ModelApiKind` 分派 URL、请求头和请求体。约定：

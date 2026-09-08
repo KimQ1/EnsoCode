@@ -51,8 +51,8 @@ beforeAll(() => {
       'openai-codex': {
         type: 'oauth',
         access: fakeJwt({
-          email: 'user@example.com',
           'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' },
+          'https://api.openai.com/profile': { email: 'user@example.com' },
         }),
         refresh: 'r3',
         expires,
@@ -96,13 +96,35 @@ describe('listOauthProviders 的账号枚举', () => {
     ).toBe(true);
   });
 
-  it('access token 是 JWT 时，email 与套餐不发网络请求就能读出来', async () => {
+  it('OpenAI access token 的 profile claim 包含 email 时不发网络请求就能读出来', async () => {
     const { listOauthProviders } = await import('./oauthProviders');
     const providers = await listOauthProviders();
     const codex = providers.find((provider) => provider.id === 'openai-codex');
     expect(codex?.accounts).toEqual([
       { key: 'openai-codex', providerId: 'openai-codex', email: 'user@example.com', plan: 'plus' },
     ]);
+  });
+
+  it('OpenAI access token 的顶层 email 保持兼容', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 'legacy@example.com',
+          'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts[0]?.email).toBe('legacy@example.com');
+    } finally {
+      restore();
+    }
   });
 
   it('未登录的 provider 是空 accounts 数组，api_key 凭证不算订阅账号', async () => {
