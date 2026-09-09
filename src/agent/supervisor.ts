@@ -107,6 +107,7 @@ import { applyHashlineSessionTools } from './hashline/sessionTools';
 import { InMemorySnapshotStore } from './hashline/snapshots';
 import { wrapHashlineEditDefinition } from './hashline/tools';
 import { withHashlineWrite } from './hashline/withWrite';
+import { type ContextMessage, pruneHistoricalImages } from './imageContext';
 import { McpManager } from './mcp';
 import { createMessageCoworkerTool } from './messageCoworker';
 import { createMessageMainTool } from './messageMain';
@@ -228,6 +229,7 @@ interface ManagedSession {
   /** 绝对消息 index 口径：压完那刻 messages.length（须在 reconcileMessages 之后取） */
   compactionNoticeAt?: number;
   subagents: Map<string, SubagentInfo>;
+  subagentAborts: Map<string, () => void>;
   factory?: SessionFactory;
   parentId?: string;
   coworkerName?: string;
@@ -303,9 +305,21 @@ function createSessionResourceLoader(options: {
     noSkills: options.noSkills,
     ...(options.noExtensions ? { noExtensions: true } : {}),
     ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
-    ...(!options.noExtensions && (options.exploreFold || options.smartCompactEnabled)
-      ? {
-          extensionFactories: [
+    // noExtensions 只挡磁盘上的项目/全局扩展；inline factory 不受影响，图片修剪对所有会话生效
+    extensionFactories: [
+      {
+        name: 'image-context',
+        hidden: true,
+        factory: (pi) => {
+          pi.on('context', (event) => ({
+            messages: pruneHistoricalImages(
+              event.messages as unknown as ContextMessage[]
+            ) as unknown as typeof event.messages,
+          }));
+        },
+      } satisfies InlineExtension,
+      ...(!options.noExtensions && (options.exploreFold || options.smartCompactEnabled)
+        ? [
             ...(options.exploreFold
               ? [
                   {
@@ -329,9 +343,9 @@ function createSessionResourceLoader(options: {
                   }),
                 ]
               : []),
-          ],
-        }
-      : {}),
+          ]
+        : []),
+    ],
     agentsFilesOverride: options.remoteAgentsFiles
       ? () => ({
           agentsFiles: [
@@ -564,6 +578,8 @@ export class SessionSupervisor {
     // 先收掉整棵子会话（coworker/child 都以 `${parentId}::` 为键前缀）
     for (const [id, child] of [...this.sessions]) {
       if (!id.startsWith(`${parentId}::`)) continue;
+      for (const abort of child.subagentAborts.values()) abort();
+      child.subagentAborts.clear();
       child.gate.cancelAll();
       child.asks.cancelAll();
       child.ensoApp?.cancelAll('Parent released');
@@ -578,6 +594,8 @@ export class SessionSupervisor {
       this.settleRound(child);
     }
     managed.coworkers.clear();
+    for (const abort of managed.subagentAborts.values()) abort();
+    managed.subagentAborts.clear();
     managed.gate.cancelAll();
     managed.asks.cancelAll();
     managed.ensoApp?.cancelAll('Session released');
@@ -966,6 +984,11 @@ export class SessionSupervisor {
         this.must(command.identity);
         this.bgTasks.stop(command.taskId);
         return;
+      case 'subagent-stop': {
+        const managed = this.must(command.identity);
+        managed.subagentAborts.get(command.agentId)?.();
+        return;
+      }
       case 'fork': {
         const managed = this.must(command.identity);
         if (managed.status !== 'idle' || managed.childIdentity) {
@@ -1556,6 +1579,12 @@ export class SessionSupervisor {
           agent,
         });
       },
+      registerAbort: (id, abort) => {
+        const managed = managedRef ?? this.sessions.get(sessionId);
+        if (!managed) return;
+        if (abort) managed.subagentAborts.set(id, abort);
+        else managed.subagentAborts.delete(id);
+      },
     });
     // 模型常把 spawn 与 send/wait 放进同一批并行工具调用:后者按名字等 spawn 落地再解析。
     // 无 pending 时同步解析,避免多一跳微任务(parentWaiting 等状态位要在调用当刻立起)
@@ -1772,6 +1801,7 @@ export class SessionSupervisor {
       pendingTaskReminders: [],
       roundWaiters: new Set(),
       subagents: new Map(),
+      subagentAborts: new Map(),
       coworkers: new Map(),
       lastActivityAt: Date.now(),
       contextUsage: new UsageTracker(),

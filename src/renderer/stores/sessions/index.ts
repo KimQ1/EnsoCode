@@ -68,6 +68,7 @@ import {
 } from './messageCache';
 import { migrateSessions, SESSIONS_VERSION } from './migrate';
 import { cachedPartializeSessions } from './persistSnapshot';
+import { staleArchivedConversationIdsToDelete, staleUnarchivedConversationIds } from './pinned';
 import { remapConversationProjectIds } from './projectAuthorityRemap';
 import {
   applyAgentEvent,
@@ -277,6 +278,10 @@ interface SessionsState {
   clearTitleSummaryState(): void;
   /** 切换会话归档(归档时同时清置顶) */
   toggleArchiveConversation(id: string): void;
+  /** 闲置自动归档；清理已合并开时对候选隔离会话先 cleanup 再归档 */
+  autoArchiveStaleConversations(now?: number): Promise<void>;
+  /** 归档超期自动删除：days<=0 no-op，否则对候选走 removeConversation */
+  autoDeleteStaleArchived(now?: number): void;
   dispatchAgent(
     typeKey: AgentTypeKey,
     task: AgentDispatchTask,
@@ -1110,7 +1115,8 @@ export const useSessionsStore = create<SessionsState>()(
             if (next === conversation) return state;
             return patch(state, id, {
               ...next,
-              sessionFile: event.sessionFile,
+              // 与 Main 同款守卫：空值不覆写，否则 resume 路径丢失 → 重启后历史无法找回
+              ...(event.sessionFile ? { sessionFile: event.sessionFile } : {}),
               ...(event.contextWindow !== undefined ? { contextWindow: event.contextWindow } : {}),
               ...(event.occupancy ? { occupancy: event.occupancy } : {}),
             });
@@ -1834,6 +1840,82 @@ export const useSessionsStore = create<SessionsState>()(
               ? patch(state, id, { archived: undefined, archivedAt: undefined })
               : patch(state, id, { archived: true, pinned: undefined, archivedAt: Date.now() });
           });
+        },
+
+        async autoArchiveStaleConversations(now = Date.now()) {
+          const idleDays = useSettingsStore.getState().autoArchiveIdleDays;
+          if (!(idleDays > 0)) return;
+          const cleanupMerged = useSettingsStore.getState().autoArchiveMergedWorktrees;
+          const { order, conversations, activeId, worktreeStatuses } = get();
+          const ids = staleUnarchivedConversationIds({
+            order,
+            conversations,
+            now,
+            idleDays,
+            activeId,
+            cleanupMergedWorktrees: cleanupMerged,
+            worktreeStatuses,
+          });
+          if (ids.length === 0) return;
+          const archive = (id: string) => {
+            set((state) => {
+              const conversation = state.conversations[id];
+              if (!conversation || conversation.archived === true) return state;
+              return patch(state, id, {
+                archived: true,
+                archivedAt: now,
+                pinned: undefined,
+              });
+            });
+          };
+          const plain: string[] = [];
+          const isolated: string[] = [];
+          for (const id of ids) {
+            if (conversations[id]?.worktree) isolated.push(id);
+            else plain.push(id);
+          }
+          if (plain.length > 0) {
+            set((state) => {
+              let changed = false;
+              const next = { ...state.conversations };
+              for (const id of plain) {
+                const conversation = next[id];
+                if (!conversation || conversation.archived === true) continue;
+                next[id] = {
+                  ...conversation,
+                  archived: true,
+                  archivedAt: now,
+                  pinned: undefined,
+                };
+                changed = true;
+              }
+              return changed ? { conversations: next } : state;
+            });
+          }
+          for (const id of isolated) {
+            const conversation = get().conversations[id];
+            if (!conversation?.worktree || conversation.archived === true) continue;
+            const status = worktreeStatuses[id];
+            if (status?.exists !== false) {
+              const error = await get().cleanupWorktree(id);
+              if (error) continue;
+            }
+            archive(id);
+          }
+        },
+
+        autoDeleteStaleArchived(now = Date.now()) {
+          const days = useSettingsStore.getState().autoDeleteArchivedDays;
+          if (!(days > 0)) return;
+          const { order, conversations, activeId } = get();
+          const ids = staleArchivedConversationIdsToDelete(
+            order,
+            conversations,
+            days,
+            now,
+            activeId
+          );
+          for (const id of ids) get().removeConversation(id);
         },
 
         removeConversation(id) {
@@ -2811,7 +2893,10 @@ async function hydrateParentHistoryTail(conversationId: string): Promise<void> {
   parentTailInFlight.add(conversationId);
   try {
     const result = await read(conversationId);
-    if (!result.ok || result.messages.length === 0) return;
+    if (!result.ok || result.messages.length === 0) {
+      markParentHistoryAttempted(conversationId);
+      return;
+    }
     const latest = useSessionsStore.getState().conversations[conversationId];
     if (!latest || latest.parentId || hasAuthoritativeMessages(latest.messages)) return;
     const optimistic = latest.messages.filter((message) => message.optimistic);
@@ -2826,10 +2911,20 @@ async function hydrateParentHistoryTail(conversationId: string): Promise<void> {
       },
     });
   } catch {
-    // 尾巴失败不挡 resume；下次点开再试
+    // 尾巴失败不挡 resume；worker 快照仍能补回正文
+    markParentHistoryAttempted(conversationId);
   } finally {
     parentTailInFlight.delete(conversationId);
   }
+}
+
+/** 尾窗读不到就收口：否则 failed 会话会卡在 Preparing 永久转圈 */
+function markParentHistoryAttempted(conversationId: string): void {
+  useSessionsStore.setState((state) => {
+    const conversation = state.conversations[conversationId];
+    if (!conversation || conversation.historyLoadAttempted) return state;
+    return patch(state, conversationId, { historyLoadAttempted: true });
+  });
 }
 
 useSessionsStore.subscribe((state) => {
@@ -2840,10 +2935,11 @@ useSessionsStore.subscribe((state) => {
   window.electronAPI.agent.setViewedSession?.(viewed);
   stampViewDeparture(lastViewedAt, previousViewedId, viewed, Date.now());
   const conversation = viewed ? state.conversations[viewed] : undefined;
-  if (viewed && conversation && needsWorkerSnapshot(conversation)) {
+  if (viewed && conversation) {
+    // 历史补水不受 failed 门控：红字与历史同屏，而不是只剩红字
     if (needsHistoryHydration(conversation)) void hydrateParentHistoryTail(viewed);
     // worker 若还持有，快照比尾窗完整（审批 / 进行中轮次）；回空则由 sessionId 路由收回 started
-    void window.electronAPI.agent.requestSnapshot(viewed);
+    if (needsWorkerSnapshot(conversation)) void window.electronAPI.agent.requestSnapshot(viewed);
   }
   if (evictTimer) clearTimeout(evictTimer);
   evictTimer = setTimeout(() => {

@@ -1,5 +1,9 @@
 export type Locale = 'en' | 'zh';
 
+/** 「AI 自动配置」按钮召唤 Enso 时下发的完整提示词（key 即英文原文，中文见字典） */
+export const SUBAGENT_MODELS_CONFIGURE_PROMPT =
+  'Configure "Let the agent pick subagent models" for me. How it is used: when the main agent dispatches a subagent or coworker (built-in types: scout for read-only recon, reviewer for code review, tester for writing tests, worker for implementation), it reads each entry\'s description from the tool\'s model parameter to choose a model per subtask — so descriptions are decision rules, not marketing copy. Steps: 1) read the current entries and toggle state; 2) list providers with valid credentials and their enabled models, never invent models; 3) pick 2–4 models that cover: a cheap, fast, long-context model for recon / reading / summarizing; a strong reasoning model for review, architecture and hard debugging; a reliable coding model for implementation; 4) add what is missing, fix duplicates or unusable entries, then enable the toggle; 5) each description is one short sentence in my interface language: when to use it, relative cost / speed, one caveat. Finish by listing the final entries with the reason for each.';
+
 export const zhTranslations: Record<string, string> = {
   'Add to favorites': '添加收藏',
   Appearance: '外观',
@@ -167,6 +171,17 @@ export const zhTranslations: Record<string, string> = {
     '超过此时长没有 token 或工具结果就中止并重试。思考输出也算有输出。',
   Never: '永不',
   '{{count}} min': '{{count}} 分钟',
+  '{{count}} day': '{{count}} 天',
+  '{{count}} days': '{{count}} 天',
+  'Archive idle conversations': '归档闲置会话',
+  'Move conversations that have been idle this long into Archived. Does not delete them.':
+    '将闲置超过此天数的会话移入已归档，不会删除。',
+  'Clean up merged worktrees': '清理已合并 worktree',
+  'When archiving idle conversations, also remove isolated worktrees that are merged and clean.':
+    '归档闲置会话时，一并清理已合并且干净的隔离 worktree。',
+  'Delete archived conversations after': '归档超过此天数后删除',
+  'Permanently delete conversations that have been archived longer than this. This cannot be undone. Choosing a positive value deletes already-overdue archived conversations immediately.':
+    '永久删除归档超过此天数的会话，不可恢复。改成正数会立即删除已超期的归档。',
   'No output for {{minutes}} minutes — retrying': '{{minutes}} 分钟没有输出，正在重试',
   'Stopped after repeated stalls': '多次卡住后已停止',
   'No file changes in this conversation yet.': '本会话还没有文件改动。',
@@ -615,6 +630,7 @@ export const zhTranslations: Record<string, string> = {
   'New group': '新建分组',
   'Edit group': '编辑分组',
   'Delete group': '删除分组',
+  'No color': '无颜色',
   'Project group': '项目组',
   'Groups organize projects in the sidebar.': '用分组整理侧栏里的项目。',
   'Move projects into this group': '选择要移入的项目',
@@ -828,8 +844,8 @@ export const zhTranslations: Record<string, string> = {
   Rename: '重命名',
   'Model selection': '模型选择',
   'Auto configure with AI': 'AI 自动配置',
-  'Ask Enso to configure subagent models':
-    '请帮我配置【允许子代理指定模型】（subagent-models），根据当前可用的模型服务，挑选适合子任务的便宜轻量模型和主力模型，并生成选型依据描述。',
+  [SUBAGENT_MODELS_CONFIGURE_PROMPT]:
+    '请帮我配置【允许子代理指定模型】。使用场景：主 Agent 派发 subagent/coworker（内置类型：scout 只读调研、reviewer 代码评审、tester 写测试、worker 实现）时，会从工具的 model 参数里读取每个条目的描述来给子任务挑模型，所以描述要写成选型规则，而不是宣传语。步骤：1）先读取当前条目和开关状态；2）列出凭证有效的模型服务及其已启用模型，不要凭空编造模型；3）挑 2–4 个模型覆盖：便宜、快、长上下文的用于调研/阅读/总结；推理最强的用于评审、架构和疑难排查；稳定的编码模型用于实现；4）补缺、去重、清理不可用条目，然后打开开关；5）每条描述用我的界面语言写一句话：什么时候用、相对成本/速度、一个注意点。最后列出最终条目及各自的选型理由。',
   'Must be picked by main agent': '必须由主 Agent 选择',
   'Picked by main agent': '由主 Agent 选择',
   'Fixed model': '自选固定模型',
@@ -863,6 +879,7 @@ export const zhTranslations: Record<string, string> = {
   'Read-only (read/grep/find/ls)': '只读(read/grep/find/ls)',
   Stop: '停止',
   'Stop task': '停止任务',
+  'Stop subagent': '停止子代理',
   'Dismiss coworker': '解雇 coworker',
   'Hire coworker': '雇佣 coworker',
   'Set a session goal (/goal <objective> · pause · resume · clear)':
