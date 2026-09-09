@@ -155,17 +155,23 @@ let lastScan: { scanId: string; byId: Map<string, Cached> } | null = null;
 - `https://api.openai.com/auth.chatgpt_plan_type`：ChatGPT 套餐；
 - 顶层 `email` 仅作为旧格式兼容回退，不能当作当前 token 的主路径。
 
-解析集中在 `src/main/services/oauthProviders.ts` 的 `identityFromCredential()`。只接受字符串字段，
-profile 缺失、不是对象或 email 类型错误时返回缺省身份，让 Renderer 沿用账号 key 兜底；不得为此
-新增网络请求，也不得记录 JWT payload 或身份字段值。
+解析集中在 `src/main/services/oauthProviders.ts` 的 `identityFromCredential()`。只接受字符串字段；profile
+缺失、为 null、不是普通对象或为数组，或其中的 `email` 类型错误时，先回退到有效的顶层 `email`；两者都无效才返回
+缺省身份，让 Renderer 沿用账号 key 兜底；不得为此新增网络请求，也不得记录 JWT payload 或身份字段值。
 
 ```ts
 // Wrong：真实 OpenAI token 没有顶层 email，多个账号会退回 openai-codex#n。
 const email = claims.email;
 
-// Correct：真实 profile 优先，顶层字段仅兼容旧格式。
+// Correct：真实 profile 优先；profile 无效时仅回退到字符串类型的顶层字段。
 const profileEmail = obj(claims['https://api.openai.com/profile']).email;
-const email = typeof profileEmail === 'string' ? profileEmail : claims.email;
+const legacyEmail = claims.email;
+const email =
+  typeof profileEmail === 'string'
+    ? profileEmail
+    : typeof legacyEmail === 'string'
+      ? legacyEmail
+      : undefined;
 ```
 
 回归测试必须使用真实的命名空间形状断言 `listOauthProviders()` 返回 `OauthAccount.email`，
