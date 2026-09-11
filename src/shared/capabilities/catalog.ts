@@ -1214,6 +1214,20 @@ export const CAPABILITY_CATALOG = {
     reason: 'Enso never receives browsing or page-interaction tools.',
     suggestedAction: 'Ask the coding agent to use the built-in browser.',
   }),
+  'coding-tools.isolated-sandbox': unavailable('coding-tools.isolated-sandbox', {
+    description: 'Run JavaScript that calls coding-session tools, including edits.',
+    risk: 'dangerous',
+    targetContext: 'origin-project',
+    reason: 'Enso never receives the coding-session isolated sandbox.',
+    suggestedAction: 'Ask the coding agent to use the isolated sandbox.',
+  }),
+  'coding-tools.memory': unavailable('coding-tools.memory', {
+    description: 'Search and capture durable memories across coding sessions.',
+    risk: 'dangerous',
+    targetContext: 'origin-project',
+    reason: 'Enso never receives the coding-session memory tools.',
+    suggestedAction: 'Ask the coding agent to search or capture the memory.',
+  }),
 } as const satisfies Record<ProductSurfaceId, CapabilitySpec<ProductSurfaceId, ProductSurfaceId>>;
 
 export type CapabilityCatalog = typeof CAPABILITY_CATALOG;

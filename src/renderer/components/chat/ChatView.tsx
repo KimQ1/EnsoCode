@@ -1,6 +1,6 @@
 import { ENSO_AGENT_TYPE_KEY } from '@shared/builtinAgents';
-import { conversationDotTone } from '@shared/conversationDotTone';
-import { resolveChatModel } from '@shared/defaultModel';
+import { conversationDotTone, conversationHasRunningChild } from '@shared/conversationDotTone';
+import { resolveChatModel, scopedDefaultModels } from '@shared/defaultModel';
 import type { AgentTypeMentionCandidate } from '@shared/types/mentions';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentChildOauthHost } from '@/components/agent/AgentChildOauthHost';
@@ -17,7 +17,7 @@ import {
 
 import { useSessionsStore } from '@/stores/sessions';
 import { chatSurfaceBusy, chatTimelineBusy } from '@/stores/sessions/messageCache';
-import { selectSidebarConversations } from '@/stores/sessions/sidebarDirectory';
+import { selectChatCandidateConversations } from '@/stores/sessions/sidebarDirectory';
 import { buildTimeline, terminalErrorText } from '@/stores/sessions/timeline';
 import { useSettingsStore } from '@/stores/settings';
 import { ApprovalBar } from './ApprovalBar';
@@ -45,6 +45,7 @@ export function ChatView() {
   const providers = useSettingsStore((state) => state.providers);
   const defaultModel = useSettingsStore((state) => state.defaultModel);
   const projects = useSettingsStore((state) => state.projects);
+  const projectGroups = useSettingsStore((state) => state.projectGroups);
   const parent = useSessionsStore((state) =>
     state.activeId ? state.conversations[state.activeId] : null
   );
@@ -56,30 +57,48 @@ export function ChatView() {
   });
 
   const oauthSnapshot = useOauthCredentialStore((state) => state.snapshot);
-  // @ chats 候选：同项目可回放的过去会话。ChatView 本就随 agent 事件重渲染，订阅全表不额外增负。
-  const allConversations = useSessionsStore((state) =>
-    selectSidebarConversations(state.conversations)
+  const candidateConversations = useSessionsStore((state) =>
+    selectChatCandidateConversations(state.conversations)
   );
+  const parentHasRunningChild = useSessionsStore((state) => {
+    const active = state.activeId ? state.conversations[state.activeId] : undefined;
+    return conversationHasRunningChild(active, state.conversations);
+  });
+  const parentId = parent?.id;
+  const parentProjectId = parent?.projectId;
   const chatCandidates = useMemo(
     () =>
-      parent
-        ? toChatMentionCandidates(
-            Object.values(allConversations).filter((entry) => entry.id),
-            parent.projectId,
-            parent.id
-          )
+      parentId !== undefined && parentProjectId !== undefined
+        ? toChatMentionCandidates(candidateConversations, parentProjectId, parentId)
         : [],
-    [allConversations, parent]
+    [candidateConversations, parentId, parentProjectId]
   );
   const enabledProviders = useMemo(
     () => usableProvidersForOauthSnapshot(providers, oauthSnapshot),
     [providers, oauthSnapshot]
   );
-  // 会话显式选择优先；没有 last* 的新草稿只使用全局默认，不再退化到 providers 第一项。
+  // 会话显式选择优先；新草稿沿 项目默认 → 分组默认 → 全局默认，不再退化到 providers 第一项。
+  const conversationProject = useMemo(
+    () => projects.find((entry) => entry.id === conversation?.projectId),
+    [conversation?.projectId, projects]
+  );
+  const parentProject = useMemo(
+    () => projects.find((entry) => entry.id === parent?.projectId),
+    [parent?.projectId, projects]
+  );
+  const conversationDefaults = useMemo(
+    () => scopedDefaultModels(conversationProject, projectGroups),
+    [conversationProject, projectGroups]
+  );
+  const parentDefaults = useMemo(
+    () => scopedDefaultModels(parentProject, projectGroups),
+    [parentProject, projectGroups]
+  );
   const modelResolution = useMemo(
     () =>
       resolveChatModel({
         defaultModel,
+        ...conversationDefaults,
         lastProviderId: conversation?.lastProviderId,
         lastModelId: conversation?.lastModelId,
         providers,
@@ -88,6 +107,7 @@ export function ChatView() {
     [
       conversation?.lastModelId,
       conversation?.lastProviderId,
+      conversationDefaults,
       defaultModel,
       oauthSnapshot,
       providers,
@@ -97,12 +117,20 @@ export function ChatView() {
     () =>
       resolveChatModel({
         defaultModel,
+        ...parentDefaults,
         lastProviderId: parent?.lastProviderId,
         lastModelId: parent?.lastModelId,
         providers,
         credentials: oauthCredentialContext(oauthSnapshot),
       }),
-    [defaultModel, oauthSnapshot, parent?.lastModelId, parent?.lastProviderId, providers]
+    [
+      defaultModel,
+      oauthSnapshot,
+      parent?.lastModelId,
+      parent?.lastProviderId,
+      parentDefaults,
+      providers,
+    ]
   );
   const parentSelectedModel =
     parentModelResolution.source === 'none'
@@ -127,7 +155,9 @@ export function ChatView() {
             modelResolution.reason === 'oauth-credentials-unloaded'
           ? t('Subscription credentials are loading. Choose an API-key model or wait, then retry.')
           : enabledProviders.length > 0
-            ? t('Choose a model for this conversation or set a global default before sending.')
+            ? t(
+                'Choose a model for this conversation or set a project, group, or global default before sending.'
+              )
             : t(
                 'No usable model is available. Configure provider credentials and enable a model first.'
               );
@@ -359,6 +389,7 @@ export function ChatView() {
               <StatusDot
                 status={conversation.spawning ? 'running' : conversation.status}
                 pendingAskCount={(conversation.pendingAsks ?? []).length}
+                hasRunningChild={conversation.id === parent.id && parentHasRunningChild}
               />
             </div>
           }
@@ -589,7 +620,15 @@ const ENSO_PREFILL_CANDIDATE: AgentTypeMentionCandidate = {
   canEdit: false,
 };
 
-function StatusDot({ status, pendingAskCount = 0 }: { status: string; pendingAskCount?: number }) {
-  const tone = conversationDotTone({ status, pendingAskCount });
+function StatusDot({
+  status,
+  pendingAskCount = 0,
+  hasRunningChild = false,
+}: {
+  status: string;
+  pendingAskCount?: number;
+  hasRunningChild?: boolean;
+}) {
+  const tone = conversationDotTone({ status, pendingAskCount, hasRunningChild });
   return <ConversationStatusIndicator tone={tone} size="md" title={status} />;
 }

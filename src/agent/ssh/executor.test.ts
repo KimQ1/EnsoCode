@@ -1,6 +1,15 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { createSshExecutor, resolveSshControlPath, type SpawnLike } from './executor';
+import {
+  createSshExecutor,
+  resolveSshControlPath,
+  type SpawnLike,
+  sshPasswordEnv,
+  writeSshAskpassHelper,
+} from './executor';
 
 class FakeProc extends EventEmitter {
   stdout = new EventEmitter();
@@ -30,17 +39,27 @@ function setup() {
     procs.push({ args: args as string[], proc });
     return proc as never;
   };
-  const executor = createSshExecutor('user@dev-box', '/tmp/ctl', spawnImpl);
+  const executor = createSshExecutor(
+    'user@dev-box',
+    '/tmp/ctl',
+    spawnImpl,
+    { auth: 'key' },
+    'darwin'
+  );
   return { procs, executor };
 }
 
 describe('resolveSshControlPath', () => {
   it('压到 /tmp/ec-ssh/<8位哈希>/%C,展开后仍低于 Darwin 104 字节上限', () => {
     const long = '/Users/j3n5en/Library/Application Support/enso-code/agent/pi-agent/ssh';
-    const resolved = resolveSshControlPath(long);
+    const resolved = resolveSshControlPath(long, 'darwin');
     expect(resolved).toMatch(/^\/tmp\/ec-ssh\/[0-9a-f]{8}\/%C$/);
-    expect(resolved.replace('%C', '0'.repeat(40)).length).toBeLessThan(104);
-    expect(resolveSshControlPath(long)).toBe(resolved);
+    expect(resolved?.replace('%C', '0'.repeat(40)).length).toBeLessThan(104);
+    expect(resolveSshControlPath(long, 'darwin')).toBe(resolved);
+  });
+
+  it('Windows 不启用 ControlMaster 套接字复用', () => {
+    expect(resolveSshControlPath('C:\\Users\\app\\ssh', 'win32')).toBeUndefined();
   });
 });
 
@@ -49,7 +68,7 @@ describe('SshExecutor', () => {
     const { procs, executor } = setup();
     const pending = executor.exec(['ls', '-la'], { cwd: '/srv/app' });
     const { args, proc } = procs[0];
-    expect(args.join(' ')).toContain(`ControlPath=${resolveSshControlPath('/tmp/ctl')}`);
+    expect(args.join(' ')).toContain(`ControlPath=${resolveSshControlPath('/tmp/ctl', 'darwin')}`);
     expect(args[args.length - 2]).toBe('user@dev-box');
     expect(args[args.length - 1]).toBe("cd '/srv/app' && 'ls' '-la'");
     proc.stdout.emit('data', Buffer.from('file1\n'));
@@ -133,6 +152,28 @@ describe('SshExecutor', () => {
     await expect(pending).resolves.toEqual({ exitCode: null });
   });
 
+  it('Windows 下 spawn ssh 不含 ControlMaster/ControlPath', async () => {
+    const procs: { args: string[]; proc: FakeProc }[] = [];
+    const spawnImpl: SpawnLike = (_cmd, args) => {
+      const proc = new FakeProc();
+      procs.push({ args: args as string[], proc });
+      return proc as never;
+    };
+    const executor = createSshExecutor(
+      'user@dev-box',
+      '/tmp/ctl',
+      spawnImpl,
+      { auth: 'key' },
+      'win32'
+    );
+    const pending = executor.exec(['ls']);
+    const joined = procs[0].args.join(' ');
+    expect(joined).not.toContain('ControlMaster');
+    expect(joined).not.toContain('ControlPath=');
+    procs[0].proc.emit('close', 0);
+    await pending;
+  });
+
   it('code 255(ssh 自身失败)保留 stderr 供上层归因', async () => {
     const { procs, executor } = setup();
     const pending = executor.exec(['ls']);
@@ -140,5 +181,30 @@ describe('SshExecutor', () => {
     proc.stderr.emit('data', Buffer.from('Permission denied (publickey)'));
     proc.emit('close', 255);
     await expect(pending).resolves.toMatchObject({ code: 255, stderr: /Permission denied/ });
+  });
+});
+
+describe('sshPasswordEnv / writeSshAskpassHelper', () => {
+  it('Unix 写可执行 askpass.sh，SSH_ASKPASS 指向脚本', () => {
+    const dir = path.join(tmpdir(), `enso-askpass-unix-${Date.now()}`);
+    const helper = writeSshAskpassHelper(dir, 'darwin');
+    expect(helper.endsWith('askpass.sh')).toBe(true);
+    expect(readFileSync(helper, 'utf8')).toContain('printf %s');
+    const env = sshPasswordEnv(dir, 'secret', 'darwin');
+    expect(env.SSH_ASKPASS).toBe(helper);
+    expect(env.ENSO_SSH_ASKPASS_PASSWORD).toBe('secret');
+    expect(env.SSH_ASKPASS_REQUIRE).toBe('force');
+  });
+
+  it('Windows 不把 .sh 交给 CreateProcess，改用 node --require', () => {
+    const dir = path.join(tmpdir(), `enso-askpass-win-${Date.now()}`);
+    const helper = writeSshAskpassHelper(dir, 'win32');
+    expect(helper.endsWith('askpass.cjs')).toBe(true);
+    expect(readFileSync(helper, 'utf8')).toContain('ENSO_SSH_ASKPASS_PASSWORD');
+    const env = sshPasswordEnv(dir, 'secret', 'win32');
+    expect(env.SSH_ASKPASS).toBe(process.execPath);
+    expect(env.ELECTRON_RUN_AS_NODE).toBe('1');
+    expect(env.NODE_OPTIONS).toContain('askpass.cjs');
+    expect(env.SSH_ASKPASS).not.toMatch(/\.sh$/);
   });
 });

@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -8,6 +7,9 @@ import {
   type SshExecArgsOptions,
   shellQuote,
 } from '@shared/ssh';
+import type { SshHostKeyChallenge } from '@shared/types';
+import { sshPasswordEnv } from '../../agent/ssh/executor';
+import { challengeFromScan, classifySshHostKeyFailure, scanSshHostKey } from './sshHostKey';
 
 const CONNECT_TIMEOUT_SECONDS = 10;
 const PROBE_TIMEOUT_MS = 15_000;
@@ -30,12 +32,24 @@ export function buildSshLoginProbeArgs(host: string, options: SshExecArgsOptions
   });
 }
 
+export type SshProbeError = { error: string; hostKey?: SshHostKeyChallenge };
+export type SshProbeOptions = SshExecArgsOptions & {
+  password?: string;
+  keyscanHost?: string;
+};
+
 export function classifySshProbeFailure(
   code: number,
   stderr: string,
   auth: SshExecArgsOptions['auth'] = 'key'
 ): string {
   if (code === 255) {
+    const hostKey = classifySshHostKeyFailure(stderr);
+    if (hostKey === 'changed') return 'SSH 主机密钥已变更:请核对 known_hosts 后再连接。';
+    if (hostKey === 'untrusted') return 'SSH 主机密钥未信任。';
+    if (/posix_spawnp|CreateProcessW failed|ssh_askpass/i.test(stderr)) {
+      return 'SSH 认证失败:无法调用密码助手。';
+    }
     if (/permission denied|authentication/i.test(stderr)) {
       return auth === 'password'
         ? 'SSH 认证失败:用户名或密码不正确。'
@@ -46,25 +60,31 @@ export function classifySshProbeFailure(
   return '远程路径不存在或不是目录。';
 }
 
+async function attachHostKey(
+  error: string,
+  stderr: string,
+  options: SshProbeOptions
+): Promise<SshProbeError> {
+  if (classifySshHostKeyFailure(stderr) !== 'untrusted' || !options.keyscanHost) {
+    return { error };
+  }
+  const scanned = await scanSshHostKey(options.keyscanHost, options.port ?? 22);
+  return {
+    error,
+    hostKey: challengeFromScan(options.keyscanHost, options.port ?? 22, scanned),
+  };
+}
+
 function probeEnv(password?: string): NodeJS.ProcessEnv | undefined {
   if (!password) return undefined;
-  const helper = path.join(tmpdir(), 'enso-ssh-askpass.sh');
-  writeFileSync(helper, '#!/bin/sh\nprintf %s "$ENSO_SSH_ASKPASS_PASSWORD"\n', { mode: 0o700 });
-  return {
-    ...process.env,
-    SSH_ASKPASS: helper,
-    SSH_ASKPASS_REQUIRE: 'force',
-    DISPLAY: process.env.DISPLAY || ':',
-    ENSO_SSH_ASKPASS_PASSWORD: password,
-    SSH_AUTH_SOCK: '',
-  };
+  return sshPasswordEnv(path.join(tmpdir(), 'enso-ssh-askpass'), password);
 }
 
 function runSshProbe(
   args: string[],
-  options: SshExecArgsOptions & { password?: string },
+  options: SshProbeOptions,
   onOtherCode: string
-): Promise<string | null> {
+): Promise<SshProbeError | null> {
   return new Promise((resolve) => {
     execFile(
       'ssh',
@@ -76,9 +96,12 @@ function runSshProbe(
           typeof (error as { code?: unknown }).code === 'number'
             ? ((error as { code?: number }).code as number)
             : 255;
-        if ((error as { killed?: boolean }).killed) return resolve('连接远程主机超时。');
-        if (code === 255) return resolve(classifySshProbeFailure(code, stderr ?? '', options.auth));
-        resolve(onOtherCode);
+        if ((error as { killed?: boolean }).killed) {
+          return resolve({ error: '连接远程主机超时。' });
+        }
+        const message =
+          code === 255 ? classifySshProbeFailure(code, stderr ?? '', options.auth) : onOtherCode;
+        void attachHostKey(message, stderr ?? '', options).then(resolve);
       }
     );
   });
@@ -87,8 +110,8 @@ function runSshProbe(
 export function sshProbeDirectory(
   host: string,
   remotePath: string,
-  options: SshExecArgsOptions & { password?: string } = {}
-): Promise<string | null> {
+  options: SshProbeOptions = {}
+): Promise<SshProbeError | null> {
   return runSshProbe(
     buildSshProbeArgs(host, remotePath, options),
     options,
@@ -119,8 +142,11 @@ export function parseSshListDirsOutput(stdout: string): { path: string; dirs: st
 export function sshListRemoteDirs(
   host: string,
   path: string | undefined,
-  options: SshExecArgsOptions & { password?: string } = {}
-): Promise<{ ok: true; path: string; dirs: string[] } | { ok: false; error: string }> {
+  options: SshProbeOptions = {}
+): Promise<
+  | { ok: true; path: string; dirs: string[] }
+  | { ok: false; error: string; hostKey?: SshHostKeyChallenge }
+> {
   const args = buildSshExecArgs(host, buildRemoteCommand(buildSshListDirsScript(path)), {
     connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
     ...options,
@@ -139,13 +165,14 @@ export function sshListRemoteDirs(
             typeof (error as { code?: unknown }).code === 'number'
               ? ((error as { code?: number }).code as number)
               : 255;
-          return resolve({
-            ok: false,
-            error:
-              code === 255
-                ? classifySshProbeFailure(code, stderr ?? '', options.auth)
-                : '远程路径不存在或不是目录。',
-          });
+          const message =
+            code === 255
+              ? classifySshProbeFailure(code, stderr ?? '', options.auth)
+              : '远程路径不存在或不是目录。';
+          void attachHostKey(message, stderr ?? '', options).then((failure) =>
+            resolve({ ok: false, ...failure })
+          );
+          return;
         }
         const parsed = parseSshListDirsOutput(stdout ?? '');
         resolve(parsed ? { ok: true, ...parsed } : { ok: false, error: '远程命令输出异常。' });
@@ -156,7 +183,7 @@ export function sshListRemoteDirs(
 
 export function sshProbeLogin(
   host: string,
-  options: SshExecArgsOptions & { password?: string } = {}
-): Promise<string | null> {
+  options: SshProbeOptions = {}
+): Promise<SshProbeError | null> {
   return runSshProbe(buildSshLoginProbeArgs(host, options), options, '远程命令执行失败。');
 }

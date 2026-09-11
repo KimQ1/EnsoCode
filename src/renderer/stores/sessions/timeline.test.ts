@@ -5,6 +5,7 @@ import {
   foldTimeline,
   historyPageChrome,
   isReadOnlyCommand,
+  parseSandboxOutput,
   type TimelineItem,
   terminalErrorText,
 } from './timeline';
@@ -64,6 +65,51 @@ describe('buildTimeline', () => {
       summary: 'a.ts',
       output: 'file body',
       state: 'ok',
+    });
+  });
+
+  it('exec 摘要用首行 JS，source 保留全文，结果 JSON 解析为 value/calls', () => {
+    const code = 'const pkg = await read({ path: "package.json" });\nreturn pkg;';
+    const output = JSON.stringify({
+      status: 'completed',
+      value: { ok: true },
+      calls: [
+        { name: 'read', ok: true },
+        { name: 'ls', ok: true },
+      ],
+    });
+    const timeline = buildTimeline(
+      [
+        user('试试 code mode'),
+        {
+          role: 'assistant',
+          content: [{ type: 'toolCall', id: 'e1', name: 'exec', arguments: { code } }],
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'e1',
+          toolName: 'exec',
+          isError: false,
+          content: [{ type: 'text', text: output }],
+        },
+      ],
+      false
+    );
+    expect(timeline[1]).toMatchObject({
+      kind: 'tool',
+      name: 'exec',
+      summary: 'const pkg = await read({ path: "package.json" });',
+      source: code,
+      output,
+      state: 'ok',
+    });
+    expect(parseSandboxOutput(output)).toEqual({
+      status: 'completed',
+      value: { ok: true },
+      calls: [
+        { name: 'read', ok: true },
+        { name: 'ls', ok: true },
+      ],
     });
   });
 
@@ -517,7 +563,7 @@ describe('buildTimeline', () => {
     expect(timeline).toMatchObject([{ kind: 'thinking', text: '正在想', streaming: true }]);
   });
 
-  it('多 step 轮次：末 step 的 perf 带整轮总耗时 turnMs（首 step 开始→末 step 完成），中间 step 不带', () => {
+  it('多 step 轮次：末 step 的 turnMs 累计模型与工具活跃用时，中间 step 不带', () => {
     const timeline = buildTimeline(
       [
         user('改代码'),
@@ -535,6 +581,7 @@ describe('buildTimeline', () => {
           toolCallId: 't1',
           toolName: 'read',
           isError: false,
+          toolDurationMs: 30_000,
           content: [{ type: 'text', text: 'body' }],
         },
         {
@@ -550,7 +597,47 @@ describe('buildTimeline', () => {
     expect(texts).toHaveLength(2);
     expect(texts[0]).toMatchObject({ perf: { runMs: 2_000 } });
     expect(texts[0].kind === 'text' && texts[0].perf?.turnMs).toBeUndefined();
-    expect(texts[1]).toMatchObject({ perf: { runMs: 27_000, turnMs: 86_000 } });
+    // 模型 2s + 工具 30s + 模型 27s；中间 27s 空档不计。
+    expect(texts[1]).toMatchObject({ perf: { runMs: 27_000, turnMs: 59_000 } });
+  });
+
+  it('整轮总用时不包含等待 ask_user 回答的时间', () => {
+    const timeline = buildTimeline(
+      [
+        user('先问我再继续'),
+        {
+          role: 'assistant',
+          stopReason: 'toolUse',
+          duration: 2_000,
+          timing: { stepStartMs: 1_000, completedMs: 3_000 },
+          content: [
+            {
+              type: 'toolCall',
+              id: 'ask-1',
+              name: 'ask_user',
+              arguments: { question: '继续吗？' },
+            },
+          ],
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'ask-1',
+          toolName: 'ask_user',
+          toolDurationMs: 20 * 60_000,
+          content: [{ type: 'text', text: '继续' }],
+        },
+        {
+          role: 'assistant',
+          stopReason: 'stop',
+          duration: 3_000,
+          timing: { stepStartMs: 20 * 60_000 + 3_000, completedMs: 20 * 60_000 + 6_000 },
+          content: [{ type: 'text', text: '完成' }],
+        },
+      ],
+      false
+    );
+    const lastText = timeline.findLast((item) => item.kind === 'text');
+    expect(lastText).toMatchObject({ perf: { runMs: 3_000, turnMs: 5_000 } });
   });
 
   it('单 step 轮次不带 turnMs（与 runMs 重复）；新一轮 user 消息重置轮起点', () => {
@@ -1079,6 +1166,13 @@ describe('工具路径摘要相对化', () => {
 
   it('cwd 本身显示为 .', () => {
     expect(tool({ path: cwd }, cwd)).toMatchObject({ summary: '.' });
+  });
+
+  it('Windows 盘符路径相对 POSIX 项目 cwd', () => {
+    expect(tool({ path: 'D:/root/semble/README.md' }, '/root/semble')).toMatchObject({
+      summary: 'README.md',
+    });
+    expect(tool({ path: 'D:\\root\\semble' }, '/root/semble')).toMatchObject({ summary: '.' });
   });
 
   it('command 不受影响', () => {

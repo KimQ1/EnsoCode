@@ -72,6 +72,7 @@ export function registerSshConnectionHandlers(): void {
         auth: secret.auth,
         port: secret.port,
         password: secret.password,
+        keyscanHost: secret.host,
       });
     }
   );
@@ -86,7 +87,26 @@ export function registerSshConnectionHandlers(): void {
       auth: secret.auth,
       port: secret.port,
       password: secret.password,
+      keyscanHost: secret.host,
     });
-    return failure ? { ok: false, error: failure } : { ok: true };
+    return failure ? { ok: false, ...failure } : { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SSH_CONNECTIONS_TRUST_HOST, async (event, id: unknown) => {
+    if (!isTrustedWindow(event.sender.id) || typeof id !== 'string') {
+      return { ok: false, error: 'Invalid request.' };
+    }
+    const secret = getSshConnectionStore().getSecret(id);
+    if (!secret) return { ok: false, error: '连接不存在。' };
+    const failure = await sshProbeLogin(resolveSshTarget(secret), {
+      auth: secret.auth,
+      port: secret.port,
+      password: secret.password,
+      strictHostKeyChecking: 'accept-new',
+    });
+    if (!failure || (!failure.hostKey && !/主机密钥未信任/.test(failure.error))) {
+      return { ok: true };
+    }
+    return { ok: false, error: failure.error };
   });
 }

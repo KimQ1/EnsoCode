@@ -1,7 +1,7 @@
 /**
- * worker 内的 SSH 执行器:系统 ssh 子进程 + ControlMaster 连接复用。
- * 每个远程会话持有一个实例;ControlPath 按 host 哈希(%C)落在 controlDir,
- * 同 host 多会话自然共享一条真连接,worker 退出后 ControlPersist 到期自动断。
+ * worker 内的 SSH 执行器:系统 ssh 子进程。非 Windows 启用 ControlMaster 连接复用;
+ * ControlPath 按 host 哈希(%C)落在 controlDir,同 host 多会话共享一条真连接,
+ * worker 退出后 ControlPersist 到期自动断。Windows OpenSSH 不支持 Unix socket,禁用复用。
  */
 
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -45,17 +45,42 @@ export type SpawnLike = (
   options?: { env?: NodeJS.ProcessEnv }
 ) => ChildProcess;
 
-export function writeSshAskpassHelper(dir: string): string {
+export function writeSshAskpassHelper(dir: string, platform = process.platform): string {
   mkdirSync(dir, { recursive: true });
+  if (platform === 'win32') {
+    const file = path.join(dir, 'askpass.cjs');
+    writeFileSync(
+      file,
+      "process.stdout.write(process.env.ENSO_SSH_ASKPASS_PASSWORD ?? '');\nprocess.exit(0);\n"
+    );
+    return file;
+  }
   const file = path.join(dir, 'askpass.sh');
   writeFileSync(file, '#!/bin/sh\nprintf %s "$ENSO_SSH_ASKPASS_PASSWORD"\n', { mode: 0o700 });
   return file;
 }
 
-export function sshPasswordEnv(dir: string, password: string): NodeJS.ProcessEnv {
+export function sshPasswordEnv(
+  dir: string,
+  password: string,
+  platform = process.platform
+): NodeJS.ProcessEnv {
+  const helper = writeSshAskpassHelper(dir, platform);
+  if (platform === 'win32') {
+    return {
+      ...process.env,
+      SSH_ASKPASS: process.execPath,
+      SSH_ASKPASS_REQUIRE: 'force',
+      DISPLAY: process.env.DISPLAY || ':',
+      ENSO_SSH_ASKPASS_PASSWORD: password,
+      SSH_AUTH_SOCK: '',
+      ELECTRON_RUN_AS_NODE: '1',
+      NODE_OPTIONS: `--require ${JSON.stringify(helper)}`,
+    };
+  }
   return {
     ...process.env,
-    SSH_ASKPASS: writeSshAskpassHelper(dir),
+    SSH_ASKPASS: helper,
     SSH_ASKPASS_REQUIRE: 'force',
     DISPLAY: process.env.DISPLAY || ':',
     ENSO_SSH_ASKPASS_PASSWORD: password,
@@ -80,7 +105,12 @@ export interface SshExecutor {
  * userData/agent/ssh/%C 在 macOS 上会直接超限导致全部 ssh 失败,
  * 所以 socket 落 /tmp/ec-ssh/<controlDir 8 位哈希>/%C(同 agentDir 复用同一条 multiplex)。
  */
-export function resolveSshControlPath(controlDir: string): string {
+export function resolveSshControlPath(
+  controlDir: string,
+  platform: NodeJS.Platform = process.platform
+): string | undefined {
+  // Windows OpenSSH 不支持 Unix socket ControlMaster,强制启用会 getsockname failed: Not a socket
+  if (platform === 'win32') return undefined;
   const digest = createHash('sha1').update(controlDir).digest('hex').slice(0, 8);
   const dir = `/tmp/ec-ssh/${digest}`;
   mkdirSync(dir, { recursive: true });
@@ -91,17 +121,18 @@ export function createSshExecutor(
   host: string,
   controlDir: string,
   spawnImpl: SpawnLike = spawn,
-  remote: Pick<AgentRemoteConfig, 'auth' | 'port' | 'password'> = { auth: 'key' }
+  remote: Pick<AgentRemoteConfig, 'auth' | 'port' | 'password'> = { auth: 'key' },
+  platform: NodeJS.Platform = process.platform
 ): SshExecutor {
-  const controlPath = resolveSshControlPath(controlDir);
+  const controlPath = resolveSshControlPath(controlDir, platform);
   const sshOptions = {
-    controlPath,
+    ...(controlPath ? { controlPath } : {}),
     auth: remote.auth,
     ...(remote.port ? { port: remote.port } : {}),
   };
   const env =
     remote.auth === 'password' && remote.password
-      ? sshPasswordEnv(controlDir, remote.password)
+      ? sshPasswordEnv(controlDir, remote.password, platform)
       : undefined;
 
   function run(command: string[] | string, options: SshExecOptions): Promise<SshExecRawResult> {

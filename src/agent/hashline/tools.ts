@@ -1,10 +1,12 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { EDIT_REPLACE_PROPERTIES } from '../editTool';
 import { applyHashlineToFile } from './applyToFile';
 import { classifyEditArgs } from './classify';
 import { createHashlineEditTool } from './editTool';
 import { formatHashlineHeader, formatNumberedLines } from './format';
 import {
   EDIT_INVALID_MESSAGE,
+  EDIT_MIXED_MESSAGE,
   HASHLINE_EDIT_DESCRIPTION,
   HASHLINE_EDIT_GUIDELINES,
   HASHLINE_PUT_EXAMPLE,
@@ -25,21 +27,7 @@ export const HASHLINE_EDIT_PARAMETERS = {
       type: 'string',
       description: `Hashline mode only (do not combine with edits/oldText/newText). First line: the exact [path#TAG] header from the latest read/grep/write. Then PUT blocks. ${HASHLINE_PUT_RULE} Example:\n${HASHLINE_PUT_EXAMPLE}`,
     },
-    path: { type: 'string', description: 'Replace mode: file path (pair with edits)' },
-    edits: {
-      type: 'array',
-      description:
-        'Replace mode: [{oldText, newText}] with exact, unique oldText. Do not combine with input.',
-      items: {
-        type: 'object',
-        properties: {
-          oldText: { type: 'string' },
-          newText: { type: 'string' },
-        },
-      },
-    },
-    oldText: { type: 'string', description: 'Legacy single-replace old text' },
-    newText: { type: 'string', description: 'Legacy single-replace new text' },
+    ...EDIT_REPLACE_PROPERTIES,
   },
 } as unknown as ToolDefinition['parameters'];
 
@@ -116,6 +104,7 @@ export function wrapHashlineEditDefinition<T extends { execute: (...args: never[
       execute: (async (toolCallId: string, params: unknown, ...rest: unknown[]) => {
         const kind = classifyEditArgs(params).kind;
         if (kind === 'replace') return execute(toolCallId, withoutInput(params), ...rest);
+        if (kind === 'mixed') throw new Error(EDIT_MIXED_MESSAGE);
         if (kind === 'hashline') {
           const input = String((params as { input?: string } | undefined)?.input ?? '');
           const applied = await applyHashlineToFile({
@@ -145,7 +134,7 @@ export function wrapHashlineEditDefinition<T extends { execute: (...args: never[
   );
 }
 
-/** 混发时 replace 优先：去掉 input，避免 stock edit 收到陆外字段 */
+/** replace 路径剥掉误带的 input，避免 stock edit 收到额外字段 */
 function withoutInput(params: unknown): unknown {
   if (!params || typeof params !== 'object' || !('input' in params)) return params;
   const { input: _input, ...rest } = params as Record<string, unknown>;

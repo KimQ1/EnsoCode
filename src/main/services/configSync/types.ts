@@ -67,11 +67,20 @@ export interface ConfigSyncState {
   subagentModels: SubagentModelEntry[];
   defaultModel?: DefaultModelRef | null;
   titleSummaryModel?: DefaultModelRef | null;
+  memoryDistillModel?: DefaultModelRef | null;
+  memoryChatModel?: string;
+  memoryLanguage?: string;
   smartCompactModel?: DefaultModelRef | null;
   approvalReviewer?: DefaultModelRef | null;
   titleSummaryEnabled?: boolean;
   smartCompactEnabled?: boolean;
   smartCompactMode?: SmartCompactMode;
+  /** 记忆向量模型注册表 id（`none` / `local:*` / `remote:*`） */
+  memoryEmbeddingModel?: string;
+  /** 会话结束后是否用 LLM 自动蒸馏长期记忆；缺省关 */
+  memoryDistillEnabled?: boolean;
+  /** 记忆创建后是否用 LLM 异步抽取实体图谱；缺省关 */
+  memoryKgEnabled?: boolean;
   defaultReasoningEnabled?: boolean;
   defaultThinkingLevel?: ThinkingLevel;
   defaultPresetId?: string;
@@ -119,6 +128,7 @@ export interface ConfigSyncState {
   expandLiveEdits?: boolean;
   chatWide?: boolean;
   notifyMainAgentOnly?: boolean;
+  maxActiveCoworkers?: number;
   generationStallTimeoutMin?: number;
   autoArchiveIdleDays?: number;
   autoArchiveMergedWorktrees?: boolean;

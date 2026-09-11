@@ -36,9 +36,14 @@ import { type TFunction, useI18n } from '@/i18n';
 import { addSidePanelChanges } from '@/lib/sidePanelDock';
 import { cn } from '@/lib/utils';
 import { useSessionsStore } from '@/stores/sessions';
+import {
+  canShowConversationRewind,
+  resolveRewindConfirm,
+} from '@/stores/sessions/conversationRewind';
 import { formatDuration, formatTokens } from '@/stores/sessions/stats';
-import { isReadOnlyTool, type TimelineItem } from '@/stores/sessions/timeline';
+import { isReadOnlyTool, parseSandboxOutput, type TimelineItem } from '@/stores/sessions/timeline';
 import { useSettingsStore } from '@/stores/settings';
+import { CodeBlock } from './CodeBlock';
 import { ConfirmDialog } from './ConfirmDialog';
 import { useChatHost } from './chatHost';
 import { EditDiff } from './EditDiff';
@@ -104,7 +109,9 @@ function itemEqual(prev: TimelineRowProps, next: TimelineRowProps): boolean {
         a.todos === b.todos &&
         a.durationMs === b.durationMs &&
         a.startedAt === b.startedAt &&
-        a.agentMeta === b.agentMeta
+        a.agentMeta === b.agentMeta &&
+        a.source === b.source &&
+        a.nestedPending === b.nestedPending
       );
     case 'tool-group':
       return (
@@ -658,13 +665,29 @@ function userIndexFromEndForTurn(
   return null;
 }
 
-function canBranchDisplayedSession(
+function canActOnDisplayedSession(
   state: ReturnType<typeof useSessionsStore.getState>,
-  host: ReturnType<typeof useChatHost>
+  host: ReturnType<typeof useChatHost>,
+  statusOk: (status: string) => boolean
 ) {
   if (host && !host.canRewind) return false;
   const conversation = displayedConversation(state);
-  return Boolean(conversation?.started && !conversation.spawning && conversation.status === 'idle');
+  return Boolean(conversation?.started && !conversation.spawning && statusOk(conversation.status));
+}
+
+/** 回退：failed 也可；未 ready 的 spawning / 冷会话走 store 唤醒，不在这里强行显示不安全入口 */
+function canRewindDisplayedSession(
+  state: ReturnType<typeof useSessionsStore.getState>,
+  host: ReturnType<typeof useChatHost>
+) {
+  return canShowConversationRewind(displayedConversation(state), host);
+}
+
+function canForkDisplayedSession(
+  state: ReturnType<typeof useSessionsStore.getState>,
+  host: ReturnType<typeof useChatHost>
+) {
+  return canActOnDisplayedSession(state, host, (status) => status === 'idle');
 }
 
 const userActionClass =
@@ -675,7 +698,7 @@ function ForkButton({ messageIndex }: { messageIndex: number }) {
   const { t } = useI18n();
   const host = useChatHost();
   const canFork = useSessionsStore((state) => {
-    if (!canBranchDisplayedSession(state, host)) return false;
+    if (!canForkDisplayedSession(state, host)) return false;
     const conversation = displayedConversation(state);
     return Boolean(conversation && !conversation.parentId && !conversation.historyOnly);
   });
@@ -700,22 +723,33 @@ function ForkButton({ messageIndex }: { messageIndex: number }) {
   );
 }
 
-/** 回退入口:仅 idle 且已 spawn 的会话显示;点击弹出「仅对话 / 对话+文件」二选,选后再确认 */
+/** 回退入口：已 spawn 非 spawning，或可 resume 的历史主会话。未恢复 coworker / remote / historyOnly 不显示；活 child 保持。 */
 function RewindButton({ messageIndex }: { messageIndex: number }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
-  /** 待确认的回退(值 = restoreFiles);null = 无 */
-  const [pendingRestoreFiles, setPendingRestoreFiles] = useState<boolean | null>(null);
+  /** 待确认的回退；绑打开时的会话，confirm 当时重算锚点 */
+  const [pending, setPending] = useState<{ restoreFiles: boolean; conversationId: string } | null>(
+    null
+  );
   const host = useChatHost();
-  const canRewind = useSessionsStore((state) => canBranchDisplayedSession(state, host));
+  const canRewind = useSessionsStore((state) => canRewindDisplayedSession(state, host));
   if (!canRewind) return null;
-  const rewind = (restoreFiles: boolean) => {
-    const state = useSessionsStore.getState();
-    const conversation = displayedConversation(state);
+  const queueRewind = (restoreFiles: boolean) => {
+    const conversation = displayedConversation(useSessionsStore.getState());
     if (!conversation) return;
-    const userIndexFromEnd = userIndexFromEndAt(conversation, messageIndex);
-    if (userIndexFromEnd === null) return;
-    state.rewind(conversation.id, userIndexFromEnd, restoreFiles);
+    setPending({ restoreFiles, conversationId: conversation.id });
+  };
+  const rewind = (restoreFiles: boolean, originId: string) => {
+    const state = useSessionsStore.getState();
+    const displayed = displayedConversation(state);
+    const target = resolveRewindConfirm(
+      originId,
+      displayed?.id,
+      state.conversations[originId],
+      messageIndex
+    );
+    if (!target) return;
+    state.rewind(target.conversationId, target.userIndexFromEnd, restoreFiles);
   };
   const options = [
     {
@@ -723,14 +757,14 @@ function RewindButton({ messageIndex }: { messageIndex: number }) {
       label: t('Conversation only'),
       desc: t('Rewind to this message'),
       restoreFiles: false,
-      action: () => setPendingRestoreFiles(false),
+      action: () => queueRewind(false),
     },
     {
       icon: History,
       label: t('Conversation + files'),
       desc: t('Rewind and restore files to before this turn'),
       restoreFiles: true,
-      action: () => setPendingRestoreFiles(true),
+      action: () => queueRewind(true),
     },
   ];
   return (
@@ -766,13 +800,13 @@ function RewindButton({ messageIndex }: { messageIndex: number }) {
         ))}
       </PopoverPopup>
       <ConfirmDialog
-        open={pendingRestoreFiles !== null}
+        open={pending !== null}
         onOpenChange={(dialogOpen) => {
-          if (!dialogOpen) setPendingRestoreFiles(null);
+          if (!dialogOpen) setPending(null);
         }}
         title={t('Rewind to this message?')}
         description={
-          pendingRestoreFiles
+          pending?.restoreFiles
             ? t(
                 'Later messages leave the current branch and working-tree files are restored to before this turn.'
               )
@@ -780,7 +814,7 @@ function RewindButton({ messageIndex }: { messageIndex: number }) {
         }
         confirmLabel={t('Rewind')}
         onConfirm={() => {
-          if (pendingRestoreFiles !== null) rewind(pendingRestoreFiles);
+          if (pending) rewind(pending.restoreFiles, pending.conversationId);
         }}
       />
     </Popover>
@@ -848,7 +882,7 @@ const secs = (ms: number): string => {
   const s = ms / 1000;
   return s < 10 ? String(Math.round(s * 10) / 10) : String(Math.round(s));
 };
-/** 末 step 读数：本 step 耗时 · TTFT · tok/s；多 step 轮次再附「总计 Xs」= 整轮墙钟（含工具执行） */
+/** 末 step 读数：本 step 耗时 · TTFT · tok/s；多 step 轮次再附「总计 Xs」= 整轮活跃用时 */
 function formatPerf(perf: TurnPerf, t: TFunction): string {
   const parts = [`${secs(perf.runMs)}s`];
   if (perf.ttftMs !== undefined) parts.push(`TTFT ${secs(perf.ttftMs)}s`);
@@ -1190,6 +1224,66 @@ function ToolContentScroller({
   );
 }
 
+function formatSandboxValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? '';
+  } catch {
+    return String(value);
+  }
+}
+
+function SandboxOutput({
+  source,
+  output,
+  view,
+}: {
+  source?: string | null;
+  output: string | null;
+  view: ReturnType<typeof parseSandboxOutput>;
+}) {
+  const value =
+    view?.status === 'completed' ? formatSandboxValue(view.value) : (view?.error ?? output);
+  return (
+    <div className="space-y-1 px-3 py-1">
+      {source ? <CodeBlock code={source} language="javascript" /> : null}
+      {view && view.calls.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {[...new Map(view.calls.map((call) => [call.name, call])).keys()].map((name) => {
+            const group = view.calls.filter((call) => call.name === name);
+            const failed = group.find((call) => !call.ok);
+            const label = `${name} ×${group.length}`;
+            return (
+              <span
+                key={name}
+                className={cn(
+                  'rounded-md border px-1.5 py-0.5 font-mono text-[10px]',
+                  failed ? 'border-destructive/40 text-destructive' : 'text-muted-foreground'
+                )}
+                title={group
+                  .map((call) => call.summary)
+                  .filter(Boolean)
+                  .join('\n')}
+              >
+                {failed ? `${label} · ${failed.error ?? 'error'}` : label}
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+      {value ? (
+        view?.status === 'completed' && typeof view.value !== 'string' ? (
+          <CodeBlock code={value} language="json" />
+        ) : (
+          <pre className="font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
+            {value}
+          </pre>
+        )
+      ) : null}
+    </div>
+  );
+}
+
 /** 单行工具摘要：状态点/图标 + 工具名 + 参数摘要；edit 展开为 diff,write 展开为写入内容,其余为输出 */
 function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
   const { t } = useI18n();
@@ -1198,7 +1292,14 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
   const compact = compactReadOnly && isReadOnlyTool(item);
   const hasDiff = Boolean(item.edits && item.edits.length > 0);
   const hasWrite = Boolean(item.writeContent);
-  const expandable = hasDiff || hasWrite || Boolean(item.output);
+  const sandbox = item.name === 'exec' ? parseSandboxOutput(item.output) : null;
+  const headerSummary =
+    item.nestedPending && item.state === 'running'
+      ? `${item.summary} · ${item.nestedPending} pending`
+      : sandbox?.calls.length && item.state !== 'error'
+        ? `${item.summary} · ${sandbox.calls.length} calls`
+        : item.summary;
+  const expandable = hasDiff || hasWrite || Boolean(item.output) || Boolean(item.source);
   // edit 的 diff 与 write 的内容只在本轮直播（running）且开启 expandLiveEdits 时默认展开；
   // 历史会话挂载时全部折叠——否则切会话时视口内成排 FileDiff 同步解析+高亮，
   // 主线程阻塞几秒白屏
@@ -1230,7 +1331,9 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
           )}
         >
           {(!compact || item.state !== 'ok') && <ToolStateIcon state={item.state} />}
-          <span className={cn('shrink-0', !compact && 'font-medium')}>{item.name}</span>
+          <span className={cn('shrink-0', !compact && 'font-medium')}>
+            {item.name === 'exec' ? t('Isolated sandbox') : item.name}
+          </span>
           {item.summary && (
             <>
               {!compact && <span className="text-muted-foreground/50">·</span>}
@@ -1241,7 +1344,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
                   item.state === 'error' ? 'text-destructive' : 'text-muted-foreground'
                 )}
               >
-                {item.state === 'error' && item.output ? firstLine(item.output) : item.summary}
+                {item.state === 'error' && item.output ? firstLine(item.output) : headerSummary}
               </span>
             </>
           )}
@@ -1297,7 +1400,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
           <ReadFileView path={item.summary} contents={item.writeContent} />
         </ToolContentScroller>
       )}
-      {expanded && !hasDiff && !hasWrite && item.output && (
+      {expanded && !hasDiff && !hasWrite && (item.output || item.source) && (
         <ToolContentScroller
           follow={item.state === 'running'}
           className={
@@ -1306,13 +1409,15 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
               : 'rounded-b-lg border-t border-border/60'
           }
         >
-          {item.name === 'bash' ? (
-            <TerminalOutput command={item.summary} output={item.output} />
+          {item.name === 'exec' ? (
+            <SandboxOutput source={item.source} output={item.output} view={sandbox} />
+          ) : item.name === 'bash' ? (
+            <TerminalOutput command={item.summary} output={item.output ?? ''} />
           ) : item.name === 'read' ? (
-            <ReadFileView path={item.summary} contents={item.output} />
+            <ReadFileView path={item.summary} contents={item.output ?? ''} />
           ) : item.name === 'subagent' && item.state !== 'error' ? (
             <div className="px-3 py-2 text-sm">
-              <Markdown text={item.output} />
+              <Markdown text={item.output ?? ''} />
             </div>
           ) : (
             <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">

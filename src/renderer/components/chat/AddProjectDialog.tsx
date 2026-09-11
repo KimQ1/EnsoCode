@@ -1,6 +1,7 @@
-import type { ProjectGroup, RecentProject } from '@shared/types';
+import type { ProjectGroup, RecentProject, SshHostKeyChallenge } from '@shared/types';
 import { Loader2 } from 'lucide-react';
 import * as React from 'react';
+import { hostKeyFromSshFailure, SshHostKeyDialog } from '@/components/chat/SshHostKeyDialog';
 import {
   Autocomplete,
   AutocompleteEmpty,
@@ -37,13 +38,19 @@ import { useSettingsStore } from '@/stores/settings';
 function RemoteDirBrowser({
   connectionId,
   initialPath,
+  hostKeyRetry = 0,
+  fallbackHost,
   onSelect,
   onClose,
+  onHostKey,
 }: {
   connectionId: string;
   initialPath?: string;
+  hostKeyRetry?: number;
+  fallbackHost?: { host: string; port?: number };
   onSelect: (path: string) => void;
   onClose: () => void;
+  onHostKey: (challenge: SshHostKeyChallenge) => void;
 }) {
   const { t } = useI18n();
   const [path, setPath] = React.useState<string | null>(null);
@@ -51,9 +58,14 @@ function RemoteDirBrowser({
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState('');
   const requestSeq = React.useRef(0);
+  const pathRef = React.useRef<string | null>(null);
+  const onHostKeyRef = React.useRef(onHostKey);
+  onHostKeyRef.current = onHostKey;
+  const fallbackHostRef = React.useRef(fallbackHost);
+  fallbackHostRef.current = fallbackHost;
 
   const load = React.useCallback(
-    (target?: string) => {
+    (target?: string, promptHostKey = true) => {
       const seq = ++requestSeq.current;
       setLoading(true);
       setError('');
@@ -63,10 +75,16 @@ function RemoteDirBrowser({
           if (seq !== requestSeq.current) return;
           if (result.ok) {
             setPath(result.path);
+            pathRef.current = result.path;
             setDirs(result.dirs);
-          } else {
-            setError(result.error);
+            return;
           }
+          const challenge = hostKeyFromSshFailure(result, fallbackHostRef.current);
+          if (challenge && promptHostKey) {
+            onHostKeyRef.current(challenge);
+            return;
+          }
+          setError(result.error);
         })
         .catch(() => {
           if (seq === requestSeq.current) setError(t('Failed to list remote directory.'));
@@ -84,6 +102,14 @@ function RemoteDirBrowser({
     const initial = initialRef.current;
     load(initial?.startsWith('/') ? initial : undefined);
   }, [load]);
+
+  React.useEffect(() => {
+    if (!hostKeyRetry) return;
+    load(
+      pathRef.current ?? (initialRef.current?.startsWith('/') ? initialRef.current : undefined),
+      false
+    );
+  }, [hostKeyRetry, load]);
 
   const parent = path && path !== '/' ? path.replace(/\/[^/]+$/, '') || '/' : null;
 
@@ -186,6 +212,11 @@ export function AddProjectDialog({
   const [groupId, setGroupId] = React.useState<string | undefined>(defaultGroupId);
   const [browserOpen, setBrowserOpen] = React.useState(false);
   const [recent, setRecent] = React.useState<RecentProject[]>([]);
+  const [formError, setFormError] = React.useState('');
+  const [hostKey, setHostKey] = React.useState<SshHostKeyChallenge | null>(null);
+  const [afterTrust, setAfterTrust] = React.useState<'submit' | 'browse' | null>(null);
+  const [hostKeyRetry, setHostKeyRetry] = React.useState(0);
+  const [trusting, setTrusting] = React.useState(false);
   const groupItems = React.useMemo(
     () => [
       { value: '', label: t('Ungrouped') },
@@ -202,6 +233,10 @@ export function AddProjectDialog({
     setSshPath('');
     setGroupId(defaultGroupId);
     setBrowserOpen(false);
+    setFormError('');
+    setHostKey(null);
+    setAfterTrust(null);
+    setHostKeyRetry(0);
     window.electronAPI.sshConnections
       .list()
       .then(setConnections)
@@ -241,21 +276,61 @@ export function AddProjectDialog({
       ? pathValue.trim().length > 0
       : sshConnectionId.length > 0 && sshPath.trim().startsWith('/');
 
+  const submitSsh = () => {
+    const connection = connections.find((item) => item.id === sshConnectionId);
+    onAdd({
+      path: sshPath.trim(),
+      sshConnectionId,
+      sshHost: connection?.name,
+      ...(groupId ? { groupId } : {}),
+    });
+    onOpenChange(false);
+  };
+
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
     if (!canSubmit) return;
-    if (mode === 'ssh') {
-      const connection = connections.find((item) => item.id === sshConnectionId);
-      onAdd({
-        path: sshPath.trim(),
-        sshConnectionId,
-        sshHost: connection?.name,
-        ...(groupId ? { groupId } : {}),
-      });
-    } else {
+    if (mode !== 'ssh') {
       onAdd({ path: pathValue.trim(), ...(groupId ? { groupId } : {}) });
+      onOpenChange(false);
+      return;
     }
-    onOpenChange(false);
+    setFormError('');
+    const connection = connections.find((item) => item.id === sshConnectionId);
+    void window.electronAPI.sshConnections.test(sshConnectionId).then((result) => {
+      if (!result.ok) {
+        const challenge = hostKeyFromSshFailure(result, connection);
+        if (challenge) {
+          setAfterTrust('submit');
+          setHostKey(challenge);
+          return;
+        }
+        setFormError(result.error);
+        return;
+      }
+      submitSsh();
+    });
+  };
+
+  const trustHost = async () => {
+    if (!hostKey) return;
+    setTrusting(true);
+    const trusted = await window.electronAPI.sshConnections.trustHost(sshConnectionId);
+    setTrusting(false);
+    if (!trusted.ok) {
+      setFormError(trusted.error || t('Could not save host key.'));
+      setHostKey(null);
+      setAfterTrust(null);
+      return;
+    }
+    const resume = afterTrust;
+    setHostKey(null);
+    setAfterTrust(null);
+    if (resume === 'browse') {
+      setHostKeyRetry((value) => value + 1);
+      return;
+    }
+    if (resume === 'submit') submitSsh();
   };
 
   return (
@@ -326,16 +401,23 @@ export function AddProjectDialog({
                   <RemoteDirBrowser
                     connectionId={sshConnectionId}
                     initialPath={sshPath.trim() || undefined}
+                    hostKeyRetry={hostKeyRetry}
+                    fallbackHost={connections.find((item) => item.id === sshConnectionId)}
                     onSelect={(selected) => {
                       setSshPath(selected);
                       setBrowserOpen(false);
                     }}
                     onClose={() => setBrowserOpen(false)}
+                    onHostKey={(challenge) => {
+                      setAfterTrust('browse');
+                      setHostKey(challenge);
+                    }}
                   />
                 )}
                 <p className="text-xs text-muted-foreground">
                   {t('Tools run on the remote host; chat history stays local.')}
                 </p>
+                {formError && <p className="text-destructive text-xs">{formError}</p>}
               </>
             ) : (
               <Field className="w-full">
@@ -410,6 +492,17 @@ export function AddProjectDialog({
           </DialogFooter>
         </form>
       </DialogContent>
+      <SshHostKeyDialog
+        challenge={hostKey}
+        nested
+        busy={trusting}
+        onTrust={() => void trustHost()}
+        onDismiss={() => {
+          if (trusting) return;
+          setHostKey(null);
+          setAfterTrust(null);
+        }}
+      />
     </Dialog>
   );
 }

@@ -22,6 +22,7 @@ import {
   isSameChildSessionIdentity,
   type SessionIdentity,
 } from '@shared/builtinAgents';
+import { DEFAULT_MAX_ACTIVE_COWORKERS } from '@shared/maxActiveCoworkers';
 import {
   findCatalogModelById,
   positiveContextWindow,
@@ -108,12 +109,14 @@ import { InMemorySnapshotStore } from './hashline/snapshots';
 import { wrapHashlineEditDefinition } from './hashline/tools';
 import { withHashlineWrite } from './hashline/withWrite';
 import { type ContextMessage, pruneHistoricalImages } from './imageContext';
+import { createIsolatedSandboxTool } from './isolatedSandbox';
 import { McpManager } from './mcp';
 import { createMessageCoworkerTool } from './messageCoworker';
 import { createMessageMainTool } from './messageMain';
 import { ParentNotifier } from './notify';
 import { projectMessage } from './projection';
 import { applyWorkerProxyEnv } from './proxyEnv';
+import { withReadTruncationMeta } from './readTruncation';
 import { projectMessages, projectResumeTail } from './resumeSnapshots';
 import {
   EVICTION_SWEEP_INTERVAL_MS,
@@ -129,6 +132,7 @@ import {
   type SshExecutor,
   sshPasswordEnv,
 } from './ssh/executor';
+import { rewriteRemoteWorkingDirectoryPrompt } from './ssh/posixPath';
 import { createRemoteGrepToolDefinition } from './ssh/remoteGrep';
 import { createRemoteOperations } from './ssh/remoteOperations';
 import {
@@ -153,7 +157,9 @@ import { createTodoTool } from './todo';
 import { BrowserInvoker, createBrowserTools, withNavigateApproval } from './tools/browser';
 import { createEnsoAppTool, EnsoAppInvoker } from './tools/ensoApp';
 import { createEnsoCapabilitiesTool } from './tools/ensoCapabilities';
+import { createMemoryTools, MemoryInvoker } from './tools/memory';
 import { transcriptMessages } from './transcript';
+import { WorkspaceSwitchGate, workspaceBranchContextExtension } from './workspaceSwitch';
 import { withWriteScope } from './writeScope';
 
 /** 子会话产物：实际 session、模型与精确工具集合。 */
@@ -210,6 +216,7 @@ interface ManagedSession {
   promptedRequestIds: Set<string>;
   ensoApp?: EnsoAppInvoker;
   browser?: BrowserInvoker;
+  memory?: MemoryInvoker;
   adaptiveDowngraded: boolean;
   /** 最近一次 auto_retry_start 携带的原始错误（取消重试时的终态错误文案） */
   lastRetryError?: string;
@@ -234,6 +241,9 @@ interface ManagedSession {
   parentId?: string;
   coworkerName?: string;
   pendingRole?: string;
+  pendingBranch?: string;
+  pendingBranchRequestId?: string;
+  pendingVerifications?: number;
   /** 最近一轮的完整摘要(不含 gate),供 coworker report/wait 取用;由 settleRound 在每轮终态统一记入 */
   lastRoundSummary?: string;
   /** 等待本轮终态(idle/failed/销毁)的回调;由 settleRound 统一触发 */
@@ -278,6 +288,7 @@ function sessionAgentsFilesOverride(
 }
 
 function createSessionResourceLoader(options: {
+  branchContext: InlineExtension;
   cwd: string;
   agentDir: string;
   noSkills: boolean;
@@ -287,6 +298,8 @@ function createSessionResourceLoader(options: {
   instruction?: { path: string; content: string };
   /** 远程会话:替换掉本地 cwd 扫描出的 AGENTS.md(cwd 在本机不存在),只用预取的远端文件 */
   remoteAgentsFiles?: Array<{ path: string; content: string }>;
+  /** 远程会话:把系统提示里的 Windows 盘符 cwd 改回 POSIX */
+  remoteSsh?: { host: string };
   /** 加载项目内 .claude/.codex/.cursor 的 skills 与规则文件；远程会话不适用（cwd 不在本机） */
   loadHarnessAssets?: boolean;
   exploreFold?: ReturnType<typeof createExploreFoldState>;
@@ -307,6 +320,7 @@ function createSessionResourceLoader(options: {
     ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
     // noExtensions 只挡磁盘上的项目/全局扩展；inline factory 不受影响，图片修剪对所有会话生效
     extensionFactories: [
+      options.branchContext,
       {
         name: 'image-context',
         hidden: true,
@@ -318,31 +332,44 @@ function createSessionResourceLoader(options: {
           }));
         },
       } satisfies InlineExtension,
-      ...(!options.noExtensions && (options.exploreFold || options.smartCompactEnabled)
+      ...(options.exploreFold
         ? [
-            ...(options.exploreFold
-              ? [
-                  {
-                    name: 'explore-fold',
-                    hidden: true,
-                    factory: (pi) => {
-                      pi.on('context', (event) => ({
-                        messages: options.exploreFold!.apply(
-                          event.messages as never
-                        ) as typeof event.messages,
-                      }));
-                    },
-                  } satisfies InlineExtension,
-                ]
-              : []),
-            ...(options.smartCompactEnabled
-              ? [
-                  smartCompactInlineExtension({
-                    summaryModel: options.smartCompactSummaryModel,
-                    mode: options.smartCompactMode,
-                  }),
-                ]
-              : []),
+            {
+              name: 'explore-fold',
+              hidden: true,
+              factory: (pi) => {
+                pi.on('context', (event) => ({
+                  messages: options.exploreFold!.apply(
+                    event.messages as never
+                  ) as typeof event.messages,
+                }));
+              },
+            } satisfies InlineExtension,
+          ]
+        : []),
+      ...(options.remoteSsh
+        ? [
+            {
+              name: 'ssh-cwd-prompt',
+              hidden: true,
+              factory: (pi) => {
+                pi.on('before_agent_start', (event) => ({
+                  systemPrompt: rewriteRemoteWorkingDirectoryPrompt(
+                    event.systemPrompt,
+                    options.cwd,
+                    options.remoteSsh!.host
+                  ),
+                }));
+              },
+            } satisfies InlineExtension,
+          ]
+        : []),
+      ...(!options.noExtensions && options.smartCompactEnabled
+        ? [
+            smartCompactInlineExtension({
+              summaryModel: options.smartCompactSummaryModel,
+              mode: options.smartCompactMode,
+            }),
           ]
         : []),
     ],
@@ -360,7 +387,11 @@ function createSessionResourceLoader(options: {
 }
 
 /** Enso 不发现任何宿主或项目资源；cwd 只供 pi 的会话文件元数据使用。 */
-function createEnsoResourceLoader(cwd: string, agentDir: string): DefaultResourceLoader {
+function createEnsoResourceLoader(
+  cwd: string,
+  agentDir: string,
+  branchContext: InlineExtension
+): DefaultResourceLoader {
   return new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -369,6 +400,7 @@ function createEnsoResourceLoader(cwd: string, agentDir: string): DefaultResourc
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
+    extensionFactories: [branchContext],
     systemPrompt: ENSO_SYSTEM_PROMPT,
     skillsOverride: () => ({ skills: [], diagnostics: [] }),
     promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -423,10 +455,15 @@ function isSameGeneration(left: SessionIdentity, right: SessionIdentity): boolea
 
 async function refreshWorkerProviderModels(
   runtime: ModelRuntime,
-  providerId: string
+  providerId: string,
+  options?: { force?: boolean }
 ): Promise<void> {
   try {
-    await runtime.refresh({ providers: [providerId], allowNetwork: true });
+    await runtime.refresh({
+      providers: [providerId],
+      allowNetwork: true,
+      ...(options?.force ? { force: true } : {}),
+    });
   } catch {
     // 拉不到就留用该 provider 的兜底清单，不该让 worker 起不来
   }
@@ -452,6 +489,8 @@ export async function initializeWorkerRuntime(runtime: ModelRuntime): Promise<Mo
 export class SessionSupervisor {
   private readonly sessions = new Map<string, ManagedSession>();
   private readonly gate = new OperationGate();
+  private readonly workspaceSwitch = new WorkspaceSwitchGate(this.sessions);
+  private readonly pendingCommands = new Map<string, number>();
   private readonly mcp = new McpManager({ emit: (event) => this.options.emit(event) });
   private readonly bgTasks: BackgroundTaskManager;
   private runtimePromise: Promise<ModelRuntime> | null = null;
@@ -459,17 +498,37 @@ export class SessionSupervisor {
   private pinned: ReadonlySet<string> = new Set();
   private readonly evictionTimer: ReturnType<typeof setInterval>;
   private approvalReviewer: SpawnModelConfig | undefined;
+  private maxActiveCoworkers = DEFAULT_MAX_ACTIVE_COWORKERS;
   /** 父会话通知(合并投递):闲则注入合成提示唤醒,忙则挂 pending 搭下次工具结果 */
   private readonly notifier = new ParentNotifier((sessionId, text) => {
     this.deliverNotification(sessionId, text);
   });
 
+  private branchContextExtension(getSession: () => ManagedSession | undefined): InlineExtension {
+    return workspaceBranchContextExtension(getSession, (requestId) => {
+      const managed = getSession();
+      if (!managed || this.sessions.get(managed.identity.sessionId) !== managed) return;
+      this.options.emit({
+        type: 'workspace-branch-context-consumed',
+        identity: managed.identity,
+        seq: ++managed.seq,
+        requestId,
+      });
+    });
+  }
+
   private deliverNotification(sessionId: string, text: string): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
+    if (this.workspaceSwitch.defer(sessionId, () => this.deliverNotification(sessionId, text)))
+      return;
     if (managed.status === 'idle') {
+      managed.roundPending = true;
       void managed.session
         .prompt(`<agent-notification>\n${text}\n</agent-notification>`)
+        .finally(() => {
+          if (managed.status !== 'running') managed.roundPending = false;
+        })
         .catch(() => {
           // status 是我们的投影,pi loop 可能仍在收尾拒绝 prompt——退回 pending 待搭车/轮末重投,绝不静默丢
           managed.pendingTaskReminders.push(text);
@@ -539,11 +598,15 @@ export class SessionSupervisor {
       status: managed.status,
       lastActivityAt: managed.lastActivityAt,
       hasPendingWork:
+        this.workspaceSwitch.isLocked(id) ||
+        managed.pendingBranch !== undefined ||
+        !!managed.pendingVerifications ||
         managed.currentTurnId !== undefined ||
         managed.gate.snapshot().length > 0 ||
         managed.asks.snapshot().length > 0 ||
         (managed.ensoApp?.pendingCount ?? 0) > 0 ||
         (managed.browser?.pendingCount ?? 0) > 0 ||
+        (managed.memory?.pendingCount ?? 0) > 0 ||
         managed.pendingTaskReminders.length > 0 ||
         this.bgTasks.snapshot(id).some((task) => task.status === 'running'),
       hasChildren:
@@ -600,6 +663,7 @@ export class SessionSupervisor {
     managed.asks.cancelAll();
     managed.ensoApp?.cancelAll('Session released');
     managed.browser?.cancelAll('Session released');
+    managed.memory?.cancelAll('Session released');
     try {
       await managed.session.abort();
     } catch {}
@@ -617,6 +681,46 @@ export class SessionSupervisor {
   }
 
   handleCommand(command: AgentCommand): void {
+    if (command.type === 'lock-workspace' || command.type === 'unlock-workspace') {
+      const ok =
+        command.type === 'lock-workspace'
+          ? !this.bgTasks.hasRunningInWorkspace(command.conversationIds) &&
+            !command.conversationIds.some(
+              (id) => this.pendingCommands.has(id) || this.gate.hasPending(id)
+            ) &&
+            this.workspaceSwitch.lock(
+              command.requestId,
+              command.conversationIds,
+              (managed) =>
+                managed.status === 'running' ||
+                managed.session.isStreaming ||
+                managed.session.isRetrying ||
+                !!managed.roundPending ||
+                !!managed.pendingVerifications ||
+                managed.currentTurnId !== undefined ||
+                !!managed.compaction ||
+                !!managed.pendingCompact ||
+                this.pendingCommands.has(managed.identity.sessionId) ||
+                this.gate.hasPending(managed.identity.sessionId) ||
+                managed.gate.snapshot().length > 0 ||
+                managed.asks.snapshot().length > 0 ||
+                (managed.ensoApp?.pendingCount ?? 0) > 0 ||
+                (managed.browser?.pendingCount ?? 0) > 0 ||
+                [...managed.subagents.values()].some((s) => s.status === 'running') ||
+                this.bgTasks
+                  .snapshot(managed.identity.sessionId)
+                  .some((task) => task.status === 'running')
+            )
+          : this.workspaceSwitch.unlock(command.requestId, command.conversationIds, command.branch);
+      this.options.emit({
+        type:
+          command.type === 'lock-workspace' ? 'workspace-lock-result' : 'workspace-unlock-result',
+        requestId: command.requestId,
+        ok,
+        ...(ok ? {} : { error: 'Workspace is busy or the operation lock does not match.' }),
+      });
+      return;
+    }
     if (command.type === 'reload-session') {
       // 只读旁路：不得进入执行门、更新活动时间或触发模型调用。
       const managed = this.sessions.get(command.sessionId);
@@ -661,6 +765,16 @@ export class SessionSupervisor {
       void this.summarizeTitle(command).catch(() => {});
       return;
     }
+    if (command.type === 'complete-text') {
+      void this.completeText(command).catch((error) =>
+        this.options.emit({
+          type: 'text-failed',
+          requestId: command.requestId,
+          error: toErrorMessage(error),
+        })
+      );
+      return;
+    }
     if (command.type === 'set-proxy-env') {
       applyWorkerProxyEnv(command.env);
       return;
@@ -669,16 +783,23 @@ export class SessionSupervisor {
       this.approvalReviewer = command.model;
       return;
     }
+    if (command.type === 'set-max-active-coworkers') {
+      this.maxActiveCoworkers = command.limit;
+      return;
+    }
     const identity =
       command.type === 'capability-result'
         ? command.child
-        : command.type === 'browser-result'
+        : command.type === 'browser-result' || command.type === 'memory-result'
           ? command.identity
           : command.type === 'dismiss-child' ||
               command.type === 'dismiss-coworker' ||
               command.type === 'resume-coworker'
             ? command.parent
             : command.identity;
+    const scopeId =
+      command.type === 'spawn-child' ? command.identity.parent.sessionId : identity.sessionId;
+    if (this.workspaceSwitch.defer(scopeId, () => this.handleCommand(command))) return;
     const touched = this.sessions.get(identity.sessionId);
     if (touched) touched.lastActivityAt = Date.now();
     // abort 必须旁路串行门：它要打断的正是占着门的那一轮，排队等于永远等不到
@@ -688,8 +809,14 @@ export class SessionSupervisor {
       });
       return;
     }
+    this.pendingCommands.set(scopeId, (this.pendingCommands.get(scopeId) ?? 0) + 1);
     void this.gate
       .run(identity.sessionId, () => this.execute(command))
+      .finally(() => {
+        const count = (this.pendingCommands.get(scopeId) ?? 1) - 1;
+        if (count) this.pendingCommands.set(scopeId, count);
+        else this.pendingCommands.delete(scopeId);
+      })
       .catch((error) => {
         const message = toErrorMessage(error);
         if (command.type === 'spawn-parent') {
@@ -759,7 +886,8 @@ export class SessionSupervisor {
           command.hashlineEditEnabled,
           command.smartCompactEnabled,
           command.smartCompactSummaryModel,
-          command.smartCompactMode
+          command.smartCompactMode,
+          command.memoryLanguage
         );
         return;
       case 'spawn-child':
@@ -967,6 +1095,13 @@ export class SessionSupervisor {
         }
         return;
       }
+      case 'memory-result': {
+        const managed = this.must(command.identity);
+        if (!managed.memory?.resolve(command)) {
+          console.warn(`[memory] dropped result for unknown request ${command.requestId}`);
+        }
+        return;
+      }
       case 'append-session-custom-entry': {
         const managed = this.must(command.identity);
         managed.session.sessionManager.appendCustomEntry('enso-agent-session', command.entry);
@@ -1053,7 +1188,7 @@ export class SessionSupervisor {
       }
       case 'rewind': {
         const managed = this.must(command.identity);
-        if (managed.status !== 'idle') {
+        if (managed.status === 'running') {
           this.options.emit({
             type: 'rewind-done',
             identity: managed.identity,
@@ -1107,6 +1242,7 @@ export class SessionSupervisor {
         managed.asks.cancelAll();
         managed.ensoApp?.cancelAll('Enso capability invocation aborted');
         managed.browser?.cancelAll('Browser action aborted');
+        managed.memory?.cancelAll('Memory action aborted');
         managed.currentTurnId = undefined;
         // 立即收口投影：不 await session.abort()（内部 waitForIdle 会一直等到工具/流
         // 真正结束，工具不响应 signal 时永远等不到，UI 就卡在 running 上）。
@@ -1146,7 +1282,8 @@ export class SessionSupervisor {
     hashlineEditEnabled = false,
     smartCompactEnabled = false,
     smartCompactSummaryModel?: SpawnModelConfig,
-    smartCompactMode?: SmartCompactMode
+    smartCompactMode?: SmartCompactMode,
+    memoryLanguage?: string
   ): Promise<void> {
     const sessionId = identity.sessionId;
     const toolEnabled = (id: string) => !disabledTools.includes(id);
@@ -1196,12 +1333,14 @@ export class SessionSupervisor {
       await resolveBaseModelOrRefresh(runtime, smartCompactSummaryModel);
     }
     const resourceLoader = createSessionResourceLoader({
+      branchContext: this.branchContextExtension(() => managedRef),
       cwd,
       agentDir: this.options.agentDir,
       noSkills: loadLocalSkills === false,
       skillPaths,
       instruction,
       remoteAgentsFiles,
+      ...(remote ? { remoteSsh: { host: remote.host } } : {}),
       loadHarnessAssets,
       exploreFold,
       ...(smartCompactEnabled
@@ -1276,7 +1415,8 @@ export class SessionSupervisor {
         ? { readFile: remoteOps.read.readFile, writeFile: remoteOps.edit.writeFile }
         : undefined,
     });
-    const wrapRead = (definition: Def): Def => withAgentRead(definition, () => structuredById);
+    const wrapRead = (definition: Def): Def =>
+      withReadTruncationMeta(withAgentRead(definition, () => structuredById));
     const applyHashline = <T extends Def>(tools: { read: T; grep: T; edit?: T }) =>
       applyHashlineSessionTools({
         enabled: hashlineEditEnabled,
@@ -1480,7 +1620,10 @@ export class SessionSupervisor {
                 }
               )
             : undefined;
-        const subTools = isLockedEnso
+        const childExploreFold =
+          !isLockedEnso && exploreFoldEnabled ? createExploreFoldState() : undefined;
+        const childSandboxCatalog: { current: Def[] } = { current: [] };
+        const childTools = isLockedEnso
           ? [createEnsoCapabilitiesTool(), createEnsoAppTool(ensoApp!), createAskTool(askManager!)]
           : [
               ...(resolved?.tools === 'readonly' || agentType?.tools === 'readonly'
@@ -1488,11 +1631,30 @@ export class SessionSupervisor {
                 : buildBaseTools(childGate, undefined, agentType?.writeScope)),
               ...(resolved || agentType ? typeMcpTools : wrapMcpTools(childGate)),
               ...(extraTools as Def[]),
+              ...(childExploreFold ? createExploreFoldTools(childExploreFold) : []),
+            ];
+        childSandboxCatalog.current = childTools;
+        const subTools = isLockedEnso
+          ? childTools
+          : [
+              ...childTools,
+              ...(toolEnabled('isolated_sandbox')
+                ? [
+                    createIsolatedSandboxTool({
+                      getTools: () => childSandboxCatalog.current,
+                      store: new Map(),
+                    }),
+                  ]
+                : []),
             ];
         const selectedSkillPaths = resolved?.skillPaths ?? agentType?.skillPaths ?? [];
+        const branchContext = this.branchContextExtension(() =>
+          [...this.sessions.values()].find((managed) => managed.session === session)
+        );
         const subLoader = isLockedEnso
-          ? createEnsoResourceLoader(cwd, this.options.agentDir)
+          ? createEnsoResourceLoader(cwd, this.options.agentDir, branchContext)
           : createSessionResourceLoader({
+              branchContext,
               cwd,
               agentDir: this.options.agentDir,
               noSkills: resolved || agentType ? true : loadLocalSkills === false,
@@ -1500,8 +1662,10 @@ export class SessionSupervisor {
               skillPaths: resolved || agentType ? [...selectedSkillPaths] : skillPaths,
               instruction,
               remoteAgentsFiles,
+              ...(remote ? { remoteSsh: { host: remote.host } } : {}),
               // 类型化子代理与项目资源隔离（同 noSkills/noExtensions），不追加 harness 资源
               loadHarnessAssets: resolved || agentType ? false : loadHarnessAssets,
+              ...(childExploreFold ? { exploreFold: childExploreFold } : {}),
             });
         await subLoader.reload();
         const safeJournal =
@@ -1549,7 +1713,8 @@ export class SessionSupervisor {
         };
       },
     };
-    // 子代理：同 worker 子会话，复用 runtime/model/审批门/MCP 连接；工具同父但不含 task/todo（防递归）
+    // 子代理：同 worker 子会话，复用 runtime/model/审批门/MCP 连接；不含 subagent/coworker（防递归）。
+    // 隔离沙箱 / 探后折叠跟父会话同一开关，catalog 用子自己的工具集。
     const taskTool = createSubagentTool({
       modelId: model.modelId,
       agentTypes,
@@ -1659,11 +1824,29 @@ export class SessionSupervisor {
           });
         })
       : undefined;
-    const customTools = [
+    // 记忆库活在 Main（better-sqlite3），worker 只发 memory-invoke 事件，同 browser 桥。
+    const memory = toolEnabled('memory')
+      ? new MemoryInvoker(identity, (request) => {
+          const managed = managedRef ?? this.sessions.get(sessionId);
+          if (!managed) throw new Error('Session is not ready for memory actions.');
+          this.options.emit({
+            type: 'memory-invoke',
+            identity: managed.identity,
+            seq: ++managed.seq,
+            requestId: request.requestId,
+            op: request.op,
+            params: request.params,
+          });
+        })
+      : undefined;
+    const catalogRef: { current: Def[] } = { current: [] };
+    const sandboxStore = new Map<string, unknown>();
+    const sessionTools = [
       ...buildCoreTools(),
       ...(browser
         ? createBrowserTools(browser).map((tool) => withNavigateApproval(gate, tool))
         : []),
+      ...(memory ? createMemoryTools(memory, { language: memoryLanguage }) : []),
       ...(toolEnabled('todo') ? [createTodoTool()] : []),
       ...(toolEnabled('ask_user') ? [createAskTool(askManager)] : []),
       ...(toolEnabled('subagent') ? [taskTool] : []),
@@ -1682,6 +1865,13 @@ export class SessionSupervisor {
               note,
             });
           })
+        : []),
+    ];
+    catalogRef.current = sessionTools;
+    const customTools = [
+      ...sessionTools,
+      ...(toolEnabled('isolated_sandbox')
+        ? [createIsolatedSandboxTool({ getTools: () => catalogRef.current, store: sandboxStore })]
         : []),
     ].map((tool) => withTaskReminders(tool, takePendingReminders));
 
@@ -1713,6 +1903,7 @@ export class SessionSupervisor {
       checkpoints,
     });
     managedRef.browser = browser;
+    managedRef.memory = memory;
     this.options.emit({
       type: 'parent-ready',
       identity,
@@ -1914,8 +2105,8 @@ export class SessionSupervisor {
     }
     // 容量对 resume 豁免（与 coworker 路径同语义）：恢复量受关机前存量约束，
     // 不是疯雇；上限的目的是防主 agent 循环雇人。
-    if (!resumeFile && parent.coworkers.size >= MAX_ACTIVE_COWORKERS) {
-      throw new Error(`coworker limit reached (${MAX_ACTIVE_COWORKERS} active)`);
+    if (!resumeFile && parent.coworkers.size >= this.maxActiveCoworkers) {
+      throw new Error(`coworker limit reached (${this.maxActiveCoworkers} active)`);
     }
 
     let managedRef: ManagedSession | undefined;
@@ -2029,9 +2220,9 @@ export class SessionSupervisor {
     const factory = parent.factory;
     if (!factory) throw new Error(`session cannot hire coworkers: ${parentId}`);
     if (parent.coworkers.has(name)) throw new Error(`coworker name already in use: ${name}`);
-    if (!resumeFile && parent.coworkers.size >= MAX_ACTIVE_COWORKERS) {
+    if (!resumeFile && parent.coworkers.size >= this.maxActiveCoworkers) {
       throw new Error(
-        `coworker limit reached (${MAX_ACTIVE_COWORKERS} active) — dismiss one before hiring more`
+        `coworker limit reached (${this.maxActiveCoworkers} active) — dismiss one before hiring more`
       );
     }
     if (this.sessions.has(coworkerId)) throw new Error(`coworker already exists: ${coworkerId}`);
@@ -2171,6 +2362,17 @@ export class SessionSupervisor {
     opts: { signal?: AbortSignal; wait?: boolean; gate?: string; schema?: unknown } = {}
   ): Promise<string> {
     const managed = this.mustCurrent(coworkerId);
+    if (this.workspaceSwitch.isLocked(coworkerId)) {
+      return new Promise<string>((resolve, reject) => {
+        this.workspaceSwitch.defer(
+          coworkerId,
+          () => {
+            this.coworkerSend(coworkerId, text, opts).then(resolve, reject);
+          },
+          () => reject(new Error('Coworker generation ended before workspace unlock.'))
+        );
+      });
+    }
     if (opts.schema) managed.pendingYieldSchema = opts.schema;
     const { signal } = opts;
     // 先登记等待再启动,防终态竞态;终态由 settleRound 统一判定(含重试耗尽/abort/销毁)
@@ -2293,11 +2495,27 @@ export class SessionSupervisor {
     return info;
   }
 
-  private runParentGate(managed: ManagedSession, gateCommand: string): Promise<string> {
-    const parentFactory = this.sessions.get(managed.parentId ?? '')?.factory;
-    return parentFactory
-      ? parentFactory.runGate(gateCommand)
-      : runGateCommand(process.cwd(), gateCommand);
+  private async runParentGate(managed: ManagedSession, gateCommand: string): Promise<string> {
+    if (this.workspaceSwitch.isLocked(managed.identity.sessionId)) {
+      return new Promise<string>((resolve, reject) => {
+        this.workspaceSwitch.defer(
+          managed.identity.sessionId,
+          () => {
+            this.runParentGate(managed, gateCommand).then(resolve, reject);
+          },
+          () => reject(new Error('Coworker generation ended before workspace unlock.'))
+        );
+      });
+    }
+    managed.pendingVerifications = (managed.pendingVerifications ?? 0) + 1;
+    try {
+      const parentFactory = this.sessions.get(managed.parentId ?? '')?.factory;
+      return await (parentFactory
+        ? parentFactory.runGate(gateCommand)
+        : runGateCommand(process.cwd(), gateCommand));
+    } finally {
+      managed.pendingVerifications--;
+    }
   }
 
   /** 轮次结果正文:最终文本 + 输出截断/上下文水位警告(不含 gate,可缓存) */
@@ -2695,6 +2913,19 @@ export class SessionSupervisor {
     managed.status = 'failed';
     // 失败轮不总结，但下一轮的起点仍要往前推，否则失败轮的消息会混进下一轮摘要
     managed.turnStartIndex = managed.messages.length;
+    // 轮失败时放弃排队压缩（通常是 queued；running 压缩与 failTurn 时序上不可达）
+    // abandoned：清进度但不重钉「压缩完成」锚点；不带 error，避免假 toast
+    managed.pendingCompact = undefined;
+    if (managed.compaction) {
+      managed.compaction = undefined;
+      this.options.emit({
+        type: 'compaction',
+        identity: managed.identity,
+        seq: ++managed.seq,
+        state: 'end',
+        abandoned: true,
+      });
+    }
     this.emitStatus(managed, error);
     this.options.emit({
       type: 'turn-failed',
@@ -2993,10 +3224,12 @@ export class SessionSupervisor {
   /** worker 退出前 fail-closed 清理挂起 capability，并断开 MCP 子进程。 */
   shutdown(): Promise<void> {
     clearInterval(this.evictionTimer);
+    this.workspaceSwitch.clear();
     this.bgTasks.stopAll();
     for (const managed of this.sessions.values()) {
       managed.ensoApp?.cancelAll('Enso worker shutdown');
       managed.browser?.cancelAll('Enso worker shutdown');
+      managed.memory?.cancelAll('Enso worker shutdown');
       managed.currentTurnId = undefined;
     }
     return this.mcp.closeAll();
@@ -3089,6 +3322,55 @@ export class SessionSupervisor {
   }
 
   /**
+   * 通用一次性文本补全（记忆蒸馏）：与 summarizeTitle 同样的候选链，但不对输出做形状判定，
+   * 原文回 Main 由调用方容错解析。每个候选共用同一上限超时。
+   */
+  private async completeText(
+    command: Extract<AgentCommand, { type: 'complete-text' }>
+  ): Promise<void> {
+    const runtime = await this.getRuntime();
+    const context = {
+      systemPrompt: command.systemPrompt,
+      messages: [{ role: 'user' as const, content: command.userText, timestamp: Date.now() }],
+    };
+    let lastError = 'no candidates';
+    for (const candidate of command.candidates) {
+      const label = describeTitleModel(candidate);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), command.timeoutMs);
+      try {
+        const model = await resolveBaseModelOrRefresh(runtime, candidate);
+        const message = await runtime.completeSimple(model, context, {
+          signal: controller.signal,
+          ...(command.maxTokens !== undefined ? { maxTokens: command.maxTokens } : {}),
+        });
+        if (message.stopReason === 'aborted') {
+          lastError = `${label}: timed out after ${Math.round(command.timeoutMs / 1000)}s`;
+          continue;
+        }
+        if (message.stopReason === 'error') {
+          lastError = `${label}: ${message.errorMessage?.trim() || 'model error'}`;
+          continue;
+        }
+        const text = message.content
+          .map((part) => (part.type === 'text' ? part.text : ''))
+          .join('');
+        if (!text.trim()) {
+          lastError = `${label}: empty completion`;
+          continue;
+        }
+        this.options.emit({ type: 'text-completed', requestId: command.requestId, text });
+        return;
+      } catch (error) {
+        lastError = `${label}: ${toErrorMessage(error)}`;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    this.options.emit({ type: 'text-failed', requestId: command.requestId, error: lastError });
+  }
+
+  /**
    * 会话标题总结：一次性补全，不建 AgentSession、不落盘。按 candidates 依次尝试（超时 60/120/180s 递增），
    * 任一候选产出合法标题即回 title-generated 并停止；全部失败回 title-failed，error 为最后一次失败原因。
    * 同一模型不重试：真机实测“模型不听 prompt”重试三次结果一样，换模型才有效。
@@ -3156,8 +3438,6 @@ export class SessionSupervisor {
   }
 }
 
-/** 同一父会话的在编 coworker 上限,防主 agent 循环疯狂雇人 */
-const MAX_ACTIVE_COWORKERS = 5;
 /** 投影 idle 但 pi 仍 streaming 时，等它真正空闲的上限；超时视为僵尸轮 */
 const ZOMBIE_TURN_WAIT_MS = 5_000;
 
@@ -3236,7 +3516,10 @@ export async function resolveBaseModelOrRefresh(runtime: ModelRuntime, model: Sp
     return resolveBaseModel(runtime, model);
   } catch (error) {
     if (!model.oauthAccountKey) throw error;
-    await refreshWorkerProviderModels(runtime, providerIdOfAccountKey(model.oauthAccountKey));
+    // Cursor 无 force 只踢后台任务并立刻返回兜底清单（没有 claude-fable-5-1 这类新 id）
+    await refreshWorkerProviderModels(runtime, providerIdOfAccountKey(model.oauthAccountKey), {
+      force: true,
+    });
     return resolveBaseModel(runtime, model);
   }
 }

@@ -55,11 +55,17 @@ const STATE_KEYS = [
   'subagentModels',
   'defaultModel',
   'titleSummaryModel',
+  'memoryDistillModel',
+  'memoryChatModel',
+  'memoryLanguage',
   'smartCompactModel',
   'approvalReviewer',
   'titleSummaryEnabled',
   'smartCompactEnabled',
   'smartCompactMode',
+  'memoryEmbeddingModel',
+  'memoryDistillEnabled',
+  'memoryKgEnabled',
   'defaultReasoningEnabled',
   'defaultThinkingLevel',
   'defaultPresetId',
@@ -85,6 +91,7 @@ const STATE_KEYS = [
   'expandLiveEdits',
   'chatWide',
   'notifyMainAgentOnly',
+  'maxActiveCoworkers',
   'generationStallTimeoutMin',
   'autoArchiveIdleDays',
   'autoArchiveMergedWorktrees',
@@ -719,7 +726,13 @@ function validateReferences(
       );
   }
   for (const entry of subagentModels) validateRef(entry, providerModels, 'subagent model');
-  for (const key of ['defaultModel', 'titleSummaryModel', 'smartCompactModel', 'approvalReviewer'])
+  for (const key of [
+    'defaultModel',
+    'titleSummaryModel',
+    'memoryDistillModel',
+    'smartCompactModel',
+    'approvalReviewer',
+  ])
     if (state[key] !== undefined && state[key] !== null)
       validateRef(state[key], providerModels, key);
   if (
@@ -823,6 +836,8 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
   for (const key of [
     'titleSummaryEnabled',
     'smartCompactEnabled',
+    'memoryDistillEnabled',
+    'memoryKgEnabled',
     'defaultReasoningEnabled',
     'subagentModelsEnabled',
   ])
@@ -845,7 +860,12 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     throw new Error('Invalid state.theme');
   if (state.language !== undefined && !['en', 'zh'].includes(String(state.language)))
     throw new Error('Invalid state.language');
-  for (const key of ['terminalTheme', 'terminalFontFamily']) {
+  for (const key of [
+    'terminalTheme',
+    'terminalFontFamily',
+    'memoryEmbeddingModel',
+    'memoryChatModel',
+  ]) {
     if (state[key] !== undefined) nonEmptyStringField(state, key, 'state');
   }
   numberField(state, 'terminalFontSize', 'state', Number.MIN_VALUE, Number.MAX_SAFE_INTEGER);
@@ -878,6 +898,7 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     'autoArchiveMergedWorktrees',
   ])
     booleanField(state, key, 'state', false);
+  numberField(state, 'maxActiveCoworkers', 'state', 1, 20, true);
   numberField(state, 'generationStallTimeoutMin', 'state', 0, 120, true);
   numberField(state, 'autoArchiveIdleDays', 'state', 0, 90, true);
   numberField(state, 'autoDeleteArchivedDays', 'state', 0, 90, true);

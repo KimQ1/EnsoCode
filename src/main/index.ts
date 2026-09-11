@@ -5,15 +5,26 @@ import { app, BrowserWindow } from 'electron';
 import { registerIpcHandlers } from './ipc';
 import { readSettings } from './ipc/settings';
 import { startAgentWorker } from './services/agentHost';
+import { attachAppQuitDrain } from './services/appQuitDrain';
 import { browserHost } from './services/browserHost';
+import { releaseLocalChatSlot } from './services/llama/chat';
+import { disposeLlamaRuntime, llamaRuntimeActive } from './services/llama/runtime';
 import {
   registerLocalImageProtocolHandler,
   registerLocalImageSchemePrivileges,
 } from './services/localImageProtocol';
+import {
+  awaitMemoryEmbeddingClose,
+  closeMemoryDb,
+  syncMemoryDistillFromSettings,
+  syncMemoryEmbeddingFromSettings,
+  syncMemoryKgFromSettings,
+} from './services/memoryHost';
 import { startPairGuest, stopPairGuest } from './services/pairGuest';
 import { startPairHost, stopPairHost } from './services/pairHost';
 import { getProxyConfig } from './services/proxyConfig';
 import { hydrateShellPath, seedProcessPath } from './services/shellPath';
+import { disposeAllTerminals, hasPendingPtys, waitPtyQuitIdle } from './services/terminalService';
 import { createMainWindow, getMainWindow } from './windows/MainWindow';
 
 // 仅开发环境开放 CDP 端口，便于调试；打包后不开，避免暴露远程调试。
@@ -78,6 +89,12 @@ if (!gotTheLock) {
       | { state?: { proxyMode?: unknown; customProxyUrl?: unknown; autoUpdate?: boolean } }
       | undefined;
     getProxyConfig().initFromConfig(persisted?.state?.proxyMode, persisted?.state?.customProxyUrl);
+    const persistedState = (
+      persisted?.state && typeof persisted.state === 'object' ? persisted.state : {}
+    ) as Record<string, unknown>;
+    syncMemoryEmbeddingFromSettings(persistedState);
+    syncMemoryDistillFromSettings(persistedState);
+    syncMemoryKgFromSettings(persistedState);
     // UI shell 必须先创建并发起加载；Agent worker 初始化变重时不得阻塞 renderer spawn。
     const mainWindow = createMainWindow();
     // 内嵌浏览器 guest view 挂主窗口（无头也要 viewport）；窗口重建后 getMainWindow 自动指向新窗
@@ -118,7 +135,25 @@ if (!gotTheLock) {
     stopPairGuest();
     // 内嵌浏览器 Cookie / storage 落盘后再关 guest 页
     void browserHost.dispose();
+    closeMemoryDb();
   });
+  // node-pty TSFN / llama AsyncWorker 在 FreeEnvironment 期间回调会 SIGABRT；
+  // 两步必须共用一次 preventDefault，谁先 app.quit 都会拆掉另一边的环境。
+  attachAppQuitDrain(app, [
+    {
+      begin: disposeAllTerminals,
+      shouldWait: hasPendingPtys,
+      wait: waitPtyQuitIdle,
+    },
+    {
+      shouldWait: llamaRuntimeActive,
+      wait: async () => {
+        await awaitMemoryEmbeddingClose();
+        await releaseLocalChatSlot();
+        await disposeLlamaRuntime();
+      },
+    },
+  ]);
 }
 
 /** 打包环境下启动自动更新(dev 无 app-update.yml,electron-updater 会报错;Linux deb 由 IPC 层守卫) */

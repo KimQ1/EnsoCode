@@ -53,6 +53,10 @@ export type TimelineItem =
       startedAt?: number | null;
       /** subagent 工具的执行元数据（模型/token/步数）；非 subagent 为 null */
       agentMeta: { modelId?: string; outputTokens?: number; steps?: number } | null;
+      /** exec / 隔离沙箱的 JS 源码；其它工具缺省 */
+      source?: string | null;
+      /** 嵌套审批未决数（exec 脚本内 write 等） */
+      nestedPending?: number;
     }
   | {
       kind: 'tool-group';
@@ -113,17 +117,24 @@ const SUMMARY_KEYS = [
 const PATH_SUMMARY_KEYS = new Set(['path', 'file_path']);
 const HASHLINE_HEADER = /^\[(.+)#([0-9A-Fa-f]{4})\]$/;
 
+/** Windows 盘符根路径还原成 POSIX，便于远程 SSH 工具路径和项目 cwd 对齐 */
+function posixifyPath(value: string): string {
+  const normalized = value.replaceAll('\\', '/');
+  const drive = /^[A-Za-z]:(\/.*)?$/.exec(normalized);
+  if (drive) return drive[1] && drive[1].length > 0 ? drive[1] : '/';
+  return normalized;
+}
+
 /** 项目内绝对路径收成相对路径；前缀碰巧相同的目录不误切 */
 export function toProjectRelativePath(value: string, cwd?: string): string {
   if (!cwd) return value;
-  const root = cwd.replace(/[/\\]+$/, '');
-  if (!root) return value;
-  if (value === root) return '.';
-  const prefix = root.endsWith('/') || root.endsWith('\\') ? root : `${root}/`;
-  if (value.startsWith(prefix)) return value.slice(prefix.length);
-  const winPrefix = `${root}\\`;
-  if (value.startsWith(winPrefix)) return value.slice(winPrefix.length).replace(/\\/g, '/');
-  return value;
+  const root = posixifyPath(cwd).replace(/\/+$/, '');
+  const posixValue = posixifyPath(value);
+  if (!root) return posixValue;
+  if (posixValue === root) return '.';
+  const prefix = root.endsWith('/') ? root : `${root}/`;
+  if (posixValue.startsWith(prefix)) return posixValue.slice(prefix.length);
+  return posixValue === value ? value : posixValue;
 }
 
 function hashlinePathFromInput(input: unknown): string | undefined {
@@ -165,6 +176,73 @@ export function historyPageChrome(
   if (loading) return 'loading';
   if (hasOlder === false && everHadOlder) return 'start';
   return 'none';
+}
+
+export function execSourceFromArgs(args: unknown): string | null {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const record = args as Record<string, unknown>;
+  const code = [record.code, record.command].find(
+    (value) => typeof value === 'string' && value.trim()
+  );
+  return typeof code === 'string' ? code : null;
+}
+
+export function summarizeExecSource(code: string): string {
+  const line =
+    code
+      .split('\n')
+      .map((part) => part.trim())
+      .find(Boolean) ?? '';
+  return line.length > 72 ? `${line.slice(0, 72)}…` : line;
+}
+
+export interface SandboxCallView {
+  name: string;
+  ok: boolean;
+  error?: string;
+  summary?: string;
+}
+
+export interface SandboxView {
+  status: 'completed' | 'failed';
+  value?: unknown;
+  error?: string;
+  calls: SandboxCallView[];
+}
+
+export function parseSandboxOutput(output: string | null): SandboxView | null {
+  if (!output?.trim()) return null;
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.status !== 'completed' && record.status !== 'failed') return null;
+    const calls = Array.isArray(record.calls)
+      ? record.calls.flatMap((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+          const call = entry as Record<string, unknown>;
+          if (typeof call.name !== 'string' || !call.name) return [];
+          return [
+            {
+              name: call.name,
+              ok: call.ok === true,
+              ...(typeof call.error === 'string' ? { error: call.error } : {}),
+              ...(typeof call.summary === 'string' ? { summary: call.summary } : {}),
+            },
+          ];
+        })
+      : [];
+    return {
+      status: record.status,
+      ...(record.status === 'failed' && typeof record.error === 'string'
+        ? { error: record.error }
+        : {}),
+      ...(record.status === 'completed' ? { value: record.value } : {}),
+      calls,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** write 工具参数里取出写入内容 */
@@ -241,17 +319,23 @@ function findLastActivePartIndex(content: ProjectedMessage['content']): number {
   return -1;
 }
 
-/** 从该 step 的计时打点算 hover 操作条读数；打点不全则无对应字段。
- * turnStartMs 为本轮首 step 的起点，仅在「多 step 轮次的末 step」传入→ 附带整轮总耗时 turnMs */
-function perfFromTiming(message: ProjectedMessage, turnStartMs?: number): TurnPerf | undefined {
+/** 已完成 step 的模型活跃耗时；优先采用 pi 的整段请求 duration。 */
+function completedStepRunMs(message: ProjectedMessage): number | undefined {
   const timing = message.timing;
   if (!timing?.completedMs) return undefined;
-  const { stepStartMs, firstTokenMs, completedMs } = timing;
+  return typeof message.duration === 'number' && message.duration > 0
+    ? message.duration
+    : Math.max(0, timing.completedMs - timing.stepStartMs);
+}
+
+/** 从该 step 的计时打点算 hover 操作条读数；打点不全则无对应字段。
+ * turnActiveMs 仅在「多 step 轮次的末 step」传入，排除用户回答与审批等等待时间。 */
+function perfFromTiming(message: ProjectedMessage, turnActiveMs?: number): TurnPerf | undefined {
+  const timing = message.timing;
+  const runMs = completedStepRunMs(message);
+  if (!timing || runMs === undefined) return undefined;
+  const { stepStartMs, firstTokenMs } = timing;
   const out = message.usage?.output ?? 0;
-  const runMs =
-    typeof message.duration === 'number' && message.duration > 0
-      ? message.duration
-      : Math.max(0, completedMs - stepStartMs);
   const ttftMs =
     typeof message.ttft === 'number' && message.ttft > 0
       ? message.ttft
@@ -260,7 +344,7 @@ function perfFromTiming(message: ProjectedMessage, turnStartMs?: number): TurnPe
         : undefined;
   return {
     runMs,
-    ...(turnStartMs !== undefined ? { turnMs: Math.max(0, completedMs - turnStartMs) } : {}),
+    ...(turnActiveMs !== undefined ? { turnMs: turnActiveMs } : {}),
     ...(ttftMs !== undefined ? { ttftMs } : {}),
     ...(out > 0 && runMs > 0 ? { tps: out / (runMs / 1000) } : {}),
   };
@@ -307,9 +391,22 @@ function reviewingToolCallIds(
 ): Set<string> {
   const ids = new Set<string>();
   for (const request of pendingApprovals ?? []) {
-    if (request.phase === 'reviewing' && request.toolCallId) ids.add(request.toolCallId);
+    if (request.phase === 'reviewing' && request.toolCallId) {
+      ids.add(request.toolCallId);
+      const parent = request.toolCallId.split(':')[0];
+      if (parent) ids.add(parent);
+    }
   }
   return ids;
+}
+
+function nestedPendingCount(
+  toolCallId: string,
+  pendingApprovals: readonly ApprovalRequestInfo[] | undefined
+): number {
+  const prefix = `${toolCallId}:`;
+  return (pendingApprovals ?? []).filter((request) => request.toolCallId?.startsWith(prefix))
+    .length;
 }
 
 function buildMessageTimeline(
@@ -363,14 +460,14 @@ function buildMessageTimeline(
     nextTurnRole[i] = seen;
     if (messages[i].role !== 'toolResult') seen = messages[i].role;
   }
-  // 整轮计时：首 step 起点与本轮已见 step 数；遇 user 消息重置
-  let turnStartMs: number | undefined;
+  // 整轮计时只累计模型请求与非交互工具的真实执行耗时；用户回答、审批、排队等空档不计。
+  let turnActiveMs = 0;
   let turnSteps = 0;
   messages.forEach((message, messageIndex) => {
     const isLastMessage = messageIndex === messages.length - 1;
     const absIndex = historyBaseIndex + messageIndex;
     if (message.role === 'user') {
-      turnStartMs = undefined;
+      turnActiveMs = 0;
       turnSteps = 0;
       const text = partText(message);
       const images = message.content.filter((part) => part.type === 'image');
@@ -402,15 +499,28 @@ function buildMessageTimeline(
       });
       return;
     }
-    if (message.role === 'toolResult') return;
+    if (message.role === 'toolResult') {
+      // ask_user 的执行期本质是等用户，不属于任务活跃用时；其余工具采用 worker 实测时长。
+      if (
+        turnSteps > 0 &&
+        message.toolName !== 'ask_user' &&
+        typeof message.toolDurationMs === 'number' &&
+        Number.isFinite(message.toolDurationMs) &&
+        message.toolDurationMs > 0
+      ) {
+        turnActiveMs += message.toolDurationMs;
+      }
+      return;
+    }
     if (message.role !== 'assistant') return;
 
-    // 本轮末 step（后面只剩 toolResult 或已到新一轮 user）且轮内有多个 step 时，正文读数附带整轮总耗时
+    // 本轮末 step（后面只剩 toolResult 或已到新一轮 user）且轮内有多个 step 时，正文读数附带活跃总耗时。
     turnSteps += 1;
-    if (turnStartMs === undefined && message.timing) turnStartMs = message.timing.stepStartMs;
+    const stepRunMs = completedStepRunMs(message);
+    if (stepRunMs !== undefined) turnActiveMs += stepRunMs;
     const isLastStepOfTurn =
       nextTurnRole[messageIndex] === undefined || nextTurnRole[messageIndex] === 'user';
-    const perfTurnStart = isLastStepOfTurn && turnSteps > 1 ? turnStartMs : undefined;
+    const perfTurnActive = isLastStepOfTurn && turnSteps > 1 ? turnActiveMs : undefined;
     // 「流式中」= 最后一个有内容的 part：pi 流式时 thinking/text 后面常已跟着
     // 空占位 part，按「最后一个 part」判会把正在生成的块误判为已完结
     const lastActiveIndex = findLastActivePartIndex(message.content);
@@ -434,7 +544,7 @@ function buildMessageTimeline(
               text: part.text,
               streaming,
               timestamp: message.timestamp,
-              perf: perfFromTiming(message, perfTurnStart),
+              perf: perfFromTiming(message, perfTurnActive),
               ...(isLastStepOfTurn && !streaming ? { turnEnd: true } : {}),
             });
             return;
@@ -458,7 +568,7 @@ function buildMessageTimeline(
               text: piece.text,
               streaming: pieceStreaming,
               timestamp: message.timestamp,
-              perf: perfFromTiming(message, perfTurnStart),
+              perf: perfFromTiming(message, perfTurnActive),
               ...(isLastStepOfTurn && !pieceStreaming && i === pieces.length - 1
                 ? { turnEnd: true }
                 : {}),
@@ -486,14 +596,21 @@ function buildMessageTimeline(
           const result = results.get(part.id);
           // 未完成时退而用执行中的输出快照（空串不算，否则行会变“可展开但空”）
           const partial = toolOutputs?.[part.id];
+          const execSource = part.name === 'exec' ? execSourceFromArgs(part.arguments) : null;
+          const output = result ? result.output : (partial ?? null) || null;
+          const sandboxView = part.name === 'exec' ? parseSandboxOutput(output) : null;
           items.push({
             kind: 'tool',
             key,
             name: part.name,
-            summary: summarizeArgs(part.arguments, cwd),
-            output: result ? result.output : (partial ?? null) || null,
+            summary: execSource
+              ? summarizeExecSource(execSource)
+              : summarizeArgs(part.arguments, cwd),
+            source: execSource,
+            output,
+            nestedPending: nestedPendingCount(part.id, pendingApprovals) || undefined,
             state: result
-              ? result.isError
+              ? result.isError || sandboxView?.status === 'failed'
                 ? 'error'
                 : 'ok'
               : running && messageIndex === lastTurnIndex

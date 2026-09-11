@@ -105,6 +105,14 @@ export function upsertOutOfRange(
   return localIndex < 0 || localIndex > authoritativeLength(messages);
 }
 
+/** worker 的 truncated.length 是绝对长度；裁到尾窗起点之前时本地权威正文已全部失效。 */
+export function truncatedNeedsSnapshotResync(
+  historyBaseIndex: number | undefined,
+  length: number
+): boolean {
+  return length <= (historyBaseIndex ?? 0);
+}
+
 /** 上滑分页：只在新页右端正好接到当前权威起点时前置，其它情况原对象返回。 */
 export function applyHistoryPage(
   state: SessionProjection,
@@ -226,6 +234,8 @@ const eventIdentity = (event: RendererAgentEvent): SessionIdentity | null => {
   if (event.type === 'worker-exited' || event.type === 'snapshot') return null;
   // 标题总结不属于任何 worker 会话（无 identity/seq），在 store 层处理，不进投影
   if (event.type === 'title-generated' || event.type === 'title-failed') return null;
+  // 通用补全结果在 Main agentHost 就已结算，不会到达渲染层；这里只为收窄联合类型
+  if (event.type === 'text-completed' || event.type === 'text-failed') return null;
   if (event.type === 'capability-invoke') return event.child;
   return event.identity;
 };
@@ -325,6 +335,7 @@ export function applyAgentEvent(
 
   const identity = eventIdentity(event);
   if (event.type === 'title-generated' || event.type === 'title-failed') return state;
+  if (event.type === 'text-completed' || event.type === 'text-failed') return state;
   // spawn 拒绝恒以 seq:0 发出（worker 侧此时尚未建会话，没有 seq 计数器），
   // 过不了下面的 (generation, seq) 单调守卫。一并丢弃的后果是 spawn 失败在
   // UI 上完全无声：spawning 被别处清掉、status 停在 idle、error 为空，用户
@@ -384,6 +395,8 @@ export function applyAgentEvent(
         // 不归零则复活后的 status/message 全部被单调守卫丢掉：无 loading、无回复、无报错
         lastSeq: 0,
       };
+    case 'workspace-branch-context-consumed':
+      return { ...state, generation: state.generation ?? identity.generation, lastSeq: event.seq };
     case 'status': {
       const base =
         event.status === 'running'
@@ -553,8 +566,26 @@ export function applyAgentEvent(
         toolStartedAt: {},
         lastSeq: event.seq,
       };
-    case 'messages-truncated':
-      return { ...current, messages: current.messages.slice(0, event.length), lastSeq: event.seq };
+    case 'messages-truncated': {
+      const base = current.historyBaseIndex ?? 0;
+      const localKeep = event.length - base;
+      if (localKeep >= current.messages.length) {
+        return { ...current, lastSeq: event.seq };
+      }
+      if (localKeep > 0) {
+        return {
+          ...current,
+          messages: current.messages.slice(0, localKeep),
+          lastSeq: event.seq,
+        };
+      }
+      return {
+        ...current,
+        messages: current.messages.filter((message) => message.optimistic),
+        historyBaseIndex: undefined,
+        lastSeq: event.seq,
+      };
+    }
     case 'commands':
       return { ...current, commands: event.commands, lastSeq: event.seq };
     case 'turn-failed':
