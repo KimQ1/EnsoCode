@@ -6,12 +6,16 @@ import {
   type ProviderEntry,
   revokePairing,
 } from '@enso/pair';
+import { parseCompactCommand } from '@shared/compactCommand';
 import { Smartphone } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { applyAppBadge, attentionBadgeCount } from './attentionBadge';
 import { ChatScreen } from './ChatScreen';
 import { type ConnState, PairClient, type SessionView } from './client';
+import { formatOnlineConnectionLabel } from './connectionLabel';
 import { pickActive, removeDevice, renameDevice, upsertDevice } from './deviceList';
+import { parseSessionFromSearch, parseSessionId, takeStashedSessionId } from './launchSession';
 import { NewSessionSheet } from './NewSessionSheet';
 import { PairScreen } from './PairScreen';
 import {
@@ -22,6 +26,13 @@ import {
   subscribePush,
   unsubscribePush,
 } from './push';
+import {
+  captureQueueSendEcho,
+  type QueueSendEcho,
+  retainQueueSendEchoes,
+  userTextsOf,
+  withoutQueuedIds,
+} from './queueSendEcho';
 import { SessionConfigSheet } from './SessionConfigSheet';
 import { SessionDrawer } from './SessionDrawer';
 import {
@@ -33,7 +44,9 @@ import {
   saveDevices,
   saveLastSession,
 } from './storage';
+import { setPhoneAgentActions } from './stubs/electron-api';
 import { setQueueActions } from './stubs/sessions-store';
+import { shouldHoldWakeLock, syncWakeLock } from './wakeLock';
 
 /**
  * 扫码直达：桌面二维码是 https 链接，系统相机可直接打开本页并带上 #relay=…&pk=…。
@@ -59,9 +72,9 @@ const PUSH_ENABLED_KEY = 'enso-phone-push';
 
 /** 通知点击冷启动时带的 ?session=：取出即抹掉，优先于上次会话 */
 function takeSessionFromUrl(): string | null {
-  const params = new URLSearchParams(window.location.search);
-  const sessionId = params.get('session');
+  const sessionId = parseSessionFromSearch(window.location.search);
   if (!sessionId) return null;
+  const params = new URLSearchParams(window.location.search);
   params.delete('session');
   const query = params.toString();
   history.replaceState(null, '', window.location.pathname + (query ? `?${query}` : ''));
@@ -86,23 +99,25 @@ export function App() {
   const [adding, setAdding] = useState(false);
   const [state, setState] = useState<ConnState>('connecting');
   const [transport, setTransport] = useState<'relay' | 'direct'>('relay');
+  const [rttMs, setRttMs] = useState<number | null>(null);
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   /** 桌面置顶组的手动拖拽顺序（旧桌面不下发，空 = 按活跃倒序） */
   const [pinnedOrder, setPinnedOrder] = useState<string[]>([]);
   const [projects, setProjects] = useState<ProjectEntry[]>([]);
   const [projectGroups, setProjectGroups] = useState<ProjectGroupEntry[]>([]);
   const [providers, setProviders] = useState<ProviderEntry[]>([]);
+  const [urlSession] = useState(takeSessionFromUrl);
   const [activeId, setActiveId] = useState<string | null>(() => {
     const initial = pickActive(loadDevices(), loadActiveDeviceId());
-    return takeSessionFromUrl() ?? (initial ? loadLastSession(initial.pairId) : null);
+    return urlSession ?? (initial ? loadLastSession(initial.pairId) : null);
   });
   const [view, setView] = useState<SessionView | null>(null);
   /** 订阅会话同步中（subscribe 已发、snapshot 未回）：此时时间线可能是陈旧的 */
   const [syncing, setSyncing] = useState(false);
   /** 上滑翻页在途的会话 */
   const [historyPending, setHistoryPending] = useState<ReadonlySet<string>>(new Set());
-  /** 横幅刚收起时短暂闪现「已是最新」，随后淡出 */
-  const [okFlash, setOkFlash] = useState(false);
+  /** 马上发送：本地乐观上墙，等权威 user 消息到达再收掉 */
+  const [queueEchoes, setQueueEchoes] = useState<QueueSendEcho[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [composing, setComposing] = useState(false);
   /** 从抽屉项目旁进入时预填；顶栏新建为 null */
@@ -117,7 +132,12 @@ export function App() {
   const [pushBusy, setPushBusy] = useState(false);
   const [pushError, setPushError] = useState<PushFailureReason | null>(null);
   const clientRef = useRef<PairClient | null>(null);
-  const activeIdRef = useRef<string | null>(null);
+  const activeIdRef = useRef<string | null>(activeId);
+  const catalogRef = useRef(catalog);
+  const viewRef = useRef(view);
+  catalogRef.current = catalog;
+  viewRef.current = view;
+  activeIdRef.current = activeId;
   /** VAPID 公钥（桌面下发）；用 ref 避免重建连接 effect */
   const vapidKeyRef = useRef<string | null>(null);
 
@@ -127,11 +147,46 @@ export function App() {
     if (!('serviceWorker' in navigator)) return;
     const onMessage = (event: MessageEvent) => {
       const data = event.data as { type?: string; sessionId?: string };
-      if (data?.type === 'open-session' && data.sessionId) setActiveId(data.sessionId);
+      if (data?.type !== 'open-session') return;
+      const sessionId = parseSessionId(data.sessionId);
+      if (!sessionId) return;
+      setActiveId(sessionId);
+      setDrawerOpen(false);
     };
     navigator.serviceWorker.addEventListener('message', onMessage);
     return () => navigator.serviceWorker.removeEventListener('message', onMessage);
   }, []);
+  useEffect(() => {
+    applyAppBadge(attentionBadgeCount(catalog));
+  }, [catalog]);
+
+  useEffect(() => {
+    const sync = () => {
+      void syncWakeLock(
+        shouldHoldWakeLock(document.visibilityState === 'visible' && state === 'online', catalog)
+      );
+    };
+    sync();
+    document.addEventListener('visibilitychange', sync);
+    document.addEventListener('pointerdown', sync, { passive: true });
+    return () => {
+      document.removeEventListener('visibilitychange', sync);
+      document.removeEventListener('pointerdown', sync);
+      void syncWakeLock(false);
+    };
+  }, [catalog, state]);
+
+  useEffect(() => {
+    if (urlSession) {
+      void takeStashedSessionId();
+      return;
+    }
+    void takeStashedSessionId().then((id) => {
+      if (!id) return;
+      setActiveId(id);
+      setDrawerOpen(false);
+    });
+  }, [urlSession]);
 
   // 已配对状态下扫桌面二维码（地址栏带 #pk=）：进入添加流程，不再覆盖旧配对
   // biome-ignore lint/correctness/useExhaustiveDependencies: 只在挂载时判一次
@@ -150,7 +205,11 @@ export function App() {
     setTransport('relay');
     const client = new PairClient(device, {
       onState: setState,
-      onTransport: setTransport,
+      onTransport: (next) => {
+        setTransport(next);
+        setRttMs(null);
+      },
+      onRtt: setRttMs,
       onCatalog: (entries, order) => {
         setCatalog(entries);
         setPinnedOrder(order ?? []);
@@ -198,7 +257,9 @@ export function App() {
         client.nudge('visibility');
         client.send({ type: 'presence', visible: true });
       } else {
+        client.conceal();
         client.send({ type: 'presence', visible: false });
+        client.flushCache();
       }
     };
     const onOnline = () => {
@@ -207,11 +268,30 @@ export function App() {
         client.send({ type: 'presence', visible: true });
       }
     };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (document.visibilityState !== 'visible') return;
+      // bfcache 回来的 socket 几乎一定是半开，当网络恢复拆掉
+      client.nudge(event.persisted ? 'online' : 'visibility');
+      client.send({ type: 'presence', visible: true });
+    };
+    const onFocus = () => {
+      if (document.visibilityState === 'visible') client.nudge('visibility');
+    };
+    const onPageHide = () => {
+      client.conceal();
+      client.flushCache();
+    };
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('online', onOnline);
+    window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('pagehide', onPageHide);
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('online', onOnline);
+      window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('pagehide', onPageHide);
       client.close();
       clientRef.current = null;
     };
@@ -235,18 +315,59 @@ export function App() {
 
   // 排队区复用桌面组件，它经 store 桩调用这些方法；这里转成 pair 命令发回桌面
   useEffect(() => {
+    // 马上发送：先本地出队+上墙，再发命令。steer 要等当前轮边界，权威 user 晚到。
+    const echoQueuedNow = (sessionId: string, messageId: string) => {
+      const queued = catalogRef.current.find((entry) => entry.id === sessionId)?.queued;
+      const messages =
+        sessionId === activeIdRef.current && viewRef.current
+          ? [...viewRef.current.messages.values()]
+          : [];
+      const echo = captureQueueSendEcho(queued, sessionId, messageId, userTextsOf(messages));
+      if (echo) setQueueEchoes((prev) => [...prev, echo]);
+    };
     setQueueActions({
       removeQueuedMessage: (sessionId, messageId) =>
         clientRef.current?.send({ type: 'queue-remove', sessionId, messageId }),
       updateQueuedMessage: (sessionId, messageId, text) =>
         clientRef.current?.send({ type: 'queue-update', sessionId, messageId, text }),
-      sendQueuedNow: (sessionId, messageId) =>
-        clientRef.current?.send({ type: 'queue-send-now', sessionId, messageId }),
+      sendQueuedNow: (sessionId, messageId) => {
+        echoQueuedNow(sessionId, messageId);
+        clientRef.current?.send({ type: 'queue-send-now', sessionId, messageId });
+      },
       interruptAndSendQueued: async (sessionId, messageId) => {
+        echoQueuedNow(sessionId, messageId);
         clientRef.current?.send({ type: 'queue-interrupt-send', sessionId, messageId });
       },
+      pauseGoal: (sessionId) => clientRef.current?.send({ type: 'goal-pause', sessionId }),
+      resumeGoal: (sessionId) => clientRef.current?.send({ type: 'goal-resume', sessionId }),
+      clearGoal: (sessionId) => clientRef.current?.send({ type: 'goal-clear', sessionId }),
+      rewind: (sessionId, userIndexFromEnd, restoreFiles) =>
+        clientRef.current?.send({
+          type: 'rewind',
+          sessionId,
+          userIndexFromEnd,
+          ...(restoreFiles ? { restoreFiles } : {}),
+        }),
+      retry: (sessionId) => clientRef.current?.send({ type: 'retry', sessionId }),
+    });
+    setPhoneAgentActions({
+      stopTask: (sessionId, taskId) =>
+        clientRef.current?.send({ type: 'task-stop', sessionId, taskId }),
+      stopSubagent: (sessionId, agentId) =>
+        clientRef.current?.send({ type: 'subagent-stop', sessionId, agentId }),
     });
   }, []);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const texts = userTextsOf(view ? [...view.messages.values()] : []);
+    setQueueEchoes((prev) => {
+      const next = retainQueueSendEchoes(prev, activeId, texts);
+      return next.length === prev.length && next.every((echo, index) => echo === prev[index])
+        ? prev
+        : next;
+    });
+  }, [view, activeId]);
 
   // 首次连上且没有选中会话时，落到最近一条
   const firstId = catalog.find((c) => !c.parentId)?.id;
@@ -272,43 +393,21 @@ export function App() {
       '选择模型')
     : undefined;
 
-  // TG 式状态横幅：非 online 显示连接状态；online 且订阅同步中显示同步中；
-  // 收起瞬间短暂闪现「已是最新」再淡出，不常驻占屏。
-  const bannerLabel =
-    state !== 'online' && state !== 'unauthorized'
-      ? STATE_LABEL[state]
-      : state === 'online' && syncing && activeId
-        ? '同步中…'
-        : null;
   // 在线时附带业务帧出口（直连 / 中继）：顶栏副标题与抽屉设备行共用
   const connectionLabel =
-    state === 'online'
-      ? `${STATE_LABEL.online} · ${transport === 'direct' ? '直连' : '中继'}`
-      : STATE_LABEL[state];
-  const prevBannerRef = useRef<string | null>(null);
-  useEffect(() => {
-    const prev = prevBannerRef.current;
-    prevBannerRef.current = bannerLabel;
-    if (prev && !bannerLabel) {
-      setOkFlash(true);
-      const timer = setTimeout(() => setOkFlash(false), 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [bannerLabel]);
-  const banner = bannerLabel
-    ? { label: bannerLabel, tone: 'progress' as const }
-    : okFlash
-      ? { label: '已是最新', tone: 'ok' as const }
-      : null;
+    state === 'online' ? formatOnlineConnectionLabel(transport, rttMs) : STATE_LABEL[state];
 
   /** 切到另一台时清空上一台的目录/视图，等新桌面下发 */
   const resetHostState = (nextActiveId: string | null) => {
     setCatalog([]);
+    setPinnedOrder([]);
     setProjects([]);
     setProjectGroups([]);
     setProviders([]);
     setView(null);
     setSyncing(false);
+    setQueueEchoes([]);
+    setRttMs(null);
     setActiveId(nextActiveId);
   };
 
@@ -336,6 +435,8 @@ export function App() {
     const target = devices.find((d) => d.pairId === pairId);
     // 手机侧持 deviceToken，可一并清掉中继房间（桌面重连即被拒）；已被对端解绑时失败无妄
     if (target) void revokePairing(target.relayUrl, target.pairId, target.token).catch(() => {});
+    // 先停旧 client 的缓存写入，再删缓存；不能等 React effect 清理时重新写回。
+    if (pairId === device?.pairId) clientRef.current?.close();
     clearDeviceData(pairId);
     const next = removeDevice(devices, pairId);
     setDevices(next);
@@ -420,7 +521,7 @@ export function App() {
         view={view}
         connState={state}
         stateLabel={connectionLabel}
-        banner={banner}
+        syncing={syncing && Boolean(activeId)}
         onOpenDrawer={() => setDrawerOpen(true)}
         onNewSession={() => {
           setComposeProjectId(null);
@@ -436,9 +537,31 @@ export function App() {
         )}
         historyLoading={Boolean(activeId && historyPending.has(activeId))}
         onLoadOlder={() => activeId && clientRef.current?.requestHistory(activeId)}
-        queued={entry?.queued}
+        queued={withoutQueuedIds(entry?.queued, queueEchoes, activeId ?? '')}
+        echoes={queueEchoes}
+        goal={entry?.goal}
+        slashCommands={entry?.slashCommands}
         onSend={(text, images) => {
           if (!activeId) return;
+          const compact = parseCompactCommand(text);
+          if (compact) {
+            send({
+              type: 'compact',
+              sessionId: activeId,
+              ...(compact.instructions ? { instructions: compact.instructions } : {}),
+            });
+            return;
+          }
+          const goalMatch = /^\/goal(?:\s+([\s\S]+))?$/.exec(text.trim());
+          if (goalMatch) {
+            const arg = goalMatch[1]?.trim();
+            if (!arg) return;
+            if (arg === 'clear') send({ type: 'goal-clear', sessionId: activeId });
+            else if (arg === 'pause') send({ type: 'goal-pause', sessionId: activeId });
+            else if (arg === 'resume') send({ type: 'goal-resume', sessionId: activeId });
+            else send({ type: 'goal-set', sessionId: activeId, text: arg });
+            return;
+          }
           // 与桌面同语义：轮次进行中先入队（可编辑/删除/立即发送/打断并发送）
           send({
             type: view?.status === 'running' ? 'enqueue' : 'prompt',

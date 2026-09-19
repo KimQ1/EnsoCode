@@ -1,8 +1,5 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { describe, expect, it } from 'vitest';
-import { computeFileHash, formatHashlineHeader } from './hashline/format';
-import { InMemorySnapshotStore } from './hashline/snapshots';
-import { withHashlineRead } from './hashline/withRead';
 import {
   createIsolatedSandboxTool,
   guestCallableName,
@@ -44,7 +41,41 @@ describe('looksLikeShellCommand', () => {
 });
 
 describe('createIsolatedSandboxTool', () => {
-  it('prompt 只鼓励 3+ 聚合，并写明单次包装、父级 hashline 与截断成本', () => {
+  it('嵌套工具的字符串参数原样下传，不收成空对象', async () => {
+    let received: unknown;
+    const patch = mockTool('apply_patch', async (_id, params) => {
+      received = params;
+      return { content: [{ type: 'text', text: 'ok' }] };
+    });
+    const payload = '*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch';
+    const result = await run(`return await apply_patch(${JSON.stringify(payload)});`, [patch]);
+    expect(received).toBe(payload);
+    expect(result.details.status).toBe('completed');
+  });
+
+  it('整段 apply_patch 信封拒绝执行，JS 里提到信封不拦截', async () => {
+    const tool = createIsolatedSandboxTool({ getTools: () => [] });
+    const envelope = '*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch';
+    await expect(
+      tool.execute('exec-1', { code: envelope }, undefined, undefined, {} as never)
+    ).rejects.toThrow(/not an apply_patch document/);
+    await expect(
+      tool.execute(
+        'exec-1',
+        { code: '*** Begin Patch ***\n*** Add File: a.txt\n+a\n*** End Patch ***' },
+        undefined,
+        undefined,
+        {} as never
+      )
+    ).rejects.toThrow(/not an apply_patch document/);
+    const mentioned = await run(
+      'const input = `*** Begin Patch\\n*** Add File: a.txt\\n+a\\n*** End Patch`; return input.length;'
+    );
+    expect(mentioned.details.status).toBe('completed');
+    expect(mentioned.details.value).toBe(envelope.length);
+  });
+
+  it('prompt 保留约束且不含 hashline snapshot 说明', () => {
     const tool = createIsolatedSandboxTool({ getTools: () => [] });
     const text = [tool.description, tool.promptSnippet, ...(tool.promptGuidelines ?? [])].join(
       '\n'
@@ -54,12 +85,13 @@ describe('createIsolatedSandboxTool', () => {
     expect(text).toMatch(/reduced result/i);
     expect(text).toMatch(/not for exploring/i);
     expect(text).toMatch(/Do not wrap a single read\/grep\/find/i);
-    expect(text).toMatch(/parent hashline snapshot/i);
+    expect(text).not.toMatch(/parent hashline snapshot/i);
     expect(text).toMatch(/JSON-serialized and truncated/i);
     expect(text).not.toMatch(/Hashline headers require the Hashline setting/i);
     expect(text).toMatch(/No console/i);
     expect(text).toMatch(/isError: true/i);
     expect(text).toMatch(/listTools/i);
+    expect(tool.promptSnippet).toMatch(/Do not spawn a subagent for this/i);
   });
 
   it('guestCallableName 把 MCP 名收成合法标识符且不撞名', () => {
@@ -160,6 +192,31 @@ describe('createIsolatedSandboxTool', () => {
     expect(result.details.value).toEqual(['a.ts', 'b.ts']);
   });
 
+  it('apply_patch partial 即使工具 execute 返回未标错，guest 仍收到 isError 且保留 details', async () => {
+    const patch = mockTool('apply_patch', async () => ({
+      content: [{ type: 'text', text: 'one file applied, one failed' }],
+      details: {
+        kind: 'apply_patch',
+        status: 'partial',
+        applied: ['a.ts'],
+        failed: ['b.ts'],
+      },
+    }));
+    const result = await run(
+      `const out = await apply_patch({ patch: "x" }); return { error: out.isError, details: out.details };`,
+      [patch]
+    );
+    expect(result.details.value).toEqual({
+      error: true,
+      details: {
+        kind: 'apply_patch',
+        status: 'partial',
+        applied: ['a.ts'],
+        failed: ['b.ts'],
+      },
+    });
+  });
+
   it('工具失败 resolve 为 isError，不拖垮 Promise.all', async () => {
     const read = mockTool('read', async (_id, params) => {
       const path = (params as { path: string }).path;
@@ -246,25 +303,6 @@ describe('createIsolatedSandboxTool', () => {
       hits: 0,
       names: 1,
     });
-  });
-
-  it('hashline 包装的 read 把文件头和行号带回 guest', async () => {
-    const path = '/tmp/a.ts';
-    const body = 'alpha\nbeta\n';
-    const store = new InMemorySnapshotStore();
-    const raw = mockTool('read', async () => ({
-      content: [{ type: 'text', text: body }],
-      details: { raw: true },
-    }));
-    const read = withHashlineRead(raw, store) as unknown as ToolDefinition;
-    const result = await run(`return (await read({ path: ${JSON.stringify(path)} })).content;`, [
-      read,
-    ]);
-    const content = result.details.value;
-    expect(typeof content).toBe('string');
-    expect(content).toContain(formatHashlineHeader(path, computeFileHash(body)));
-    expect(content).toContain('1:alpha');
-    expect(content).toContain('2:beta');
   });
 
   it('Promise.all 超出预算在 enqueue 时失败，且不执行已入队调用', async () => {

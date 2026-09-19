@@ -1,3 +1,4 @@
+import type { CompactStrategy } from '@shared/compactStrategy';
 import type {
   DefaultModelNotice,
   DefaultModelRef,
@@ -9,6 +10,7 @@ import type { StatusLineSegmentId } from '@shared/statusLine';
 import type { TerminalShell } from '@shared/terminalShell';
 import type {
   AgentTypeEntry,
+  EditMode,
   InstructionEntry,
   McpServerEntry,
   ModelProvider,
@@ -108,13 +110,12 @@ export interface SettingsState {
   /** 探后折叠：模型可 explore_mark / explore_fold；缺省关 */
   exploreFoldEnabled: boolean;
 
-  /** 强制用 read/grep/edit/write/find 替代 cat/grep/sed -i 等 shell 读写；缺省关 */
-  bashInterceptEnabled: boolean;
+  /** 文件编辑工具模式；缺省 apply_patch，新建或冷恢复会话生效。 */
+  editMode: EditMode;
 
-  /** Hashline 行锚点 read/edit；缺省关。开时 edit 仍兼容 oldText replace */
-  hashlineEditEnabled: boolean;
-
-  /** 父会话用 Enso compact hook 做 compact 摘要；缺省关，新会话生效 */
+  /** 上下文压缩策略；缺省 standard，新会话生效。 */
+  compactStrategy: CompactStrategy;
+  /** 旧设置兼容：rehydrate 后由策略选择取代。 */
   smartCompactEnabled: boolean;
   /** 智能压缩独立模型；null = 跟随当前会话模型 */
   smartCompactModel: DefaultModelRef | null;
@@ -136,6 +137,8 @@ export interface SettingsState {
 
   /** 是否自动检查并下载应用更新；缺省 true */
   autoUpdate: boolean;
+  /** 包已下好且空闲连续 5 分钟后自动重启安装；缺省关 */
+  autoRestartWhenIdle: boolean;
 
   /** 网络代理：系统 / 直连 / 自定义；缺省 system */
   proxyMode: ProxyMode;
@@ -200,6 +203,8 @@ export interface SettingsState {
   providers: ModelProvider[];
   /** 尚未自选模型的新会话与 Enso 共用的全局默认；只保存 provider entry id + model id */
   defaultModel: DefaultModelRef | null;
+  /** 新会话跟随聊天里最后一次选的模型；缺省关（钉死当前 defaultModel） */
+  defaultModelFollowLast: boolean;
   /** 会话标题总结：首条用户消息后用小模型生成短标题；缺省关 */
   titleSummaryEnabled: boolean;
   /** 标题总结独立模型；null = 跟随全局默认模型 */
@@ -273,12 +278,13 @@ export interface SettingsState {
   setMemoryEmbeddingRemoteProviderId: (value: string | null) => void;
   setMemoryDistillEnabled: (value: boolean) => void;
   setMemoryKgEnabled: (value: boolean) => void;
-  setBashInterceptEnabled: (value: boolean) => void;
-  setHashlineEditEnabled: (value: boolean) => void;
+  setEditMode: (value: EditMode) => void;
+  setCompactStrategy: (value: CompactStrategy) => void;
   setSmartCompactEnabled: (value: boolean) => void;
   setSmartCompactModel: (value: DefaultModelRef | null) => void;
   setSmartCompactMode: (value: import('@shared/smartCompactMode').SmartCompactMode) => void;
   setAutoUpdate: (value: boolean) => void;
+  setAutoRestartWhenIdle: (value: boolean) => void;
   setProxyMode: (mode: ProxyMode) => void;
   setCustomProxyUrl: (url: string) => void;
   setOpenChangesOnFileEdit: (value: boolean) => void;
@@ -320,6 +326,10 @@ export interface SettingsState {
 
   /** 设置全局默认；只持久化 provider entry id + model id */
   setDefaultModel: (defaultModel: DefaultModelRef | null) => void;
+  /** 打开后，聊天里换模型会写回全局默认；在设置里再选具体模型则钉死 */
+  setDefaultModelFollowLast: (value: boolean) => void;
+  /** 仅 follow-last 开启时写回默认模型，不把模式切回钉死 */
+  rememberDefaultModelFromSelection: (selection: DefaultModelRef) => void;
   /** 用当前 OAuth 真凭证快照重校验；非 ready/stale 时绝不写回 */
   revalidateDefaultModel: (snapshot: OauthCredentialSnapshot) => DefaultModelRevalidation;
   setDefaultReasoningEnabled: (value: boolean) => void;
@@ -420,6 +430,8 @@ export interface SettingsState {
     model: DefaultModelRef | null,
     reasoning?: { reasoningEnabled: boolean; thinkingLevel: ThinkingLevel } | null
   ) => void;
+  /** null = 跟随全局；数组覆盖全局（空 = 本项目全开） */
+  setProjectDisabledBuiltinTools: (projectId: string, disabled: string[] | null) => void;
 
   /** 非法条目不写入，返回 false */
   setUsageModelPricing: (modelId: string, pricing: ModelPricing) => boolean;

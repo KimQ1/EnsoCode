@@ -9,16 +9,24 @@ import {
   fromBase64Url,
   type Heartbeat,
   type HostToPhone,
+  isConnectStuck,
+  isForegroundSocketStale,
+  isPairSyncCursor,
   type NudgeReason,
   openFrame,
   type PairedDevice,
+  type PairSessionSync,
+  type PairSyncCursor,
   type PhoneToHost,
   type ProjectEntry,
   type ProjectGroupEntry,
   type ProviderEntry,
+  parsePairSessionSync,
+  RELAY_CONNECT_TIMEOUT_MS,
   sealFrame,
   shouldReplaceOnNudge,
   toWebSocketUrl,
+  VISIBILITY_PROBE_MS,
 } from '@enso/pair';
 import {
   applyGuestEvent,
@@ -36,7 +44,7 @@ import {
   type SyncState,
   type SyncTracking,
 } from '@shared/pair/syncProjection';
-import { loadCursors, saveCursor } from './storage';
+import { type PhoneCacheData, type PhoneCacheStore, phoneCache } from './sessionCache';
 import {
   setCompactReadOnlyTools,
   setExpandLiveEdits,
@@ -62,7 +70,7 @@ export interface ClientEvents {
   onSession(sessionId: string, view: SessionView): void;
   /** 桌面下发 VAPID 公钥：有它才能 pushManager.subscribe */
   onPushConfig?(vapidPublicKey: string): void;
-  /** 订阅会话的同步状态：subscribe 发出 → snapshot 回包之间为 syncing */
+  /** 订阅到快照或增量确认之间为 syncing；旧内容仍可展示 */
   onSync?(state: SyncState): void;
   /** 订阅的会话已被桌面删除（曾在目录、现在消失）：上层应跳离该会话 */
   onGhostSession?(sessionId: string): void;
@@ -70,6 +78,8 @@ export interface ClientEvents {
   onHistoryPending?(sessionId: string, pending: boolean): void;
   /** 业务帧出口切换：直连（WebRTC）↔ 中继 */
   onTransport?(transport: DirectTransport): void;
+  /** 当前业务通道 ping→pong 往返（ms） */
+  onRtt?(ms: number): void;
 }
 
 export class PairClient {
@@ -87,11 +97,42 @@ export class PairClient {
   private historyPending = new Set<string>();
   private sync: SyncTracking = initialSync;
   private direct: DirectLink;
+  private cursors = new Map<string, PairSyncCursor>();
+  private baselines = new Set<string>();
+  private pendingSync: {
+    sessionId: string;
+    requestId: string;
+    observed?: PairSyncCursor | 'mixed';
+  } | null = null;
+  private freshSessionId: string | null = null;
+  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  private receiveQueue = Promise.resolve();
+  private sendQueue = Promise.resolve();
+  private cacheReady = false;
+  private cacheLoading = false;
+  private cacheTimer: ReturnType<typeof setTimeout> | null = null;
+  private cacheDirty = false;
+  /** 当前这条 WS 已经发过进房 snapshot/subscribe；host-online 立刻再来时不再打第二遍 */
+  private roomPrimed = false;
+  /** 上次退到后台的时刻；回前台用来判断 TCP 是否多半已被冻死 */
+  private hiddenAt: number | null = null;
+  /** 换中继 socket 期间先别发 offer，等 host-online 再 ICE restart */
+  private pendingDirectRestart = false;
+  private probeNonce = 0;
+  private probeSentAt: number | null = null;
+  private metadata: Omit<PhoneCacheData, 'sessions'> = {
+    catalog: [],
+    pinnedOrder: [],
+    projects: [],
+    projectGroups: [],
+    providers: [],
+  };
 
   constructor(
     private device: PairedDevice,
     private events: ClientEvents,
-    directFactory: DirectPeerFactory | null = createBrowserDirectPeerFactory()
+    directFactory: DirectPeerFactory | null = createBrowserDirectPeerFactory(),
+    private cache: PhoneCacheStore = phoneCache
   ) {
     this.contentKey = fromBase64Url(device.contentKey);
     this.direct = new DirectLink({
@@ -99,7 +140,7 @@ export class PairClient {
       factory: directFactory,
       // 信令只走中继；直连未建/已坏时信令就是为了修它
       sendSignal: (signal) => this.sendViaRelay(signal as PhoneToHost),
-      onFrame: (frame) => void this.handleFrame(frame),
+      onFrame: (frame) => this.enqueueFrame(frame),
       onTransportChange: (t) => {
         if (t === 'relay' && this.ws?.readyState !== 1 && !this.revoked && !this.closed) {
           this.events.onState('offline');
@@ -108,10 +149,12 @@ export class PairClient {
       },
       // 切通道瞬间旧通道在途帧可能丢：按重连同一套语义补（目录 + 游标增量）
       onResync: () => {
-        this.send({ type: 'snapshot' });
-        if (this.subscribedId) this.subscribe(this.subscribedId);
+        this.roomPrimed = false;
+        this.primeRoom();
       },
       onDiagnostic: (line) => console.info(`[pair] ${line}`),
+      onRtt: (ms) => this.events.onRtt?.(ms),
+      onNeedRelayProbe: () => this.sendRelayProbe(),
     });
   }
 
@@ -120,7 +163,38 @@ export class PairClient {
   }
 
   connect(): void {
-    if (this.closed) return;
+    if (this.closed || this.revoked || this.cacheLoading || (this.ws && this.ws.readyState < 2))
+      return;
+    if (!this.cacheReady) {
+      this.cacheLoading = true;
+      void this.cache
+        .load(this.device.pairId)
+        .then((cached) => {
+          if (!cached || this.closed || this.revoked) return;
+          const { sessions, ...metadata } = cached;
+          this.metadata = metadata;
+          this.sync = {
+            ...this.sync,
+            knownIds: new Set(metadata.catalog.map((entry) => entry.id)),
+          };
+          this.events.onCatalog(metadata.catalog, metadata.pinnedOrder);
+          this.events.onProjects(metadata.projects, metadata.projectGroups);
+          this.events.onProviders(metadata.providers);
+          for (const { id, view, cursor } of sessions) {
+            this.sessions.set(id, view);
+            this.baselines.add(id);
+            if (cursor) this.cursors.set(id, cursor);
+            this.events.onSession(id, { ...view, messages: new Map(view.messages) });
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          this.cacheReady = true;
+          this.cacheLoading = false;
+          this.connect();
+        });
+      return;
+    }
     this.events.onState('connecting');
     const base = toWebSocketUrl(this.device.relayUrl);
     const url = `${base}/v1/pair/${encodeURIComponent(this.device.pairId)}?role=guest&token=${encodeURIComponent(this.device.token)}`;
@@ -133,62 +207,80 @@ export class PairClient {
     }
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
+    this.roomPrimed = false;
 
     // 半开死链的 close 事件可能永不到达：心跳判死后直接走关闭路径，幂等防双跑
     let settled = false;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
     const closed = (code: number | null): void => {
       if (settled) return;
       settled = true;
+      if (connectTimer) clearTimeout(connectTimer);
+      if (this.ws !== ws) return;
       this.heartbeat?.stop();
       this.heartbeat = null;
       this.ws = null;
+      this.roomPrimed = false;
       // 1008 = 中继明确告知凭据已失效（解绑时下发，或带失效凭据重连时下发）
       if (code === 1008 || this.revoked) {
-        this.revoked = true;
-        this.direct.close();
-        this.events.onState('unauthorized');
+        this.revoke();
         return;
       }
+      if (this.closed) return;
       // 直连还活着就不算掉线：中继默默重连，直连再掉时由 onTransportChange 补置 offline
       if (this.direct.transport() !== 'direct') this.events.onState('offline');
       this.scheduleReconnect();
     };
-    this.heartbeat = attachHeartbeat(ws, () => {
-      try {
-        ws.close();
-      } catch {}
-      closed(null);
-    });
+    this.heartbeat = attachHeartbeat(
+      ws,
+      () => {
+        try {
+          ws.close();
+        } catch {}
+        closed(null);
+      },
+      (ms) => {
+        if (this.direct.transport() === 'relay') this.events.onRtt?.(ms);
+      }
+    );
+    connectTimer = setTimeout(() => {
+      if (isConnectStuck(ws.readyState, RELAY_CONNECT_TIMEOUT_MS)) {
+        try {
+          ws.close();
+        } catch {}
+        closed(null);
+      }
+    }, RELAY_CONNECT_TIMEOUT_MS);
 
     ws.onopen = () => {
+      if (this.closed || this.revoked || this.ws !== ws) return;
+      clearTimeout(connectTimer);
       this.attempt = 0;
-      // 进房后立即要目录；有订阅则带游标续传
-      this.send({ type: 'snapshot' });
-      if (this.subscribedId) this.subscribe(this.subscribedId);
+      this.primeRoom();
     };
 
     ws.onmessage = (event) => {
+      if (this.closed || this.revoked || this.ws !== ws) return;
       if (typeof event.data === 'string') {
         try {
           const control = JSON.parse(event.data) as { type?: string };
           if (control.type === 'host-online') {
             this.events.onState('online');
             this.direct.peerOnline(true);
-            this.send({ type: 'snapshot' });
-            if (this.subscribedId) this.subscribe(this.subscribedId);
+            this.flushDirectRestart();
+            this.primeRoom();
           } else if (control.type === 'host-offline') {
             this.events.onState('host-offline');
             this.direct.peerOnline(false);
+            this.roomPrimed = false;
           } else if (control.type === 'revoked') {
             // 桌面端解除了配对：立即停手，别再重连
-            this.revoked = true;
-            this.direct.peerGone();
-            this.events.onState('unauthorized');
+            this.revoke();
           }
         } catch {}
         return;
       }
-      void this.handleFrame(new Uint8Array(event.data as ArrayBuffer));
+      this.enqueueFrame(new Uint8Array(event.data as ArrayBuffer), ws);
     };
 
     ws.onclose = (event) => closed(event.code);
@@ -203,26 +295,47 @@ export class PairClient {
   /** 回前台只探活；网络恢复拆半开链，死链立即重连 */
   nudge(reason: NudgeReason = 'visibility'): void {
     if (this.closed || this.revoked) return;
-    // 网络换了：直连的候选地址已失效，拆掉立即重协商（先落回中继）
-    if (reason === 'online' || reason === 'network-change') this.direct.networkChange();
-    if (shouldReplaceOnNudge(reason, this.ws !== null)) {
-      if (this.timer) clearTimeout(this.timer);
-      this.timer = null;
-      this.attempt = 0;
-      if (this.ws) {
-        try {
-          this.ws.close();
-        } catch {}
-      } else {
-        this.connect();
-      }
+    // 已经在连：别把刚发起的握手掐掉再开第二条
+    if (this.ws?.readyState === 0) {
+      if (reason === 'online' || reason === 'network-change') this.pendingDirectRestart = true;
       return;
     }
-    this.heartbeat?.probe();
+    const hiddenMs = this.hiddenAt === null ? 0 : Date.now() - this.hiddenAt;
+    this.hiddenAt = null;
+    const stale =
+      (reason === 'visibility' || reason === 'resume') && isForegroundSocketStale(hiddenMs);
+    const replace =
+      stale || shouldReplaceOnNudge(reason, this.ws !== null, this.ws?.readyState ?? null);
+    // 直连信令必须走活着的中继。先拆 socket 再发 offer 会把这一轮丢进 15s 超时。
+    if (reason === 'online' || reason === 'network-change' || stale) {
+      if (replace) this.pendingDirectRestart = true;
+      else this.direct.networkChange();
+    }
+    if (replace) {
+      this.replaceRelay();
+      return;
+    }
+    this.heartbeat?.probe(
+      reason === 'visibility' || reason === 'resume' ? VISIBILITY_PROBE_MS : undefined
+    );
+  }
+
+  private flushDirectRestart(): void {
+    if (!this.pendingDirectRestart) return;
+    this.pendingDirectRestart = false;
+    this.direct.networkChange();
+  }
+
+  /** 退后台瞬间记下时刻，回前台判断是否该直接换链 */
+  conceal(): void {
+    this.hiddenAt ??= Date.now();
   }
 
   close(): void {
+    this.flushCache();
     this.closed = true;
+    this.pendingDirectRestart = false;
+    this.stopSyncRetry();
     if (this.timer) clearTimeout(this.timer);
     this.direct.close();
     this.heartbeat?.stop();
@@ -233,18 +346,46 @@ export class PairClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.closed) return;
+    if (this.closed || this.revoked) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => this.connect(), backoffDelay(this.attempt++));
   }
 
-  private async handleFrame(frame: Uint8Array): Promise<void> {
+  /** 拆掉旧链并立刻重连，不走 onclose 后再退避 */
+  private replaceRelay(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.attempt = 0;
+    const old = this.ws;
+    if (old) {
+      this.heartbeat?.stop();
+      this.heartbeat = null;
+      this.ws = null;
+      this.roomPrimed = false;
+      try {
+        old.close();
+      } catch {}
+    }
+    this.connect();
+  }
+
+  private enqueueFrame(frame: Uint8Array, socket?: WebSocket): void {
+    this.receiveQueue = this.receiveQueue
+      .then(async () => {
+        if (this.closed || this.revoked || (socket && socket !== this.ws)) return;
+        await this.handleFrame(frame, socket);
+      })
+      .catch(() => {});
+  }
+
+  private async handleFrame(frame: Uint8Array, socket?: WebSocket): Promise<void> {
     let payload: HostToPhone;
     try {
       payload = (await openFrame(this.contentKey, frame)) as HostToPhone;
     } catch {
       return;
     }
+    if (this.closed || this.revoked || (socket && socket !== this.ws)) return;
     switch (payload.type) {
       case 'catalog': {
         // 幽灵会话判定要在 onCatalog 前：上层可能据 ghost 立即切走
@@ -254,16 +395,32 @@ export class PairClient {
           payload.entries.map((e) => e.id)
         );
         const ghostId = ghost ? this.subscribedId : null;
+        const ids = new Set(payload.entries.map((entry) => entry.id));
+        for (const id of this.sync.knownIds) {
+          if (ids.has(id)) continue;
+          this.sessions.delete(id);
+          this.baselines.delete(id);
+          this.cursors.delete(id);
+        }
         this.setSync(tracking);
+        if (ghostId) this.subscribe(null);
         if (ghostId) this.events.onGhostSession?.(ghostId);
+        this.metadata.catalog = payload.entries;
+        this.metadata.pinnedOrder = payload.pinnedOrder ?? [];
         this.events.onCatalog(payload.entries, payload.pinnedOrder);
+        this.scheduleCache();
         break;
       }
       case 'projects':
+        this.metadata.projects = payload.projects;
+        this.metadata.projectGroups = payload.groups ?? [];
         this.events.onProjects(payload.projects, payload.groups);
+        this.scheduleCache();
         break;
       case 'providers':
+        this.metadata.providers = payload.providers;
         this.events.onProviders(payload.providers);
+        this.scheduleCache();
         break;
       case 'appearance':
         // 先写调色板再算主题：sync-terminal 要用它推导整套 UI 变量
@@ -273,8 +430,14 @@ export class PairClient {
         setExpandLiveEdits(payload.expandLiveEdits !== false);
         break;
       case 'agent-event':
-        this.applyAgentEvent(payload.event as Record<string, unknown>);
+        this.acceptAgentEvent(payload.event as Record<string, unknown>, payload.cursor);
         break;
+      case 'session-sync': {
+        const response = parsePairSessionSync(payload);
+        if (response) this.applySessionSync(response);
+        else console.warn('[pair] dropped invalid session-sync');
+        break;
+      }
       case 'push-config':
         this.events.onPushConfig?.(payload.vapidPublicKey);
         break;
@@ -285,8 +448,15 @@ export class PairClient {
       case 'direct-ice':
         this.direct.handleSignal(payload);
         break;
+      case 'probe-ack':
+        if (payload.nonce === this.probeNonce && this.probeSentAt !== null) {
+          this.direct.noteRelayRtt(Date.now() - this.probeSentAt);
+          this.probeSentAt = null;
+        }
+        break;
       case 'history': {
         // 上滑分页应答：只并入消息，不动 status/审批（那些以尾窗快照为准）
+        if (!this.historyPending.has(payload.sessionId)) break;
         this.historyPending.delete(payload.sessionId);
         this.events.onHistoryPending?.(payload.sessionId, false);
         const view = this.sessions.get(payload.sessionId);
@@ -295,17 +465,127 @@ export class PairClient {
         if (next === view) break;
         this.sessions.set(payload.sessionId, next);
         this.events.onSession(payload.sessionId, { ...next, messages: new Map(next.messages) });
+        this.scheduleCache();
         break;
       }
     }
   }
 
-  /** 把 agent 事件投影进本地会话视图（纯函数在 @shared/pair/guestProjection，这里只管游标与回调） */
+  private applySessionSync(response: PairSessionSync): void {
+    if (
+      this.pendingSync?.requestId !== response.requestId ||
+      this.pendingSync.sessionId !== response.sessionId
+    )
+      return;
+    const id = response.sessionId;
+    this.stopSyncRetry();
+    let view = this.sessions.get(id);
+    if (response.mode === 'snapshot') {
+      // epoch 变化可能是重启、回退或快照替换，旧前缀不能再视为同一段历史。
+      const sessions =
+        this.cursors.get(id)?.epoch === response.cursor.epoch
+          ? this.sessions
+          : new Map<string, SessionView>();
+      view = applyGuestSnapshot(sessions, response.snapshot as { sessions?: unknown[] })[0]?.view;
+      if (view) view = this.keepCachedMessages(id, view);
+    } else {
+      const current = this.cursors.get(id);
+      if (!view || current?.epoch !== response.cursor.epoch || current.seq !== response.fromSeq) {
+        this.cursors.delete(id);
+        this.subscribe(id);
+        return;
+      }
+      for (const value of response.events) {
+        const event = value as Record<string, unknown>;
+        if (this.truncatesBeforeCache(view, event)) {
+          this.cursors.delete(id);
+          this.subscribe(id);
+          return;
+        }
+        view = applyGuestEvent(view, event).view;
+      }
+    }
+    if (!view) return;
+    this.sessions.set(id, view);
+    this.baselines.add(id);
+    this.cursors.set(id, response.cursor);
+    const observed = this.pendingSync.observed;
+    this.pendingSync = null;
+    // 中继与直连切换可乱序：提前到达但不在本次应答内的事件，再从已落地游标补齐。
+    if (
+      observed &&
+      (observed === 'mixed' ||
+        observed.epoch !== response.cursor.epoch ||
+        observed.seq > response.cursor.seq)
+    )
+      this.subscribe(id);
+    else this.setSync({ ...this.sync, state: 'synced' });
+    this.events.onSession(id, { ...view, messages: new Map(view.messages) });
+    this.scheduleCache();
+  }
+
+  private acceptAgentEvent(event: Record<string, unknown>, cursor?: PairSyncCursor): void {
+    const id = typeof event.sessionId === 'string' ? event.sessionId : undefined;
+    if (cursor !== undefined) {
+      if (!id || !isPairSyncCursor(cursor)) return;
+      if (this.pendingSync?.sessionId === id) {
+        const observed = this.pendingSync.observed;
+        this.pendingSync.observed = !observed
+          ? cursor
+          : observed === 'mixed' || observed.epoch !== cursor.epoch
+            ? 'mixed'
+            : { epoch: cursor.epoch, seq: Math.max(observed.seq, cursor.seq) };
+        return;
+      }
+      const current = this.cursors.get(id);
+      if (current?.epoch === cursor.epoch && cursor.seq <= current.seq) return;
+      if (!current || cursor.epoch !== current.epoch || cursor.seq !== current.seq + 1) {
+        if (id === this.subscribedId) {
+          if (this.freshSessionId === id) this.freshSessionId = null;
+          this.subscribe(id);
+        } else this.cursors.delete(id);
+        return;
+      }
+      const view = this.sessions.get(id);
+      if (view && this.truncatesBeforeCache(view, event)) {
+        this.cursors.delete(id);
+        if (id === this.subscribedId) this.subscribe(id);
+        return;
+      }
+      this.applyAgentEvent(event);
+      this.cursors.set(id, cursor);
+    } else {
+      // 旧 host 没有事件版本；内容仍可缓存展示，但不能携旧 epoch 请求增量。
+      if (id) this.cursors.delete(id);
+      this.applyAgentEvent(event);
+    }
+    this.scheduleCache();
+  }
+
+  private truncatesBeforeCache(view: SessionView, event: Record<string, unknown>): boolean {
+    return (
+      event.type === 'messages-truncated' &&
+      typeof event.length === 'number' &&
+      event.length > 0 &&
+      (view.messages.size === 0 || Math.min(...view.messages.keys()) >= event.length)
+    );
+  }
+
+  /** resume 空尾窗尚未就绪：保留本地正文，避免时间线被打成「正在读取历史」。 */
+  private keepCachedMessages(id: string, view: SessionView): SessionView {
+    if (view.messages.size > 0) return view;
+    const local = this.sessions.get(id);
+    if (!local || local.messages.size === 0) return view;
+    return { ...view, messages: new Map(local.messages) };
+  }
+
+  /** 把 agent 事件投影进本地会话视图（纯函数在 @shared/pair/guestProjection） */
   private applyAgentEvent(event: Record<string, unknown>): void {
     const sessionId = event.sessionId as string | undefined;
     const type = event.type as string;
 
     if (type === 'worker-exited') {
+      this.cursors.clear();
       this.sessions = markAllFailed(this.sessions);
       for (const [id, view] of this.sessions) {
         this.events.onSession(id, { ...view, messages: new Map(view.messages) });
@@ -320,22 +600,24 @@ export class PairClient {
         .map((s) => s.sessionId ?? s.identity?.sessionId)
         .filter((id): id is string => typeof id === 'string');
       this.setSync(applySnapshot(this.sync, this.subscribedId, snapshotIds));
-      for (const { id, view, lastIndex } of applyGuestSnapshot(
+      for (const { id, view } of applyGuestSnapshot(
         this.sessions,
         event as { sessions?: unknown[] }
       )) {
-        if (lastIndex !== undefined) saveCursor(this.device.pairId, id, lastIndex);
-        this.sessions.set(id, view);
-        this.events.onSession(id, { ...view, messages: new Map(view.messages) });
+        const next = this.keepCachedMessages(id, view);
+        this.cursors.delete(id);
+        this.baselines.add(id);
+        if (id === this.pendingSync?.sessionId) {
+          this.pendingSync = null;
+          this.stopSyncRetry();
+        }
+        this.sessions.set(id, next);
+        this.events.onSession(id, { ...next, messages: new Map(next.messages) });
       }
       return;
     }
     if (!sessionId) return;
-    const { view, lastIndex } = applyGuestEvent(
-      this.sessions.get(sessionId) ?? emptyGuestView(),
-      event
-    );
-    if (lastIndex !== undefined) saveCursor(this.device.pairId, sessionId, lastIndex);
+    const { view } = applyGuestEvent(this.sessions.get(sessionId) ?? emptyGuestView(), event);
     this.sessions.set(sessionId, view);
     this.events.onSession(sessionId, { ...view, messages: new Map(view.messages) });
   }
@@ -345,12 +627,22 @@ export class PairClient {
   }
 
   send(command: PhoneToHost): void {
-    if (this.direct.transport() !== 'direct' && this.ws?.readyState !== 1) return;
-    void sealFrame(this.contentKey, command).then((frame) => {
-      // 直连优先；背压/刚好断掉时无缝退回中继
-      if (this.direct.send(frame)) return;
-      this.sendFrameViaRelay(frame);
-    });
+    if (
+      this.closed ||
+      this.revoked ||
+      (this.direct.transport() !== 'direct' && this.ws?.readyState !== 1)
+    )
+      return;
+    this.sendQueue = this.sendQueue
+      .then(async () => {
+        if (this.closed || this.revoked) return;
+        const frame = await sealFrame(this.contentKey, command);
+        if (this.closed || this.revoked) return;
+        // 直连优先；背压/刚好断掉时无缝退回中继
+        if (this.direct.send(frame)) return;
+        this.sendFrameViaRelay(frame);
+      })
+      .catch(() => {});
   }
 
   private sendFrameViaRelay(frame: Uint8Array): void {
@@ -358,8 +650,20 @@ export class PairClient {
     this.ws.send(frame.slice().buffer as ArrayBuffer);
   }
 
+  private sendRelayProbe(): void {
+    this.probeNonce = (this.probeNonce + 1) >>> 0;
+    this.probeSentAt = Date.now();
+    this.sendViaRelay({ type: 'probe', nonce: this.probeNonce });
+  }
+
   private sendViaRelay(command: PhoneToHost): void {
-    void sealFrame(this.contentKey, command).then((frame) => this.sendFrameViaRelay(frame));
+    this.sendQueue = this.sendQueue
+      .then(async () => {
+        if (this.closed || this.revoked) return;
+        const frame = await sealFrame(this.contentKey, command);
+        if (!this.closed && !this.revoked) this.sendFrameViaRelay(frame);
+      })
+      .catch(() => {});
   }
 
   private setSync(next: SyncTracking): void {
@@ -368,25 +672,116 @@ export class PairClient {
     if (changed) this.events.onSync?.(next.state);
   }
 
+  /** onopen 与紧随其后的 host-online 只进房一次；host 掉线后再上线才重拉。 */
+  private primeRoom(): void {
+    if (this.closed || this.revoked || this.roomPrimed) return;
+    if (this.ws?.readyState !== 1) return;
+    this.roomPrimed = true;
+    this.send({ type: 'snapshot' });
+    if (this.subscribedId) this.subscribe(this.subscribedId);
+  }
+
   /** 订阅会话：带上本地游标，只补断线期间的增量。fresh = 手机刚 spawn 的全新会话，不进 syncing */
   subscribe(sessionId: string | null, opts?: { fresh?: boolean }): void {
+    if (this.closed || this.revoked) return;
+    this.stopSyncRetry();
     this.subscribedId = sessionId;
+    if (opts?.fresh) this.freshSessionId = sessionId;
+    else if (sessionId !== this.freshSessionId || (sessionId && this.baselines.has(sessionId)))
+      this.freshSessionId = null;
+    // 缓存未上墙前不要进 syncing：否则时间线会先盖「正在读取历史」。
+    if (!this.cacheReady) return;
+    // spawn 在途可能根本没有快照；拿到首次基线之前沿用旧实时订阅，不能门控首轮事件。
+    const fresh = sessionId !== null && sessionId === this.freshSessionId;
+    this.pendingSync = sessionId && !fresh ? { sessionId, requestId: crypto.randomUUID() } : null;
     if (this.historyPending.size > 0) {
       const pending = [...this.historyPending];
       this.historyPending.clear();
       for (const id of pending) this.events.onHistoryPending?.(id, false);
     }
-    this.setSync(applySubscribe(this.sync, sessionId, opts));
+    this.setSync(applySubscribe(this.sync, sessionId, { fresh }));
     if (!sessionId) {
       this.send({ type: 'subscribe', sessionId: null });
       return;
     }
-    const sinceIndex = loadCursors(this.device.pairId)[sessionId];
-    this.send({
+    const view = this.sessions.get(sessionId);
+    const sinceIndex =
+      this.baselines.has(sessionId) && view
+        ? view.messages.size
+          ? Math.max(...view.messages.keys())
+          : -1
+        : undefined;
+    // 最近打开的会话排末尾，后台事件不改变缓存 LRU 次序。
+    if (view) {
+      this.sessions.delete(sessionId);
+      this.sessions.set(sessionId, view);
+    }
+    const command: Extract<PhoneToHost, { type: 'subscribe' }> = {
       type: 'subscribe',
       sessionId,
-      ...(typeof sinceIndex === 'number' ? { sinceIndex } : {}),
-    });
+      ...(this.pendingSync
+        ? {
+            sync: { requestId: this.pendingSync.requestId, cursor: this.cursors.get(sessionId) },
+          }
+        : typeof sinceIndex === 'number'
+          ? { sinceIndex }
+          : {}),
+    };
+    this.send(command);
+    if (this.pendingSync) this.armSyncRetry(command, this.pendingSync.requestId);
+  }
+
+  private armSyncRetry(command: PhoneToHost, requestId: string): void {
+    this.syncTimer = setTimeout(() => {
+      if (this.closed || this.revoked || this.pendingSync?.requestId !== requestId) return;
+      // 重试沿用 requestId：慢快照仍可兑现，不被不断换号的重试饿死。
+      this.send(command);
+      this.armSyncRetry(command, requestId);
+    }, 10_000);
+  }
+
+  private stopSyncRetry(): void {
+    if (this.syncTimer) clearTimeout(this.syncTimer);
+    this.syncTimer = null;
+  }
+
+  private scheduleCache(): void {
+    if (this.closed || this.revoked) return;
+    this.cacheDirty = true;
+    if (this.cacheTimer) return;
+    this.cacheTimer = setTimeout(() => this.flushCache(), 500);
+  }
+
+  /** 页面隐藏前尽早提交事务；缓存失败不阻塞网络或输入。 */
+  flushCache(): void {
+    if (this.cacheTimer) clearTimeout(this.cacheTimer);
+    this.cacheTimer = null;
+    if (!this.cacheReady || !this.cacheDirty || this.closed || this.revoked) return;
+    this.cacheDirty = false;
+    const sessions = [...this.sessions]
+      .filter(([id]) => this.baselines.has(id))
+      .map(([id, view]) => ({
+        id,
+        view,
+        cursor: this.cursors.get(id),
+      }));
+    void this.cache.save(this.device.pairId, { ...this.metadata, sessions }).catch(() => {});
+  }
+
+  private revoke(): void {
+    this.revoked = true;
+    this.pendingDirectRestart = false;
+    this.stopSyncRetry();
+    if (this.timer) clearTimeout(this.timer);
+    if (this.cacheTimer) clearTimeout(this.cacheTimer);
+    this.cacheTimer = null;
+    this.direct.close();
+    this.heartbeat?.stop();
+    this.sessions.clear();
+    this.cursors.clear();
+    this.baselines.clear();
+    void this.cache.clear(this.device.pairId).catch(() => {});
+    this.events.onState('unauthorized');
   }
 
   /** 是否还有更早的历史可拉（已加载区间起点 > 0） */
@@ -398,7 +793,14 @@ export class PairClient {
 
   /** 上滑加载上一页；无更早内容或已在途时静默忽略 */
   requestHistory(sessionId: string): void {
-    if (this.historyPending.has(sessionId) || !this.hasOlder(sessionId)) return;
+    if (
+      this.pendingSync ||
+      this.subscribedId !== sessionId ||
+      this.historyPending.has(sessionId) ||
+      !this.hasOlder(sessionId)
+    ) {
+      return;
+    }
     const view = this.sessions.get(sessionId);
     if (!view) return;
     this.historyPending.add(sessionId);

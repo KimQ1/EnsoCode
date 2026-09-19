@@ -9,6 +9,7 @@
 | [traffic-lights.md](traffic-lights.md) | macOS 红绿灯遮标题 / 弹窗后位置偏移 |
 | [ui-component-classname.md](ui-component-classname.md) | 输入框左侧一大片留白、图标不见了 |
 | [dialog-layering.md](dialog-layering.md) | 弹窗内的下拉点开没反应 |
+| [ios-pwa-header-blur.md](ios-pwa-header-blur.md) | Safari 正常，独立 PWA 顶部标题模糊；透明遮罩又留下灰色状态栏 |
 | [dedupe-identity.md](dedupe-identity.md) | 去重没生效，同一个东西导入了三份 |
 | [agent-end-run-scoped-messages.md](agent-end-run-scoped-messages.md) | 多轮对话后历史消息消失，只剩最近一轮 |
 | [checkpoint-cross-session-wipe.md](checkpoint-cross-session-wipe.md) | 「回退+文件」不还原文件，无报错 |
@@ -17,7 +18,12 @@
 | [cdp-hidden-window-input.md](cdp-hidden-window-input.md) | CDP 拖拽/点击时好时坏，eval/截图全正常，极易误判为产品 bug |
 | [optimistic-echo-blocks-snapshot.md](optimistic-echo-blocks-snapshot.md) | 冷会话回来先发一句后，聊天区只剩这一句、计时器在走、工具卡不出现；worker 其实在正常干活 |
 | [enso-compact-token-limit-fallback.md](enso-compact-token-limit-fallback.md) | Smart Compact 开着仍报 Auto-compaction failed: Summarization failed: Input token limit exceeded |
+| [responses-compaction-routing-key.md](responses-compaction-routing-key.md) | 普通对话可用，默认压缩却报 invalid codex request / invalid_responses_request |
+| [responses-sse-eof-terminal-event.md](responses-sse-eof-terminal-event.md) | 新开对话可用，旧会话反复报 OpenAI Responses stream ended before a terminal response event |
 | [tool-prepare-arguments-schema-drift.md](tool-prepare-arguments-schema-drift.md) | 工具单测全绿，真机上模型每次调用都被判参数不合法 |
+| [hashline-stale-recovery.md](hashline-stale-recovery.md) | 文件远处变动使旧 TAG 失效；恢复必须证明上下文唯一且不改变行号坐标系 |
+| [session-before-compact-return-and-eviction-range.md](session-before-compact-return-and-eviction-range.md) | 持续记忆压缩：overflow 轮直接失败 / 走了原生摘要；memory#2 起静默丢旧史、split-turn 前缀无覆盖 |
+| [electron-builder-platform-files.md](electron-builder-platform-files.md) | 安装包 asar 里出现 src/packages，体积比应用代码大出一两百 MB |
 
 ## 共同教训
 

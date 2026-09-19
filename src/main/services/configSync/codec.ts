@@ -5,13 +5,16 @@ import {
   scrypt as scryptCallback,
 } from 'node:crypto';
 import { isReservedAgentTypeName } from '@shared/builtinAgents';
+import { parseCompactStrategy } from '@shared/compactStrategy';
 import { parseSmartCompactMode } from '@shared/smartCompactMode';
 import { STATUS_LINE_SEGMENT_IDS } from '@shared/statusLine';
 import {
   BUILTIN_AGENT_TYPES,
   BUILTIN_TOOLS,
   DEFAULT_PRESET_ID,
+  isEditMode,
   MODEL_API_KINDS,
+  resolveEditMode,
   THINKING_LEVELS,
 } from '@shared/types';
 import { hasBase64Shape } from './assets';
@@ -54,6 +57,7 @@ const STATE_KEYS = [
   'agentTypes',
   'subagentModels',
   'defaultModel',
+  'defaultModelFollowLast',
   'titleSummaryModel',
   'memoryDistillModel',
   'memoryChatModel',
@@ -61,6 +65,7 @@ const STATE_KEYS = [
   'smartCompactModel',
   'approvalReviewer',
   'titleSummaryEnabled',
+  'compactStrategy',
   'smartCompactEnabled',
   'smartCompactMode',
   'memoryEmbeddingModel',
@@ -85,6 +90,7 @@ const STATE_KEYS = [
   'loadHarnessAssets',
   'exploreFoldEnabled',
   'bashInterceptEnabled',
+  'editMode',
   'hashlineEditEnabled',
   'openChangesOnFileEdit',
   'compactReadOnlyTools',
@@ -193,12 +199,14 @@ const KEYBINDING_ACTIONS = [
   'open-settings',
   'switch-model',
   'focus-composer',
+  'send-message',
   'find-in-chat',
   'search-workspace',
   'new-conversation',
   'next-tab',
   'prev-tab',
   'new-side-tab',
+  'new-btw-tab',
   'close-side-tab',
 ] as const;
 const PRICING_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
@@ -840,8 +848,13 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     'memoryKgEnabled',
     'defaultReasoningEnabled',
     'subagentModelsEnabled',
+    'defaultModelFollowLast',
   ])
     booleanField(state, key, 'state', false);
+  if (state.compactStrategy !== undefined && parseCompactStrategy(state.compactStrategy) === null)
+    throw new Error('Invalid state.compactStrategy');
+  if (state.editMode !== undefined && !isEditMode(state.editMode))
+    throw new Error('Invalid state.editMode');
   if (
     state.smartCompactMode !== undefined &&
     parseSmartCompactMode(state.smartCompactMode) === null
@@ -954,20 +967,26 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     new Set(skills.map((entry) => String(entry.id))),
     new Map(instructions.map((entry) => [String(entry.id), Number(entry.bytes)]))
   );
+  const canonicalState: Record<string, unknown> = {
+    ...state,
+    providers,
+    skills,
+    mcpServers,
+    instructions,
+    presets,
+    agentTypes,
+    subagentModels,
+  };
+  if ('editMode' in state || 'hashlineEditEnabled' in state) {
+    canonicalState.editMode = resolveEditMode(state.editMode, state.hashlineEditEnabled);
+    delete canonicalState.hashlineEditEnabled;
+  }
+  delete canonicalState.bashInterceptEnabled;
   return {
     format: ENVELOPE_FORMAT,
     version: VERSION,
     createdAt,
-    state: {
-      ...state,
-      providers,
-      skills,
-      mcpServers,
-      instructions,
-      presets,
-      agentTypes,
-      subagentModels,
-    } as unknown as ConfigSyncBundle['state'],
+    state: canonicalState as unknown as ConfigSyncBundle['state'],
     resources: resources as ConfigSyncBundle['resources'],
     secretsIncluded: bundle.secretsIncluded,
   };

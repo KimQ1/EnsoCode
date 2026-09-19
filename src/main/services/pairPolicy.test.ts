@@ -20,9 +20,46 @@ describe('手机命令白名单', () => {
       { type: 'ask-respond', sessionId: 's', requestId: 'r', answer: 'yes' },
       { type: 'snapshot' },
       { type: 'subscribe', sessionId: 's', sinceIndex: 3 },
+      { type: 'subscribe', sessionId: 's', sync: { requestId: 'r1' } },
+      {
+        type: 'subscribe',
+        sessionId: 's',
+        sync: { requestId: 'r2', cursor: { epoch: 'epoch-1', seq: 4 } },
+      },
       { type: 'subscribe', sessionId: null },
     ];
     for (const cmd of ok) expect(parsePhoneCommand(cmd).ok, JSON.stringify(cmd)).toBe(true);
+  });
+
+  it('subscribe 严格校验 sync 与 sinceIndex，旧端形状保持兼容', () => {
+    expect(parsePhoneCommand({ type: 'subscribe', sessionId: 's' }).ok).toBe(true);
+    expect(parsePhoneCommand({ type: 'subscribe', sessionId: 's', sinceIndex: -1 }).ok).toBe(true);
+    const bad = [
+      { type: 'subscribe', sessionId: 's', sinceIndex: -2 },
+      { type: 'subscribe', sessionId: 's', sinceIndex: 1.5 },
+      { type: 'subscribe', sessionId: 's', sinceIndex: Number.MAX_SAFE_INTEGER + 1 },
+      { type: 'subscribe', sessionId: 's', sync: null },
+      { type: 'subscribe', sessionId: null, sync: { requestId: 'r' } },
+      { type: 'subscribe', sessionId: 'x'.repeat(513), sync: { requestId: 'r' } },
+      { type: 'subscribe', sessionId: 's', sync: {} },
+      { type: 'subscribe', sessionId: 's', sync: { requestId: '' } },
+      { type: 'subscribe', sessionId: 's', sync: { requestId: 'x'.repeat(513) } },
+      { type: 'subscribe', sessionId: 's', sync: { requestId: 'r', extra: true } },
+      { type: 'subscribe', sessionId: 's', sync: { requestId: 'r', cursor: null } },
+      {
+        type: 'subscribe',
+        sessionId: 's',
+        sync: { requestId: 'r', cursor: { epoch: 'e', seq: -1 } },
+      },
+      {
+        type: 'subscribe',
+        sessionId: 's',
+        sync: { requestId: 'r', cursor: { epoch: 'e', seq: 0, extra: true } },
+      },
+    ];
+    for (const command of bad) {
+      expect(parsePhoneCommand(command).ok, JSON.stringify(command)).toBe(false);
+    }
   });
 
   it('放行队列操作命令，缺字段被拒', () => {
@@ -48,12 +85,45 @@ describe('手机命令白名单', () => {
     for (const cmd of bad) expect(parsePhoneCommand(cmd).ok, JSON.stringify(cmd)).toBe(false);
   });
 
+  it('放行 goal 暂停/继续/清除，缺 sessionId 被拒', () => {
+    for (const type of ['goal-pause', 'goal-resume', 'goal-clear'] as const) {
+      expect(parsePhoneCommand({ type, sessionId: 's' }).ok, type).toBe(true);
+      expect(parsePhoneCommand({ type }).ok, type).toBe(false);
+      expect(parsePhoneCommand({ type, sessionId: '' }).ok, type).toBe(false);
+    }
+  });
+
+  it('放行 goal-set / compact / rewind / retry / 停任务，缺字段被拒', () => {
+    const ok = [
+      { type: 'goal-set', sessionId: 's', text: 'ship' },
+      { type: 'compact', sessionId: 's' },
+      { type: 'compact', sessionId: 's', instructions: 'keep tests' },
+      { type: 'rewind', sessionId: 's', userIndexFromEnd: 0 },
+      { type: 'rewind', sessionId: 's', userIndexFromEnd: 1, restoreFiles: true },
+      { type: 'retry', sessionId: 's' },
+      { type: 'task-stop', sessionId: 's', taskId: 't' },
+      { type: 'subagent-stop', sessionId: 's', agentId: 'a' },
+    ];
+    for (const cmd of ok) expect(parsePhoneCommand(cmd).ok, JSON.stringify(cmd)).toBe(true);
+
+    const bad = [
+      { type: 'goal-set', sessionId: 's', text: '' },
+      { type: 'goal-set', sessionId: 's' },
+      { type: 'compact', sessionId: 's', instructions: 1 },
+      { type: 'rewind', sessionId: 's' },
+      { type: 'rewind', sessionId: 's', userIndexFromEnd: -1 },
+      { type: 'rewind', sessionId: 's', userIndexFromEnd: 0, restoreFiles: 'yes' },
+      { type: 'retry' },
+      { type: 'task-stop', sessionId: 's' },
+      { type: 'subagent-stop', agentId: 'a' },
+    ];
+    for (const cmd of bad) expect(parsePhoneCommand(cmd).ok, JSON.stringify(cmd)).toBe(false);
+  });
+
   it('拒绝白名单外命令（改审批模式 / 设置写入 / 任意命令）', () => {
     for (const cmd of [
       { type: 'set-approval-mode', sessionId: 's', mode: 'full' },
       { type: 'settings-write', key: 'providers' },
-      { type: 'rewind', sessionId: 's' },
-      { type: 'task-stop', sessionId: 's', taskId: 't' },
       {},
       null,
       'prompt',
@@ -191,6 +261,14 @@ describe('直连信令帧校验', () => {
       { type: 'direct-close' },
     ];
     for (const cmd of bad) expect(parsePhoneCommand(cmd).ok, JSON.stringify(cmd)).toBe(false);
+  });
+
+  it('放行 probe，nonce 必须是非负整数', () => {
+    expect(parsePhoneCommand({ type: 'probe', nonce: 0 }).ok).toBe(true);
+    expect(parsePhoneCommand({ type: 'probe', nonce: 7 }).ok).toBe(true);
+    expect(parsePhoneCommand({ type: 'probe' }).ok).toBe(false);
+    expect(parsePhoneCommand({ type: 'probe', nonce: -1 }).ok).toBe(false);
+    expect(parsePhoneCommand({ type: 'probe', nonce: 1.5 }).ok).toBe(false);
   });
 });
 
@@ -360,6 +438,14 @@ describe('snapshot 裁剪（批事件，本身无 sessionId）', () => {
     // 600KB 预算下 300KB 的消息最多装 2 条
     expect(session.messages.length).toBeLessThanOrEqual(2);
     expect(session.baseIndex).toBe(10 - session.messages.length);
+  });
+
+  it('单条消息超过 relay 限制时允许发空尾窗，不能生成必丢的大帧', () => {
+    const messages = [{ text: 'x'.repeat(1_100_000) }];
+    const out = narrowSnapshot({ type: 'snapshot', sessions: [{ sessionId: 'a', messages }] }, 'a');
+    expect(Buffer.byteLength(JSON.stringify(out), 'utf8')).toBeLessThan(900_000);
+    const session = out?.sessions[0] as { messages: unknown[] } | undefined;
+    expect(session?.messages).toEqual([]);
   });
 
   it('字节预算按 UTF-8 计，中文不能按字符数低估', () => {

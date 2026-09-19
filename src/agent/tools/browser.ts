@@ -97,10 +97,19 @@ const requireStr = (params: Params, key: string): string => {
   return value;
 };
 
+function encodeToolText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined) return '';
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === 'string' ? encoded : '';
+  } catch {
+    return String(value);
+  }
+}
+
 const textResult = (value: unknown) => ({
-  content: [
-    { type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value) },
-  ],
+  content: [{ type: 'text' as const, text: encodeToolText(value) }],
   details: undefined,
 });
 
@@ -165,8 +174,8 @@ export function createBrowserTools(invoker: BrowserInvoker): ToolDefinition[] {
     define(
       'browser_snapshot',
       'Browser snapshot',
-      'Return an accessibility-style text tree of the current page. Interactive elements carry [ref=eN]; ' +
-        'use those refs with browser_click / browser_type. Refs expire after navigation or the next snapshot.',
+      'Return visible page text plus in-viewport interactive controls. Controls carry [ref=eN] and [kind=click|fill|select]; ' +
+        'use ref with browser_click / browser_type / browser_select_option. Refs expire after navigation or the next snapshot.',
       schema({}),
       (_params, signal) => invoker.invoke('snapshot', {}, signal)
     ),

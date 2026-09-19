@@ -1,3 +1,4 @@
+import { isBtwIsolationPrompt } from '@shared/btw';
 import type { AgentSessionCustomEntry, TodoItem, TurnPerf } from '@shared/types/agent';
 import {
   Bot,
@@ -33,7 +34,9 @@ import {
 } from '@/components/ui/dialog';
 import { Popover, PopoverPopup, PopoverTrigger } from '@/components/ui/popover';
 import { type TFunction, useI18n } from '@/i18n';
+import { diffCacheKey } from '@/lib/diffCacheKey';
 import { addSidePanelChanges } from '@/lib/sidePanelDock';
+import { stripAnsi } from '@/lib/terminalText';
 import { cn } from '@/lib/utils';
 import { useSessionsStore } from '@/stores/sessions';
 import {
@@ -41,7 +44,13 @@ import {
   resolveRewindConfirm,
 } from '@/stores/sessions/conversationRewind';
 import { formatDuration, formatTokens } from '@/stores/sessions/stats';
-import { isReadOnlyTool, parseSandboxOutput, type TimelineItem } from '@/stores/sessions/timeline';
+import {
+  isReadOnlyTool,
+  parseSandboxOutput,
+  shouldAutoExpandAppliedFileChanges,
+  shouldShowToolOutputAfterFileChanges,
+  type TimelineItem,
+} from '@/stores/sessions/timeline';
 import { useSettingsStore } from '@/stores/settings';
 import { CodeBlock } from './CodeBlock';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -106,6 +115,7 @@ function itemEqual(prev: TimelineRowProps, next: TimelineRowProps): boolean {
         a.output === b.output &&
         a.edits === b.edits &&
         a.writeContent === b.writeContent &&
+        a.fileChanges === b.fileChanges &&
         a.todos === b.todos &&
         a.durationMs === b.durationMs &&
         a.startedAt === b.startedAt &&
@@ -427,7 +437,7 @@ function UserText({
           {t('From main agent')}
         </p>
       )}
-      {role && (
+      {role?.[1] && !isBtwIsolationPrompt(role[1]) && (
         <div className="mb-2 rounded-md bg-background/60 px-2.5 py-1.5 text-xs text-muted-foreground">
           <span className="font-semibold">{t('Role')}</span> · {role[1]}
         </div>
@@ -687,6 +697,7 @@ function canForkDisplayedSession(
   state: ReturnType<typeof useSessionsStore.getState>,
   host: ReturnType<typeof useChatHost>
 ) {
+  if (host?.canFork === false) return false;
   return canActOnDisplayedSession(state, host, (status) => status === 'idle');
 }
 
@@ -769,14 +780,7 @@ function RewindButton({ messageIndex }: { messageIndex: number }) {
   ];
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        className={cn(
-          userActionClass,
-          // popover 打开期间保持可见,否则 hover 移开触发按钮会随组隐藏
-          open ? 'opacity-100' : 'opacity-0 group-hover/user:opacity-100'
-        )}
-        title={t('Rewind to this message')}
-      >
+      <PopoverTrigger className={userActionClass} title={t('Rewind to this message')}>
         <Undo2 className="h-3 w-3" />
         {t('Rewind')}
       </PopoverTrigger>
@@ -917,7 +921,13 @@ function ThinkingRow({
         className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
       >
         <Brain className={cn('h-3.5 w-3.5', streaming && 'animate-pulse')} />
-        <span>{streaming ? t('Thinking…') : t('Thought process')}</span>
+        {streaming ? (
+          <span className="t-shimmer" data-text={t('Thinking…')}>
+            {t('Thinking…')}
+          </span>
+        ) : (
+          <span>{t('Thought process')}</span>
+        )}
         {streaming ? (
           <RunningElapsed itemKey={itemKey} since={startedAt} />
         ) : (
@@ -930,7 +940,7 @@ function ThinkingRow({
         <ChevronRight className={cn('h-3 w-3 transition-transform', expanded && 'rotate-90')} />
       </button>
       {expanded && (
-        <p className="mt-1.5 border-l-2 border-border pl-3 text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
+        <p className="t-acc-reveal mt-1.5 border-l-2 border-border pl-3 text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
           {text}
         </p>
       )}
@@ -984,7 +994,7 @@ function TaskNoteRow({ item }: { item: Extract<TimelineItem, { kind: 'task-note'
             {logPath
               ? log === undefined
                 ? t('Loading…')
-                : (log ?? t('(log unavailable)'))
+                : stripAnsi(log ?? t('(log unavailable)'))
               : t('(no log available)')}
           </pre>
         </div>
@@ -1020,18 +1030,18 @@ function CompactionRow({
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const divider = item.kind === 'compaction';
-  const label =
-    item.tokensBefore === null
-      ? item.verified
+  const tokens = item.tokensBefore === null ? null : formatTokens(item.tokensBefore);
+  const label = item.memory
+    ? tokens === null
+      ? t('Memory context compacted')
+      : t('Memory context compacted ({{tokens}} tokens before)', { tokens })
+    : item.verified
+      ? tokens === null
         ? t('Verified context compacted')
-        : t('Context compacted')
-      : item.verified
-        ? t('Verified context compacted ({{tokens}} tokens before)', {
-            tokens: formatTokens(item.tokensBefore),
-          })
-        : t('Context compacted ({{tokens}} tokens before)', {
-            tokens: formatTokens(item.tokensBefore),
-          });
+        : t('Verified context compacted ({{tokens}} tokens before)', { tokens })
+      : tokens === null
+        ? t('Context compacted')
+        : t('Context compacted ({{tokens}} tokens before)', { tokens });
   return (
     <div>
       <button
@@ -1039,13 +1049,17 @@ function CompactionRow({
         onClick={() => setExpanded((v) => !v)}
         className={cn('flex items-center gap-3', divider && 'w-full')}
         title={
-          item.verified
+          item.memory
             ? t(
-                'Verified summary from smart compaction. Messages above are no longer in the model context.'
+                'Summary rendered from continuous memory. Messages above are no longer in the model context; use recall for sources.'
               )
-            : divider
-              ? t('Messages above are no longer in the model context; only this summary is.')
-              : t('Latest compaction summary — expand to read what the model kept.')
+            : item.verified
+              ? t(
+                  'Verified summary from smart compaction. Messages above are no longer in the model context.'
+                )
+              : divider
+                ? t('Messages above are no longer in the model context; only this summary is.')
+                : t('Latest compaction summary — expand to read what the model kept.')
         }
       >
         {divider && <span className="h-px flex-1 bg-border" />}
@@ -1276,7 +1290,7 @@ function SandboxOutput({
           <CodeBlock code={value} language="json" />
         ) : (
           <pre className="font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
-            {value}
+            {stripAnsi(value)}
           </pre>
         )
       ) : null}
@@ -1292,6 +1306,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
   const compact = compactReadOnly && isReadOnlyTool(item);
   const hasDiff = Boolean(item.edits && item.edits.length > 0);
   const hasWrite = Boolean(item.writeContent);
+  const hasFileChanges = Boolean(item.fileChanges && item.fileChanges.length > 0);
   const sandbox = item.name === 'exec' ? parseSandboxOutput(item.output) : null;
   const headerSummary =
     item.nestedPending && item.state === 'running'
@@ -1299,17 +1314,23 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
       : sandbox?.calls.length && item.state !== 'error'
         ? `${item.summary} · ${sandbox.calls.length} calls`
         : item.summary;
-  const expandable = hasDiff || hasWrite || Boolean(item.output) || Boolean(item.source);
+  const expandable =
+    hasDiff || hasWrite || hasFileChanges || Boolean(item.output) || Boolean(item.source);
   // edit 的 diff 与 write 的内容只在本轮直播（running）且开启 expandLiveEdits 时默认展开；
   // 历史会话挂载时全部折叠——否则切会话时视口内成排 FileDiff 同步解析+高亮，
   // 主线程阻塞几秒白屏
   const autoExpand = expandLiveEdits && (hasDiff || hasWrite) && item.state === 'running';
   const [expanded, setExpanded] = useState(autoExpand);
-  // 直播中 edits/writeContent 随参数流式补齐晚于行挂载：到位时自动展开。
-  // 历史会话挂载时 state 已是终态，不会触发；用户手动收起后依赖项不变，不会重新弹开
+  const previouslyHadFileChanges = useRef(hasFileChanges);
+  // apply_patch 只在终态结果中拿到真实 diff：必须按「本行从无到有」识别直播，历史首次挂载不展开。
   useEffect(() => {
-    if (autoExpand) setExpanded(true);
-  }, [autoExpand]);
+    const appliedChangesArrived = shouldAutoExpandAppliedFileChanges(
+      item,
+      previouslyHadFileChanges.current
+    );
+    previouslyHadFileChanges.current = hasFileChanges;
+    if (autoExpand || (expandLiveEdits && appliedChangesArrived)) setExpanded(true);
+  }, [autoExpand, expandLiveEdits, hasFileChanges, item]);
 
   if (item.todos) return <TodoRow todos={item.todos} />;
   if (item.name.startsWith('goal_')) return <GoalSignalRow item={item} />;
@@ -1332,7 +1353,11 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
         >
           {(!compact || item.state !== 'ok') && <ToolStateIcon state={item.state} />}
           <span className={cn('shrink-0', !compact && 'font-medium')}>
-            {item.name === 'exec' ? t('Isolated sandbox') : item.name}
+            {item.name === 'exec'
+              ? t('Isolated sandbox')
+              : item.name === 'apply_patch'
+                ? t('Apply patch')
+                : item.name}
           </span>
           {item.summary && (
             <>
@@ -1344,7 +1369,11 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
                   item.state === 'error' ? 'text-destructive' : 'text-muted-foreground'
                 )}
               >
-                {item.state === 'error' && item.output ? firstLine(item.output) : headerSummary}
+                {item.state === 'error' && item.output
+                  ? item.name === 'apply_patch' && hasFileChanges
+                    ? `${headerSummary} · ${firstLine(item.output)}`
+                    : firstLine(item.output)
+                  : headerSummary}
               </span>
             </>
           )}
@@ -1376,7 +1405,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
             />
           )}
         </button>
-        {(hasDiff || hasWrite) && item.state === 'ok' && (
+        {(hasDiff || hasWrite || hasFileChanges) && (item.state === 'ok' || hasFileChanges) && (
           <button
             type="button"
             title={t('Open in side panel')}
@@ -1388,25 +1417,50 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
         )}
       </div>
       {expanded && hasDiff && item.edits && (
-        <ToolContentScroller follow={item.state === 'running'}>
+        <ToolContentScroller follow={item.state === 'running'} className="t-acc-reveal">
           <EditDiff path={item.summary} blocks={item.edits} />
+        </ToolContentScroller>
+      )}
+      {expanded && hasFileChanges && item.fileChanges && (
+        <ToolContentScroller follow={item.state === 'running'} className="t-acc-reveal">
+          {item.fileChanges.map((change) => (
+            <div
+              key={`${change.type}:${diffCacheKey(change.path, change.oldText, change.newText)}`}
+            >
+              <div className="flex items-center gap-2 border-t border-border/60 px-3 py-1 font-mono text-[10px] text-muted-foreground">
+                <span className="uppercase">{change.type}</span>
+                <span className="min-w-0 flex-1 truncate" title={change.path}>
+                  {change.path}
+                </span>
+                {change.truncated && <span>{t('Truncated preview')}</span>}
+              </div>
+              <EditDiff path={change.path} blocks={[change]} snapshot={change} />
+            </div>
+          ))}
+        </ToolContentScroller>
+      )}
+      {expanded && shouldShowToolOutputAfterFileChanges(item) && (
+        <ToolContentScroller follow={false} className="t-acc-reveal border-t border-border/60">
+          <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
+            {stripAnsi(item.output ?? '')}
+          </pre>
         </ToolContentScroller>
       )}
       {expanded && hasWrite && item.writeContent && (
         <ToolContentScroller
           follow={item.state === 'running'}
-          className="rounded-b-lg border-t border-border/60"
+          className="t-acc-reveal rounded-b-lg border-t border-border/60"
         >
           <ReadFileView path={item.summary} contents={item.writeContent} />
         </ToolContentScroller>
       )}
-      {expanded && !hasDiff && !hasWrite && (item.output || item.source) && (
+      {expanded && !hasDiff && !hasWrite && !hasFileChanges && (item.output || item.source) && (
         <ToolContentScroller
           follow={item.state === 'running'}
           className={
             compact
-              ? 'mt-1 rounded-lg border border-border/60 bg-muted/30'
-              : 'rounded-b-lg border-t border-border/60'
+              ? 't-acc-reveal mt-1 rounded-lg border border-border/60 bg-muted/30'
+              : 't-acc-reveal rounded-b-lg border-t border-border/60'
           }
         >
           {item.name === 'exec' ? (
@@ -1421,7 +1475,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
             </div>
           ) : (
             <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
-              {item.output}
+              {stripAnsi(item.output ?? '')}
             </pre>
           )}
         </ToolContentScroller>
@@ -1547,4 +1601,4 @@ function ToolStateIcon({ state }: { state: 'running' | 'reviewing' | 'ok' | 'err
   }
 }
 
-const firstLine = (text: string): string => text.split('\n', 1)[0] ?? '';
+const firstLine = (text: string): string => stripAnsi(text.split('\n', 1)[0] ?? '');

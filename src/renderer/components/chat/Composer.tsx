@@ -8,7 +8,7 @@ import type {
   MentionCandidate,
   UiElementMentionCandidate,
 } from '@shared/types/mentions';
-import { ArrowUp, CircleStop, SlashSquare, X } from 'lucide-react';
+import { ArrowUp, CircleStop, ImagePlus, SlashSquare, X } from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/dialog';
 import { flattenMentionRoot, useMentionSearch } from '@/hooks/useMentionSearch';
 import { useI18n } from '@/i18n';
-import { effectiveKeybindings, eventToBinding } from '@/lib/keybindings';
+import { effectiveKeybindings, eventToBinding, formatBinding } from '@/lib/keybindings';
 import { cn } from '@/lib/utils';
 import { useSettingsStore } from '@/stores/settings';
 import {
@@ -56,6 +56,7 @@ interface ComposerProps {
   toolbar?: React.ReactNode;
   locked?: boolean;
   injectedDraft?: string;
+  injectedImages?: AttachedImage[];
   onDraftConsumed?: () => void;
   initialRecipient?: AgentTypeMentionCandidate;
   onInitialRecipientConsumed?: () => void;
@@ -65,6 +66,13 @@ interface ComposerProps {
   onActivate?: () => void;
   onSend: (payload: ComposerPayload) => boolean | undefined;
   onAbort: () => void;
+  /**
+   * 侧栏旁路等第二输入框：不抢主 Composer 的 insert/focus 桥，也不吃侧栏拖放。
+   * 主会话必须保持默认 false。
+   */
+  isolated?: boolean;
+  /** 覆盖默认「Type @ …」占位；slash / locked / agent 文案仍优先 */
+  placeholder?: string;
 }
 
 interface ComposerDraft {
@@ -87,6 +95,7 @@ export function Composer({
   toolbar,
   locked = false,
   injectedDraft,
+  injectedImages,
   onDraftConsumed,
   initialRecipient,
   onInitialRecipientConsumed,
@@ -94,8 +103,12 @@ export function Composer({
   onActivate,
   onSend,
   onAbort,
+  isolated = false,
+  placeholder: placeholderText,
 }: ComposerProps) {
   const { t } = useI18n();
+  const keybindings = useSettingsStore((s) => s.keybindings);
+  const sendBinding = effectiveKeybindings(keybindings)['send-message'];
   const mentionPickerId = useId();
   const [images, setImages] = useState<AttachedImage[]>([]);
   const [slash, setSlash] = useState<string | null>(null);
@@ -107,11 +120,15 @@ export function Composer({
 
   // 侧栏拖入(dnd-kit):会话/项目行落到输入区插 mention chip。
   // 与 OS 文件拖入(HTML5 dnd)互不干扰:两套事件体系独立。
-  const { setNodeRef: setDropRef, isOver: dndOver } = useDroppable({ id: COMPOSER_DROP_ID });
+  const { setNodeRef: setDropRef, isOver: dndOver } = useDroppable({
+    id: isolated ? `isolated-composer:${focusKey ?? 'side'}` : COMPOSER_DROP_ID,
+    disabled: isolated,
+  });
   const [preview, setPreview] = useState<UiElementMentionCandidate | null>(null);
   const [imagePreview, setImagePreview] = useState<AttachedImage | null>(null);
   const boundIds = useRef(new Set<string>());
   useEffect(() => {
+    if (isolated) return;
     const unsubInsert = registerComposerInsert((candidate) =>
       editorRef.current?.insertMention(candidate)
     );
@@ -135,9 +152,10 @@ export function Composer({
       unsubUi();
       unsubImage();
     };
-  }, []);
+  }, [isolated]);
   const editorRef = useRef<MentionEditorHandle>(null);
   const composerRef = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const composingRef = useRef(false);
   const [popupLayout, setPopupLayout] = useState<{
     left: number;
@@ -226,15 +244,16 @@ export function Composer({
     onInitialRecipientConsumed?.();
   }, [initialRecipient, onInitialRecipientConsumed]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: injectedDraft is an external one-shot signal.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: injected content is an external one-shot signal.
   useEffect(() => {
-    if (!injectedDraft) return;
-    const parsed = splitSlashCommand(injectedDraft);
+    if (!injectedDraft && !injectedImages?.length) return;
+    const parsed = splitSlashCommand(injectedDraft ?? '');
     setSlash(parsed.slash);
+    setImages(injectedImages ?? []);
     editorRef.current?.setSegments(parsed.rest ? [{ type: 'text', text: parsed.rest }] : []);
     onDraftConsumed?.();
     window.setTimeout(() => editorRef.current?.focus(), 0);
-  }, [injectedDraft]);
+  }, [injectedDraft, injectedImages]);
 
   const subQuery = slashSubcommandQuery(slash, editorPlain.replaceAll('\uFFFC', ''));
   const slashResults =
@@ -462,6 +481,7 @@ export function Composer({
     if (isComposing) return;
     const pressed = eventToBinding(event);
     if (
+      !isolated &&
       pressed &&
       pressed === effectiveKeybindings(useSettingsStore.getState().keybindings)['switch-model']
     ) {
@@ -481,9 +501,12 @@ export function Composer({
       setRecipient(undefined);
       return;
     }
-    if (event.key === 'Enter' && !event.shiftKey && enterToSend) {
-      event.preventDefault();
-      handleSend();
+    if (enterToSend && !popupKind) {
+      const pressedSend = eventToBinding(event, { allowBare: true });
+      if (pressedSend === sendBinding) {
+        event.preventDefault();
+        handleSend();
+      }
     }
   };
 
@@ -594,7 +617,7 @@ export function Composer({
                     onClick={() =>
                       setImages((current) => current.filter((_, item) => item !== index))
                     }
-                    className="absolute -top-1.5 -right-1.5 rounded-full border bg-background p-0.5 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-destructive group-hover:opacity-100"
+                    className="absolute -top-1.5 -right-1.5 rounded-full border bg-background p-0.5 text-muted-foreground shadow-sm transition-opacity hover:text-destructive"
                   >
                     <X className="h-3 w-3" />
                   </button>
@@ -633,9 +656,11 @@ export function Composer({
                   ? t('Resolve the pending approval to continue')
                   : agentRecipient
                     ? t('Message the selected Agent…')
-                    : running
-                      ? t('Message will queue until this round finishes…')
-                      : t('Type @ to choose a file or Agent')
+                    : placeholderText
+                      ? placeholderText
+                      : running
+                        ? t('Message will queue until this round finishes…')
+                        : t('Type @ to choose a file or Agent')
             }
             disabled={locked}
             onStateChange={handleEditorState}
@@ -680,7 +705,30 @@ export function Composer({
         </div>
         {agentRecipient && <p className="sr-only">{t('Send only to the selected Agent')}</p>}
         <div className="flex items-center justify-between gap-1.5 px-1.5 pb-1">
-          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">{toolbar}</div>
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                ingestFiles(Array.from(event.target.files ?? []));
+                event.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              disabled={locked}
+              onClick={() => imageInputRef.current?.click()}
+              aria-label={t('Attach image')}
+              title={t('Attach image')}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+            >
+              <ImagePlus className="h-3.5 w-3.5" />
+            </button>
+            {toolbar}
+          </div>
           {/* 生成中且输入为空才显示停止；有草稿则保持发送，方便手机点按钮入队 */}
           {effectiveBusy && !hasContent ? (
             <Button
@@ -699,7 +747,13 @@ export function Composer({
               onClick={handleSend}
               disabled={!hasContent || locked}
               aria-label={agentRecipient ? t('Send only to the selected Agent') : t('Send')}
-              title={agentRecipient ? t('Send only to the selected Agent') : t('Send')}
+              title={
+                agentRecipient
+                  ? t('Send only to the selected Agent')
+                  : enterToSend
+                    ? `${t('Send')} ${formatBinding(sendBinding)}`
+                    : t('Send')
+              }
             >
               <ArrowUp className="h-4 w-4" />
             </Button>

@@ -1,9 +1,11 @@
+import type { CompactStrategy } from '@shared/compactStrategy';
 import type { DefaultModelRef } from '@shared/defaultModel';
 import type { Locale } from '@shared/i18n';
 import type { SmartCompactMode } from '@shared/smartCompactMode';
 import type { StatusLineSegmentId } from '@shared/statusLine';
 import type {
   AgentTypeEntry,
+  EditMode,
   InstructionEntry,
   McpServerEntry,
   ModelProvider,
@@ -66,6 +68,7 @@ export interface ConfigSyncState {
   agentTypes: AgentTypeEntry[];
   subagentModels: SubagentModelEntry[];
   defaultModel?: DefaultModelRef | null;
+  defaultModelFollowLast?: boolean;
   titleSummaryModel?: DefaultModelRef | null;
   memoryDistillModel?: DefaultModelRef | null;
   memoryChatModel?: string;
@@ -73,6 +76,7 @@ export interface ConfigSyncState {
   smartCompactModel?: DefaultModelRef | null;
   approvalReviewer?: DefaultModelRef | null;
   titleSummaryEnabled?: boolean;
+  compactStrategy?: CompactStrategy;
   smartCompactEnabled?: boolean;
   smartCompactMode?: SmartCompactMode;
   /** 记忆向量模型注册表 id（`none` / `local:*` / `remote:*`） */
@@ -122,6 +126,8 @@ export interface ConfigSyncState {
   loadHarnessAssets?: boolean;
   exploreFoldEnabled?: boolean;
   bashInterceptEnabled?: boolean;
+  editMode?: EditMode;
+  /** @deprecated 仅用于读取旧配置包；校验后迁为 editMode。 */
   hashlineEditEnabled?: boolean;
   openChangesOnFileEdit?: boolean;
   compactReadOnlyTools?: boolean;

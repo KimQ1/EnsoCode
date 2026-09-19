@@ -3,14 +3,17 @@ import type { ProjectedMessage } from '@shared/types/agent';
 /**
  * `@/stores/sessions` 的 PWA 桩：手机端会话状态在 client.ts，不用 zustand。
  * 形状对齐桌面被复用组件读取的字段（activeId / conversations / rewind），
- * 使 RewindButton、RunningElapsed 无需改动即可编译并自动降级：
- * started 恒为 false 且无 sessionFile → RewindButton 不渲染。
+ * 使 RewindButton、RunningElapsed 无需改动即可编译。
+ * started / rewind / retry 由 ChatScreen + App 注入。
  * 经 vite alias 注入，桌面源码零改动。
  */
 
 export interface SessionGoal {
   text: string;
-  status: 'active' | 'paused';
+  status: 'active' | 'paused' | 'completed' | 'blocked' | 'waiting';
+  note?: string;
+  autoTurns: number;
+  noProgressRuns: number;
 }
 
 export interface QueuedMessage {
@@ -27,33 +30,45 @@ export interface Conversation {
   messages: ProjectedMessage[];
   activeTabId?: string;
   queuedMessages?: QueuedMessage[];
+  /** TimelineRow / sidePanelDock 读取；手机无侧栏工程，空串即可 */
+  projectId: string;
+  parentId?: string;
+  historyOnly?: boolean;
 }
 
-/** 队列操作：真正的队列在桌面 renderer store，手机只发命令，由 App 注入 */
+/** 队列 / 目标操作：真正状态在桌面 renderer store，手机只发命令，由 App 注入 */
 export interface QueueActions {
   removeQueuedMessage(conversationId: string, messageId: string): void;
   updateQueuedMessage(conversationId: string, messageId: string, text: string): void;
   sendQueuedNow(conversationId: string, messageId: string): void;
   interruptAndSendQueued(conversationId: string, messageId: string): Promise<void>;
+  pauseGoal(conversationId: string): void;
+  resumeGoal(conversationId: string): void;
+  clearGoal(conversationId: string): void;
+  rewind(sessionId: string, userIndexFromEnd: number, restoreFiles?: boolean): void;
+  retry(sessionId: string): void;
 }
 
 type SessionsSlice = {
   activeId: string | null;
   conversations: Record<string, Conversation>;
-  rewind(sessionId: string, userIndexFromEnd: number, restoreFiles?: boolean): void;
-  retry(sessionId: string): void;
+  /** TimelineRow ForkButton 读取；手机 ChatHost.canFork=false，保持 no-op */
+  forkFromMessage(conversationId: string, userIndexFromEnd: number): Promise<string | null>;
 } & QueueActions;
 
 const state: SessionsSlice = {
   activeId: null,
   conversations: {},
-  // 手机端不支持回退（RewindButton 因 started=false 已不渲染，这里只为类型完整）
   rewind: () => {},
   retry: () => {},
+  forkFromMessage: async () => null,
   removeQueuedMessage: () => {},
   updateQueuedMessage: () => {},
   sendQueuedNow: () => {},
   interruptAndSendQueued: async () => {},
+  pauseGoal: () => {},
+  resumeGoal: () => {},
+  clearGoal: () => {},
 };
 
 /** App 启动时注入：把桌面 MessageQueue 组件的 store 调用转成 pair 命令 */

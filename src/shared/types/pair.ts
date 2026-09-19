@@ -12,6 +12,8 @@ export interface PairStatusDevice {
   phoneOnline: boolean;
   /** 业务帧当前出口：直连（WebRTC）或中继；缺省（旧 main）视为中继 */
   transport?: 'relay' | 'direct';
+  /** 当前业务通道 ping→pong 往返（ms）；未采样或缺省不展示 */
+  rttMs?: number;
 }
 
 export interface PairStatus {
@@ -48,8 +50,8 @@ export type PairSessionConfig =
   | { type: 'set-thinking'; sessionId: string; level: ThinkingLevel };
 
 /**
- * 手机端的排队消息操作（已过白名单校验）。queuedMessages 只存于 renderer store，
- * 故不走 agent bridge，一律交 renderer 的 store 方法（与桌面队列区同一路径）。
+ * 手机端的排队消息 / 会话目标操作（已过白名单校验）。queuedMessages 与 goal 只存于
+ * renderer store，故不走 agent bridge，一律交 renderer 的 store 方法（与桌面同一路径）。
  */
 export type PairQueueAction =
   | {
@@ -61,7 +63,16 @@ export type PairQueueAction =
   | { type: 'queue-remove'; sessionId: string; messageId: string }
   | { type: 'queue-update'; sessionId: string; messageId: string; text: string }
   | { type: 'queue-send-now'; sessionId: string; messageId: string }
-  | { type: 'queue-interrupt-send'; sessionId: string; messageId: string };
+  | { type: 'queue-interrupt-send'; sessionId: string; messageId: string }
+  | { type: 'goal-pause'; sessionId: string }
+  | { type: 'goal-resume'; sessionId: string }
+  | { type: 'goal-clear'; sessionId: string }
+  | { type: 'goal-set'; sessionId: string; text: string }
+  | { type: 'compact'; sessionId: string; instructions?: string }
+  | { type: 'rewind'; sessionId: string; userIndexFromEnd: number; restoreFiles?: boolean }
+  | { type: 'retry'; sessionId: string }
+  | { type: 'task-stop'; sessionId: string; taskId: string }
+  | { type: 'subagent-stop'; sessionId: string; agentId: string };
 
 /** renderer 推给 main 的目录快照。providers 必须已剥掉 apiKey/baseUrl。 */
 export interface PairCatalogPayload {
@@ -72,7 +83,10 @@ export interface PairCatalogPayload {
     projectId: string;
     status: string;
     unread?: boolean;
+    pendingAskCount?: number;
     parentId?: string;
+    /** 挂起的工具审批数，手机角标用 */
+    pendingApprovalCount?: number;
     /** 最后活动时间（末条消息或创建时间） */
     updatedAt?: number;
     /** 会话当前选用的 provider/model 与推理档位，手机切换器回显用 */
@@ -82,6 +96,14 @@ export interface PairCatalogPayload {
     thinkingLevel?: string;
     /** 排队中的消息（手机队列区展示用） */
     queued?: { id: string; text: string; hasImages?: boolean }[];
+    /** 会话目标（手机 GoalBar 展示用） */
+    goal?: {
+      text: string;
+      status: 'active' | 'paused' | 'completed' | 'blocked' | 'waiting';
+      note?: string;
+      autoTurns: number;
+    };
+    slashCommands?: { name: string; description: string }[];
   }[];
   /** 置顶组手动拖拽顺序（会话 id）；项目手动顺序已直接体现在 projects 排序里 */
   pinnedOrder?: string[];
@@ -89,6 +111,8 @@ export interface PairCatalogPayload {
     id: string;
     name: string;
     path: string;
+    /** 项目别名；对端展示走 pairProjectDisplayName，name 保持真实项目名 */
+    alias?: string;
     kind?: 'local' | 'ssh';
     sshConnectionName?: string;
     sshHost?: string;

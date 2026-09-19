@@ -76,6 +76,50 @@ describe('config sync codec schema and crypto boundaries', () => {
     expect(() => validateBundle(input)).toThrow(/smartCompactModel|reference/i);
   });
 
+  it('压缩策略与旧 smartCompactEnabled 一起往返，非法策略拒绝', () => {
+    const input = minimalBundle();
+    input.state.compactStrategy = 'continuous-memory';
+    input.state.smartCompactEnabled = false;
+    expect(validateBundle(input).state).toMatchObject({
+      compactStrategy: 'continuous-memory',
+      smartCompactEnabled: false,
+    });
+    delete input.state.compactStrategy;
+    expect(validateBundle(input).state).not.toHaveProperty('compactStrategy');
+    (input.state as unknown as Record<string, unknown>).compactStrategy = 'bogus';
+    expect(() => validateBundle(input)).toThrow(/compactStrategy/);
+  });
+
+  it('编辑模式新枚举优先，旧开关按存在性迁为 canonical 字段，完全缺省则不捏造', () => {
+    for (const editMode of ['replace', 'apply_patch'] as const) {
+      const input = minimalBundle();
+      input.state.editMode = editMode;
+      input.state.hashlineEditEnabled = true;
+      const state = validateBundle(input).state;
+      expect(state.editMode).toBe(editMode);
+      expect(state).not.toHaveProperty('hashlineEditEnabled');
+    }
+
+    const legacy = minimalBundle();
+    legacy.state.hashlineEditEnabled = true;
+    expect(validateBundle(legacy).state).toMatchObject({ editMode: 'apply_patch' });
+    legacy.state.hashlineEditEnabled = false;
+    expect(validateBundle(legacy).state).toMatchObject({ editMode: 'apply_patch' });
+    expect(validateBundle(minimalBundle()).state).not.toHaveProperty('editMode');
+  });
+
+  it('编辑模式或旧开关类型非法时拒绝整个包', () => {
+    for (const [field, value] of [
+      ['editMode', 'patch'],
+      ['editMode', true],
+      ['hashlineEditEnabled', 'true'],
+    ] as const) {
+      const input = minimalBundle();
+      (input.state as unknown as Record<string, unknown>)[field] = value;
+      expect(() => validateBundle(input), field).toThrow();
+    }
+  });
+
   it('拒绝缺少任何必需的资源数组', () => {
     for (const key of ['skills', 'instructions'] as const) {
       const input = minimalBundle();

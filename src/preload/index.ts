@@ -1,3 +1,10 @@
+import type {
+  BtwAbortRequest,
+  BtwDisposeRequest,
+  BtwPromptRequest,
+  BtwPromptResult,
+  BtwSpawnRequest,
+} from '@shared/btw';
 import type { AgentTypeRegistrySnapshot } from '@shared/builtinAgents';
 import type {
   CapabilityAskDecisionAck,
@@ -107,6 +114,7 @@ import type {
   BrowserDesignModeEvent,
   BrowserTabState,
 } from '@shared/types/browser';
+import type { SessionChangeSnapshots } from '@shared/types/fileChanges';
 import type {
   AgentComposerPrefillEvent,
   AgentDispatchRequest,
@@ -156,8 +164,19 @@ const electronAPI = {
       ipcRenderer.on(IPC_CHANNELS.APP_CLOSE_REQUEST, listener);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.APP_CLOSE_REQUEST, listener);
     },
-    respondCloseRequest: (requestId: string, payload: { confirmed: boolean }): void => {
+    respondCloseRequest: (
+      requestId: string,
+      payload: { action: 'cancel' | 'quit' | 'tray' }
+    ): void => {
       ipcRenderer.send(IPC_CHANNELS.APP_CLOSE_RESPONSE, requestId, payload);
+    },
+    onFlushPersist: (callback: (requestId: string) => void): (() => void) => {
+      const listener = (_: unknown, requestId: string) => callback(requestId);
+      ipcRenderer.on(IPC_CHANNELS.APP_FLUSH_PERSIST_REQUEST, listener);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.APP_FLUSH_PERSIST_REQUEST, listener);
+    },
+    respondFlushPersist: (requestId: string): void => {
+      ipcRenderer.send(IPC_CHANNELS.APP_FLUSH_PERSIST_RESPONSE, requestId);
     },
   },
 
@@ -366,11 +385,11 @@ const electronAPI = {
 
   changes: {
     /** Changes 面板会话快照（编辑前全文）：主进程按会话落盘，不进 localStorage */
-    readSnapshots: (request: { conversationId: string }): Promise<Record<string, string>> =>
+    readSnapshots: (request: { conversationId: string }): Promise<SessionChangeSnapshots> =>
       ipcRenderer.invoke(IPC_CHANNELS.CHANGES_SNAPSHOTS_READ, request),
     writeSnapshots: (request: {
       conversationId: string;
-      snapshots: Record<string, string>;
+      snapshots: SessionChangeSnapshots;
     }): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.CHANGES_SNAPSHOTS_WRITE, request),
   },
 
@@ -797,6 +816,8 @@ const electronAPI = {
     quitAndInstall: (): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.UPDATER_QUIT_AND_INSTALL),
     setAutoUpdateEnabled: (enabled: boolean): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.UPDATER_SET_AUTO_UPDATE_ENABLED, enabled),
+    setAutoRestartWhenIdle: (enabled: boolean): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.UPDATER_SET_AUTO_RESTART_WHEN_IDLE, enabled),
     onStatus: (callback: (status: UpdateStatus) => void): (() => void) => {
       const listener = (_: unknown, status: UpdateStatus) => callback(status);
       ipcRenderer.on(IPC_CHANNELS.UPDATER_STATUS, listener);
@@ -840,7 +861,7 @@ const electronAPI = {
       ipcRenderer.on(IPC_CHANNELS.PAIR_SESSION_CONFIG, listener);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.PAIR_SESSION_CONFIG, listener);
     },
-    /** main 通知：手机操作了排队消息，应用到会话 store */
+    /** main 通知：手机操作了排队消息 / 会话目标，应用到会话 store */
     onQueueAction: (callback: (action: PairQueueAction) => void): (() => void) => {
       const listener = (_: unknown, action: PairQueueAction) => callback(action);
       ipcRenderer.on(IPC_CHANNELS.PAIR_QUEUE_ACTION, listener);
@@ -916,6 +937,16 @@ const electronAPI = {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.WINDOW_FULLSCREEN_CHANGED, listener);
     },
   },
+  btw: {
+    prompt: (request: BtwPromptRequest): Promise<BtwPromptResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BTW_PROMPT, request),
+    abort: (request: BtwAbortRequest): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BTW_ABORT, request),
+    spawn: (request: BtwSpawnRequest): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BTW_SPAWN, request),
+    dispose: (request: BtwDisposeRequest): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BTW_DISPOSE, request),
+  },
   terminal: {
     create: (request: TerminalCreateRequest): Promise<TerminalCreateResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_CREATE, request),
@@ -969,6 +1000,8 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.BROWSER_RELOAD, tabId),
     closeTab: (tabId: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.BROWSER_CLOSE_TAB, tabId),
+    closeSession: (conversationId: string): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.BROWSER_CLOSE_SESSION, conversationId),
     clearData: (kind: BrowserClearKind): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.BROWSER_CLEAR_DATA, kind),
     setLocked: (conversationId: string, locked: boolean): Promise<void> =>

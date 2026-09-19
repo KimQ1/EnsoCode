@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DirectCandidate, IceServerEntry } from '../protocol';
 import { encodeChunks } from './chunk';
 import { DIRECT_NEGOTIATE_TIMEOUT_MS } from './directSession';
-import { DirectLink, type DirectSignal } from './link';
+import { DirectLink, type DirectLinkDeps, type DirectSignal } from './link';
 import type { DirectPeer } from './peer';
 
 /** 可脚本化的假对端：记录调用，测试手动触发回调 */
@@ -81,17 +81,23 @@ function fakePeer() {
   };
 }
 
-function harness(role: 'guest' | 'host', factoryNull = false) {
+function harness(
+  role: 'guest' | 'host',
+  factoryNull = false,
+  extra: Partial<Pick<DirectLinkDeps, 'onNeedRelayProbe'>> = {}
+) {
   const peers: ReturnType<typeof fakePeer>[] = [];
   const factoryIceServers: IceServerEntry[][] = [];
   const signals: DirectSignal[] = [];
   const frames: Uint8Array[] = [];
   const transports: string[] = [];
   const diagnostics: string[] = [];
+  const rtts: number[] = [];
   let resyncs = 0;
   const link = new DirectLink({
     role,
     onDiagnostic: (line) => diagnostics.push(line),
+    onRtt: (ms) => rtts.push(ms),
     factory: (iceServers) => {
       factoryIceServers.push(iceServers);
       if (factoryNull) return null;
@@ -106,6 +112,7 @@ function harness(role: 'guest' | 'host', factoryNull = false) {
     onResync: () => {
       resyncs += 1;
     },
+    ...extra,
   });
   return {
     link,
@@ -115,6 +122,7 @@ function harness(role: 'guest' | 'host', factoryNull = false) {
     frames,
     transports,
     diagnostics,
+    rtts,
     resyncs: () => resyncs,
   };
 }
@@ -240,7 +248,7 @@ describe('DirectLink guest', () => {
 
     const frame = new Uint8Array(20_000).fill(9);
     expect(h.link.send(frame)).toBe(true);
-    expect(p.sent).toHaveLength(2);
+    expect(p.sent).toHaveLength(3);
 
     for (const c of encodeChunks(new Uint8Array([1, 2, 3]))) p.fire.message(c);
     expect(h.frames).toEqual([new Uint8Array([1, 2, 3])]);
@@ -256,7 +264,7 @@ describe('DirectLink guest', () => {
     p.sendResults.push(true, false);
 
     expect(h.link.send(new Uint8Array(20_000))).toBe(false);
-    expect(p.sent).toHaveLength(1);
+    expect(p.sent).toHaveLength(2);
     expect(p.isClosed()).toBe(true);
     expect(h.link.transport()).toBe('relay');
     expect(h.transports).toEqual(['direct', 'relay']);
@@ -272,7 +280,7 @@ describe('DirectLink guest', () => {
     p.sendResults.push(false);
 
     expect(h.link.send(new Uint8Array(20_000))).toBe(false);
-    expect(p.sent).toEqual([]);
+    expect(p.sent).toEqual([new Uint8Array([0x02])]);
     expect(p.isClosed()).toBe(false);
     expect(h.link.transport()).toBe('direct');
     expect(h.transports).toEqual(['direct']);
@@ -320,18 +328,31 @@ describe('DirectLink guest', () => {
     expect(h.factoryIceServers).toHaveLength(1);
   });
 
-  it('心跳：25s 发 ping，10s 内无消息判死 → 切回 relay', async () => {
+  it('心跳：打开后立刻 ping，10s 内无消息判死 → 切回 relay', async () => {
     const h = harness('guest');
     h.link.peerOnline(true);
     h.link.hostInfo({ capabilities: ['direct-v1'] });
     await flush();
     const p = h.peers[0];
     p.fire.open();
-    await vi.advanceTimersByTimeAsync(25_000);
     expect(p.sent.at(-1)).toEqual(new Uint8Array([0x02]));
     await vi.advanceTimersByTimeAsync(10_000);
     expect(h.link.transport()).toBe('relay');
     expect(p.isClosed()).toBe(true);
+  });
+
+  it('直连打开立刻 ping，pong 回报 RTT', async () => {
+    vi.setSystemTime(10_000);
+    const h = harness('guest');
+    h.link.peerOnline(true);
+    h.link.hostInfo({ capabilities: ['direct-v1'] });
+    await flush();
+    const p = h.peers[0];
+    p.fire.open();
+    expect(p.sent[0]).toEqual(new Uint8Array([0x02]));
+    vi.setSystemTime(10_037);
+    p.fire.message(new Uint8Array([0x03]));
+    expect(h.rtts).toEqual([37]);
   });
 
   it('收到 ping 回 pong；pong 视为存活', async () => {
@@ -399,6 +420,78 @@ describe('DirectLink guest', () => {
   });
 });
 
+describe('DirectLink 直连/中继比速', () => {
+  async function openGuest() {
+    const probes: number[] = [];
+    const h = harness('guest', false, { onNeedRelayProbe: () => probes.push(1) });
+    h.link.peerOnline(true);
+    h.link.hostInfo({ capabilities: ['direct-v1'] });
+    await flush();
+    return { h, probes };
+  }
+
+  it('打开后先测速，业务仍走中继', async () => {
+    const { h, probes } = await openGuest();
+    h.peers[0].fire.open();
+    expect(probes).toEqual([1]);
+    expect(h.link.transport()).toBe('relay');
+    expect(h.transports).toEqual([]);
+  });
+
+  it('直连 RTT 明显差于中继 → 拆直连、钉中继、不重试', async () => {
+    vi.setSystemTime(10_000);
+    const { h } = await openGuest();
+    const p = h.peers[0];
+    p.fire.open();
+    vi.setSystemTime(10_120);
+    p.fire.message(new Uint8Array([0x03]));
+    h.link.noteRelayRtt(40);
+    expect(h.link.transport()).toBe('relay');
+    expect(h.transports).toEqual([]);
+    expect(h.signals.at(-1)).toEqual({ type: 'direct-close', gen: 1 });
+    expect(p.isClosed()).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.peers).toHaveLength(1);
+  });
+
+  it('直连不慢于中继 → 切到直连', async () => {
+    vi.setSystemTime(10_000);
+    const { h } = await openGuest();
+    const p = h.peers[0];
+    p.fire.open();
+    vi.setSystemTime(10_020);
+    p.fire.message(new Uint8Array([0x03]));
+    h.link.noteRelayRtt(80);
+    expect(h.link.transport()).toBe('direct');
+    expect(h.transports).toEqual(['direct']);
+  });
+
+  it('测速超时且没有中继样本 → 仍切直连', async () => {
+    const { h } = await openGuest();
+    h.peers[0].fire.open();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.link.transport()).toBe('direct');
+  });
+
+  it('钉中继后网络变化才重新发 offer', async () => {
+    vi.setSystemTime(10_000);
+    const { h } = await openGuest();
+    const p = h.peers[0];
+    p.fire.open();
+    vi.setSystemTime(10_120);
+    p.fire.message(new Uint8Array([0x03]));
+    h.link.noteRelayRtt(40);
+    expect(h.signals.at(-1)).toEqual({ type: 'direct-close', gen: 1 });
+    h.link.hostInfo({ capabilities: ['direct-v1'] });
+    await flush();
+    expect(h.peers).toHaveLength(1);
+    h.link.networkChange();
+    await flush();
+    expect(h.peers).toHaveLength(2);
+    expect(h.signals.at(-1)).toEqual({ type: 'direct-offer', gen: 2, sdp: 'offer-sdp' });
+  });
+});
+
 describe('DirectLink host', () => {
   it('收到 offer → 建 peer、回 answer；dc 打开 → direct', async () => {
     const h = harness('host');
@@ -407,6 +500,22 @@ describe('DirectLink host', () => {
     expect(h.peers[0].calls).toEqual(['acceptOffer:offer-sdp']);
     expect(h.signals).toEqual([{ type: 'direct-answer', gen: 1, sdp: 'answer-sdp' }]);
     h.peers[0].fire.open();
+    expect(h.link.transport()).toBe('direct');
+  });
+
+  it('已连接后访客重启的 gen=1 提议立刻顶掉旧通道', async () => {
+    const h = harness('host');
+    h.link.handleSignal({ type: 'direct-offer', gen: 1, sdp: 'a' });
+    await flush();
+    h.peers[0].fire.open();
+    expect(h.link.transport()).toBe('direct');
+
+    h.link.handleSignal({ type: 'direct-offer', gen: 1, sdp: 'b' });
+    await flush();
+    expect(h.peers[0].isClosed()).toBe(true);
+    expect(h.peers[1].calls).toEqual(['acceptOffer:b']);
+    expect(h.link.transport()).toBe('relay');
+    h.peers[1].fire.open();
     expect(h.link.transport()).toBe('direct');
   });
 

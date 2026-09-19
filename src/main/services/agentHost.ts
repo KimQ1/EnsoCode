@@ -12,6 +12,7 @@ import {
   type SessionIdentity,
 } from '@shared/builtinAgents';
 import type { CapabilityExecutionEnvelope } from '@shared/capabilities/types';
+import { resolveCompactStrategy } from '@shared/compactStrategy';
 import {
   type DefaultModelRef,
   type ModelCredentialContext,
@@ -22,7 +23,11 @@ import { mcpTimeoutsForSpawn } from '@shared/mcpTimeout';
 import { pickModelCapabilityOverrides } from '@shared/modelCatalog';
 import { proxyEnvPatchFromEnv } from '@shared/proxy';
 import { parseSmartCompactMode } from '@shared/smartCompactMode';
-import { effectiveDisabledBuiltinTools } from '@shared/types';
+import {
+  projectDisabledBuiltinTools,
+  resolveDisabledBuiltinTools,
+  resolveEditMode,
+} from '@shared/types';
 import type {
   AgentCommand,
   AgentRemoteConfig,
@@ -337,6 +342,23 @@ export function resolveModelSelection(
   };
 }
 
+export function expectedAgentTypeToolIds(tools: AgentTypeEntry['tools']): readonly string[] {
+  return tools === 'readonly'
+    ? ['read', 'grep', 'find', 'ls', 'message_main_agent', 'message_coworker']
+    : [
+        'read',
+        'grep',
+        'find',
+        'ls',
+        'bash',
+        'edit',
+        'apply_patch',
+        'write',
+        'message_main_agent',
+        'message_coworker',
+      ];
+}
+
 export function resolveAgentTypeSpawnConfig(
   typeKey: AgentTypeKey,
   parentModel: ResolvedModelSelection,
@@ -417,20 +439,7 @@ export function resolveAgentTypeSpawnConfig(
       systemPromptHash: createHash('sha256').update(definition.systemPrompt).digest('hex'),
     },
     expectedModel: selectedModel.ref,
-    expectedToolIds:
-      definition.tools === 'readonly'
-        ? ['read', 'grep', 'find', 'ls', 'message_main_agent', 'message_coworker']
-        : [
-            'read',
-            'grep',
-            'find',
-            'ls',
-            'bash',
-            'edit',
-            'write',
-            'message_main_agent',
-            'message_coworker',
-          ],
+    expectedToolIds: expectedAgentTypeToolIds(definition.tools),
   };
 }
 
@@ -439,7 +448,14 @@ export function spawnSession(
   request: AgentSpawnRequest,
   authenticatedAccountKeys: ReadonlySet<string>,
   /** 由 main 从项目权威派生(渲染层不可伪造):ssh 项目的会话工具走远端执行 */
-  remote?: AgentRemoteConfig
+  remote?: AgentRemoteConfig,
+  /** 由 main 从会话权威派生，渲染层不可伪造 */
+  projectId?: string,
+  options?: {
+    rolePrompt?: string;
+    extraDisabledTools?: readonly string[];
+    omitDispatchTools?: boolean;
+  }
 ): { ok: boolean; error?: string } {
   if (request.resumeFile && !existsSync(request.resumeFile)) {
     return { ok: false, error: '会话文件已丢失，无法恢复历史' };
@@ -464,19 +480,31 @@ export function spawnSession(
   );
   const skillPaths = enabledSkillPaths(preset);
   const mcpServers = enabledMcpServers(preset);
-  const subagentModels = configuredSubagentModels(authenticatedAccountKeys);
-  const agentTypes = configuredAgentTypes(authenticatedAccountKeys, subagentModels.length > 0);
+  const subagentModels = options?.omitDispatchTools
+    ? []
+    : configuredSubagentModels(authenticatedAccountKeys);
+  const agentTypes = options?.omitDispatchTools
+    ? []
+    : configuredAgentTypes(authenticatedAccountKeys, subagentModels.length > 0);
   const state = readSettingsState();
-  const disabledTools = effectiveDisabledBuiltinTools(state?.disabledBuiltinTools);
+  const disabledTools = resolveDisabledBuiltinTools(state?.disabledBuiltinTools, {
+    disabledBuiltinTools: projectDisabledBuiltinTools(state?.projects, projectId),
+  });
+  for (const id of options?.extraDisabledTools ?? []) {
+    if (!disabledTools.includes(id)) disabledTools.push(id);
+  }
   const loadHarnessAssets = state?.loadHarnessAssets === true;
   const windowsLocalShell = parseWindowsLocalShell(state?.windowsLocalShell);
   const exploreFoldEnabled = state?.exploreFoldEnabled === true;
-  const bashInterceptEnabled = state?.bashInterceptEnabled === true;
-  const hashlineEditEnabled = state?.hashlineEditEnabled === true;
-  const smartCompactEnabled = state?.smartCompactEnabled === true;
+  const editMode = resolveEditMode(state?.editMode, state?.hashlineEditEnabled);
+  const compactStrategy = resolveCompactStrategy(
+    state?.compactStrategy,
+    state?.smartCompactEnabled
+  );
+  const smartCompactEnabled = compactStrategy === 'smart';
   const smartCompactRef = asModelRef(state?.smartCompactModel);
   const smartCompactSummary =
-    smartCompactEnabled && smartCompactRef
+    compactStrategy !== 'standard' && smartCompactRef
       ? resolveModelSelection(
           smartCompactRef.providerId,
           smartCompactRef.modelId,
@@ -503,8 +531,8 @@ export function spawnSession(
     ...(loadHarnessAssets ? { loadHarnessAssets: true } : {}),
     ...(windowsLocalShell !== 'auto' ? { windowsLocalShell } : {}),
     ...(exploreFoldEnabled ? { exploreFoldEnabled: true } : {}),
-    ...(bashInterceptEnabled ? { bashInterceptEnabled: true } : {}),
-    ...(hashlineEditEnabled ? { hashlineEditEnabled: true } : {}),
+    editMode,
+    ...(compactStrategy !== 'standard' ? { compactStrategy } : {}),
     ...(smartCompactEnabled ? { smartCompactEnabled: true } : {}),
     ...(smartCompactSummaryModel ? { smartCompactSummaryModel } : {}),
     ...(smartCompactMode ? { smartCompactMode } : {}),
@@ -518,6 +546,7 @@ export function spawnSession(
     ...(disabledTools.length > 0 ? { disabledTools } : {}),
     ...(instruction ? { instruction } : {}),
     ...(remote ? { remote } : {}),
+    ...(options?.rolePrompt ? { rolePrompt: options.rolePrompt } : {}),
   });
 }
 
@@ -717,14 +746,18 @@ export function isAgentWorkerReady(): boolean {
  * worker 不在 / 退出 / 超时都以 reject 收尾，调用方自己决定重试。
  */
 export function completeText(input: {
+  requestId?: string;
   systemPrompt: string;
   userText: string;
   candidates: SpawnModelConfig[];
   timeoutMs: number;
   maxTokens?: number;
+  stream?: boolean;
+  reasoning?: ThinkingLevel | 'off';
 }): Promise<string> {
   if (!worker || !workerReady) return Promise.reject(new Error('Agent worker is not running.'));
-  const requestId = randomUUID();
+  const requestId = input.requestId?.trim() || randomUUID();
+  const { requestId: _requestId, stream, reasoning, ...rest } = input;
   return new Promise<string>((resolve, reject) => {
     // 每个候选各自 timeoutMs，整体再留一点余量做兑底
     const timer = setTimeout(
@@ -732,7 +765,7 @@ export function completeText(input: {
         pendingCompletions.delete(requestId);
         reject(new Error('completion timed out'));
       },
-      input.timeoutMs * input.candidates.length + 5_000
+      rest.timeoutMs * rest.candidates.length + 5_000
     );
     pendingCompletions.set(requestId, {
       resolve: (text) => {
@@ -744,12 +777,30 @@ export function completeText(input: {
         reject(error);
       },
     });
-    const posted = sendAgentCommand({ type: 'complete-text', requestId, ...input });
+    const posted = sendAgentCommand({
+      type: 'complete-text',
+      requestId,
+      ...rest,
+      ...(stream ? { stream: true as const } : {}),
+      ...(reasoning ? { reasoning } : {}),
+    });
     if (!posted.ok) {
       pendingCompletions.get(requestId)?.reject(new Error(posted.error ?? 'post failed'));
       pendingCompletions.delete(requestId);
     }
   });
+}
+
+/** 中止一次性补全：先拒绝 Main 侧等待者，再通知 worker 停推理 */
+export function abortCompleteText(requestId: string): { ok: boolean; error?: string } {
+  const id = requestId.trim();
+  if (!id) return { ok: false, error: 'invalid request' };
+  const pending = pendingCompletions.get(id);
+  if (pending) {
+    pendingCompletions.delete(id);
+    pending.reject(new Error('aborted'));
+  }
+  return sendAgentCommand({ type: 'abort-complete-text', requestId: id });
 }
 
 /** 标题总结：一次性补全命令，不绑会话身份；worker 按序尝试 candidates，结果经 title-generated / title-failed 回流 */

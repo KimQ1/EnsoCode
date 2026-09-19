@@ -5,6 +5,7 @@ import type {
   TodoItem,
   TurnPerf,
 } from '@shared/types/agent';
+import type { ProjectedApplyPatchOutcome, ProjectedFileChange } from '@shared/types/fileChanges';
 
 /** edit 工具的单个替换块（pi edit 工具参数 edits[] 的元素） */
 export interface EditBlock {
@@ -45,6 +46,8 @@ export type TimelineItem =
       edits: EditBlock[] | null;
       /** write 工具写入的文件内容,展开即可查看;非 write 为 null */
       writeContent: string | null;
+      /** apply_patch 实际落盘的多文件操作；失败结果也可能非空 */
+      fileChanges?: ProjectedFileChange[] | null;
       /** todo 工具的清单快照；非 todo 为 null */
       todos: TodoItem[] | null;
       /** 工具执行耗时（完成后显示）；未知为 null */
@@ -78,6 +81,7 @@ export type TimelineItem =
       summary: string;
       tokensBefore: number | null;
       verified?: boolean;
+      memory?: boolean;
     }
   /** 压缩进行中 / 排队：钉在时间线底部，不依赖占用面板 */
   | { kind: 'compaction-progress'; key: string; state: 'queued' | 'running' }
@@ -88,11 +92,48 @@ export type TimelineItem =
       summary: string;
       tokensBefore: number | null;
       verified?: boolean;
+      memory?: boolean;
     }
   /** 后台任务完成的合成注入消息（<background-task-update>），渲染为系统通知行 */
   | { kind: 'task-note'; key: string; summary: string; detail: string }
   /** 不进入 LLM context 的 parent/child SessionManager custom entry。 */
   | { kind: 'session-custom'; key: string; entry: AgentSessionCustomEntry };
+
+export function formatApplyPatchOutcome(outcome: ProjectedApplyPatchOutcome): string {
+  const list = (label: string, paths: string[]): string =>
+    `${label}:\n${paths.length > 0 ? paths.map((path) => `- ${path}`).join('\n') : '(none)'}`;
+  return [
+    `Patch ${outcome.status}.`,
+    list('Applied', outcome.applied),
+    list('Failed paths', outcome.failed),
+    ...(outcome.error ? [`Error: ${outcome.error}`] : []),
+    list('Unattempted', outcome.unattempted),
+    list('Uncertain', outcome.uncertain),
+    ...(outcome.status === 'success' ? [] : ['Re-read failed or uncertain paths before retrying.']),
+    ...(outcome.input ? [`Input:\n${outcome.input}`] : []),
+  ].join('\n');
+}
+
+export function shouldAutoExpandAppliedFileChanges(
+  item: TimelineItem,
+  previouslyHadFileChanges: boolean
+): boolean {
+  return (
+    !previouslyHadFileChanges &&
+    item.kind === 'tool' &&
+    item.name === 'apply_patch' &&
+    Boolean(item.fileChanges?.length)
+  );
+}
+
+export function shouldShowToolOutputAfterFileChanges(item: TimelineItem): boolean {
+  return (
+    item.kind === 'tool' &&
+    item.name === 'apply_patch' &&
+    Boolean(item.fileChanges?.length) &&
+    Boolean(item.output)
+  );
+}
 
 export interface ToolGroupStats {
   commands: number;
@@ -163,19 +204,35 @@ function summarizeArgs(args: unknown, cwd?: string): string {
 }
 
 /** 时间线顶部：翻页在途 / 已到第 0 条 / 不占文案 */
-export type HistoryPageChrome = 'none' | 'loading' | 'start';
+export type HistoryPageChrome = 'none' | 'loading' | 'start' | 'more';
 
 /** 到头提示只给「曾经有更早、现已翻完」的会话；刚开场 / 一页就完的短会话不显示 */
 export function historyPageChrome(
   hasItems: boolean,
   loading: boolean,
   hasOlder: boolean | undefined,
-  everHadOlder = false
+  everHadOlder = false,
+  offerLoadMore = false
 ): HistoryPageChrome {
   if (!hasItems) return 'none';
   if (loading) return 'loading';
+  if (hasOlder && offerLoadMore) return 'more';
   if (hasOlder === false && everHadOlder) return 'start';
   return 'none';
+}
+
+/**
+ * 非虚拟化时间线（PWA）：探索组收拢后内容往往撑不满一屏，
+ * 用户滚不到顶。撑不满时只展示可点的加载入口，避免一进会话就拉一整页历史。
+ */
+export function shouldPrefetchOlderHistory(
+  hasOlder: boolean,
+  loading: boolean,
+  scrollHeight: number,
+  clientHeight: number,
+  slack = 80
+): boolean {
+  return hasOlder && !loading && scrollHeight <= clientHeight + slack;
 }
 
 export function execSourceFromArgs(args: unknown): string | null {
@@ -428,6 +485,8 @@ function buildMessageTimeline(
       durationMs: number | null;
       agentMeta: { modelId?: string; outputTokens?: number; steps?: number } | null;
       editDiff: { oldText: string; newText: string } | null;
+      fileChanges: ProjectedFileChange[] | null;
+      applyPatchOutcome: ProjectedApplyPatchOutcome | null;
     }
   >();
   for (const message of messages) {
@@ -439,6 +498,8 @@ function buildMessageTimeline(
         durationMs: message.toolDurationMs ?? null,
         agentMeta: message.subagentMeta ?? null,
         editDiff: message.editDiff ?? null,
+        fileChanges: message.fileChanges ?? null,
+        applyPatchOutcome: message.applyPatchOutcome ?? null,
       });
     }
   }
@@ -496,6 +557,7 @@ function buildMessageTimeline(
         summary: partText(message),
         tokensBefore: message.tokensBefore ?? null,
         ...(message.verified ? { verified: true } : {}),
+        ...(message.memory ? { memory: true } : {}),
       });
       return;
     }
@@ -597,7 +659,11 @@ function buildMessageTimeline(
           // 未完成时退而用执行中的输出快照（空串不算，否则行会变“可展开但空”）
           const partial = toolOutputs?.[part.id];
           const execSource = part.name === 'exec' ? execSourceFromArgs(part.arguments) : null;
-          const output = result ? result.output : (partial ?? null) || null;
+          const output = result
+            ? result.applyPatchOutcome
+              ? formatApplyPatchOutcome(result.applyPatchOutcome)
+              : result.output
+            : (partial ?? null) || null;
           const sandboxView = part.name === 'exec' ? parseSandboxOutput(output) : null;
           items.push({
             kind: 'tool',
@@ -605,7 +671,11 @@ function buildMessageTimeline(
             name: part.name,
             summary: execSource
               ? summarizeExecSource(execSource)
-              : summarizeArgs(part.arguments, cwd),
+              : part.name === 'apply_patch' && result?.fileChanges?.length
+                ? result.fileChanges.length === 1
+                  ? toProjectRelativePath(result.fileChanges[0].path, cwd)
+                  : `${result.fileChanges.length} files`
+                : summarizeArgs(part.arguments, cwd),
             source: execSource,
             output,
             nestedPending: nestedPendingCount(part.id, pendingApprovals) || undefined,
@@ -626,6 +696,7 @@ function buildMessageTimeline(
               : (extractEdits(part.name, part.arguments) ??
                 extractHashlineDiff(part.name, result?.editDiff)),
             writeContent: extractWriteContent(part.name, part.arguments),
+            fileChanges: result?.fileChanges ?? null,
             todos: result?.todos ?? null,
             durationMs: result?.durationMs ?? null,
             agentMeta: result?.agentMeta ?? null,
@@ -711,6 +782,7 @@ function insertCompactionNotice(items: TimelineItem[], noticeAt: number): Timeli
     summary: lastSummary.summary,
     tokensBefore: lastSummary.tokensBefore,
     ...(lastSummary.verified ? { verified: true } : {}),
+    ...(lastSummary.memory ? { memory: true } : {}),
   };
   return [...items.slice(0, at), notice, ...items.slice(at)];
 }
@@ -729,6 +801,96 @@ function appendCompactionChrome(
 }
 
 /** Messages 与 custom entries 仅在展示层按时间合并；custom entries 从不进入 messages。 */
+/**
+ * 末条 assistant 仍在流式思考/正文变长：复用前缀行对象，只替换那一行。
+ * 结构对不上（新 part、工具结果、非 running）返回 null，调用方全量重建。
+ */
+export function patchStreamingTimeline(
+  previous: readonly TimelineItem[],
+  messages: readonly ProjectedMessage[],
+  running: boolean,
+  historyBaseIndex = 0
+): TimelineItem[] | null {
+  if (!running || previous.length === 0) return null;
+  const last = messages.at(-1);
+  if (last?.role !== 'assistant') return null;
+  const settled = Boolean(last.stopReason) && last.stopReason !== 'pending';
+  if (settled) return null;
+  const lastActive = findLastActivePartIndex(last.content);
+  if (lastActive < 0) return null;
+  const part = last.content[lastActive];
+  if (!part || (part.type !== 'thinking' && part.type !== 'text')) return null;
+  if (part.type === 'text') {
+    const pieces = splitThinkingTaggedText(part.text);
+    if (pieces.length !== 1 || pieces[0].kind !== 'text') return null;
+  }
+  const key = `${historyBaseIndex + messages.length - 1}-${lastActive}`;
+  let hit = -1;
+  for (let i = previous.length - 1; i >= 0; i--) {
+    const item = previous[i];
+    if (item.key !== key) continue;
+    if (item.kind === 'thinking' || item.kind === 'text') {
+      hit = i;
+      break;
+    }
+  }
+  if (hit < 0) return null;
+  const item = previous[hit];
+  if (item.kind === 'thinking') {
+    if (part.type !== 'thinking' || item.streaming !== true) return null;
+    if (item.text === part.text) return previous as TimelineItem[];
+    const next = previous.slice();
+    next[hit] = { ...item, text: part.text };
+    return next;
+  }
+  if (item.kind !== 'text' || part.type !== 'text' || item.streaming !== true) return null;
+  if (item.text === part.text) return previous as TimelineItem[];
+  const next = previous.slice();
+  next[hit] = { ...item, text: part.text };
+  return next;
+}
+
+/** 已完成的 edit/write 身份；思考/正文流式变长时保持不变，供 Files/Changes 跳过重渲染。 */
+export function completedEditWriteFingerprint(messages: readonly ProjectedMessage[]): string {
+  const failed = new Map<string, boolean>();
+  const appliedPatches = new Map<string, ProjectedFileChange[]>();
+  for (const message of messages) {
+    if (message.role === 'toolResult' && message.toolCallId) {
+      failed.set(message.toolCallId, message.isError === true);
+      if (message.toolName === 'apply_patch' && message.fileChanges?.length) {
+        appliedPatches.set(message.toolCallId, message.fileChanges);
+      }
+    }
+  }
+  const parts: string[] = [];
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue;
+    for (const part of message.content) {
+      if (part.type !== 'toolCall') continue;
+      if (part.name === 'apply_patch') {
+        const changes = appliedPatches.get(part.id);
+        if (!changes) continue;
+        parts.push(
+          part.id,
+          part.name,
+          changes
+            .map(
+              (change) =>
+                `${change.path}:${change.type}:${change.oldText.length}:${change.newText.length}:${change.truncated === true}`
+            )
+            .join('|')
+        );
+        continue;
+      }
+      if (part.name !== 'edit' && part.name !== 'write') continue;
+      const isError = failed.get(part.id);
+      if (isError === undefined || isError) continue;
+      parts.push(part.id, part.name, JSON.stringify(part.arguments));
+    }
+  }
+  return parts.join('\0');
+}
+
 export function buildTimeline(
   messages: ProjectedMessage[],
   running: boolean,
@@ -964,6 +1126,32 @@ export function isReadOnlyTool(item: { name: string; summary: string }): boolean
   );
 }
 
+/** 仅展示层合并同一消息的相邻思考；保留原始 part 行供流式补丁定位。 */
+function mergeAdjacentThinking(items: TimelineItem[]): TimelineItem[] {
+  const result: TimelineItem[] = [];
+  for (const item of items) {
+    const previous = result.at(-1);
+    if (
+      item.kind === 'thinking' &&
+      previous?.kind === 'thinking' &&
+      messageItemIndex(item) >= 0 &&
+      messageItemIndex(previous) === messageItemIndex(item)
+    ) {
+      result[result.length - 1] = {
+        ...previous,
+        text: `${previous.text}\n\n${item.text}`,
+        streaming: previous.streaming || item.streaming,
+        // 各 part 共用 step 计时，不能累加；标签思考可能没有打点。
+        durationMs: previous.durationMs ?? item.durationMs,
+        startedAt: previous.startedAt ?? item.startedAt,
+      };
+    } else {
+      result.push(item);
+    }
+  }
+  return result;
+}
+
 /**
  * 工具行分组折叠（折中方案）：
  * - 段 = 连续的 tool/thinking 行（text/user/error 打断）；thinking 收进段内，门槛只数 tool。
@@ -996,14 +1184,15 @@ export function foldTimeline(
     // 收集连续段
     let end = i;
     while (end < items.length && inSegment(items[end])) end += 1;
-    const segment = items.slice(i, end);
+    const segment = mergeAdjacentThinking(items.slice(i, end));
     const liveSegment = !compact && running && lastUserIndex >= 0 && i > lastUserIndex;
     // 钉住的行不进组：edit 的 diff、write 的内容、todo 清单是核心产物。
     // compact 下 running 只读行进组（避免完成后从平铺跳进组头抽动）；
     // 非 compact 仍把 running 钉在组外，方便看此刻在跑什么。
     const pinned = (s: TimelineItem): boolean => {
       if (s.kind !== 'tool') return false;
-      if (s.edits !== null || s.writeContent || s.name === 'todo') return true;
+      if (s.edits !== null || s.writeContent || s.fileChanges?.length || s.name === 'todo')
+        return true;
       if (s.state !== 'running' && s.state !== 'reviewing') return false;
       return !(compact && isReadOnlyTool(s));
     };

@@ -22,6 +22,7 @@ import {
   isSameChildSessionIdentity,
   type SessionIdentity,
 } from '@shared/builtinAgents';
+import { type CompactStrategy, resolveCompactStrategy } from '@shared/compactStrategy';
 import { DEFAULT_MAX_ACTIVE_COWORKERS } from '@shared/maxActiveCoworkers';
 import {
   findCatalogModelById,
@@ -31,6 +32,7 @@ import {
 import { ensureAccountProvider } from '@shared/piAccounts';
 import { resolvePiProviderBaseUrl } from '@shared/providerCatalog';
 import { ANTIGRAVITY_PROVIDER_ID, antigravityProviderConfig } from '@shared/providers/antigravity';
+import { DEVIN_PROVIDER_ID, devinProviderConfig } from '@shared/providers/devin';
 import type { SmartCompactMode } from '@shared/smartCompactMode';
 import { buildSshShellCommand, shellQuote } from '@shared/ssh';
 import type {
@@ -56,9 +58,16 @@ import type {
   ThinkingLevel,
 } from '@shared/types/agent';
 import { parseAgentSessionCustomEntry } from '@shared/types/agent';
+import { type EditMode, resolveEditMode } from '@shared/types/editMode';
 import { providerIdOfAccountKey } from '@shared/types/oauthProviders';
 import type { WindowsLocalShell } from '@shared/windowsLocalShell';
 import { version } from '../../package.json';
+import {
+  createApplyPatchTool,
+  createRemoteApplyPatchIo,
+  validateApplyPatchTargets,
+} from './applyPatch';
+import { applyPatchResultExtension } from './applyPatchResultExtension';
 import { ApprovalGate, withApproval } from './approval';
 import {
   APPROVAL_REVIEW_TIMEOUT_MS,
@@ -69,13 +78,7 @@ import {
 } from './approvalReview';
 import { AskManager, createAskTool } from './ask';
 import { ensureAssistantUsage } from './assistantUsage';
-import {
-  BackgroundTaskManager,
-  createTaskTools,
-  withBackground,
-  withTaskReminders,
-} from './backgroundTasks';
-import { withBashInterception } from './bashInterceptor';
+import { BackgroundTaskManager, createTaskTools, withBackground } from './backgroundTasks';
 import { CheckpointManager, withCheckpoint } from './checkpoint/manager';
 import { createRemoteCheckpointHost } from './checkpoint/remoteHost';
 import {
@@ -93,9 +96,14 @@ import {
   type ContextUsageTracker,
   ContextUsageTracker as UsageTracker,
 } from './contextUsage';
+import {
+  cancelContinuousMemory,
+  continuousMemoryInlineExtension,
+} from './continuousMemory/extension';
 import { createCoworkerTool } from './coworker';
 import { CURSOR_PROVIDER_ID, loadCursorProvider } from './cursor/loadProvider';
 import { attachCursorBridgeToSession, isCursorModel } from './cursor/sessionBridge';
+import { resolveCustomModelCompat, selectCatalogEntryForCompat } from './customModelCompat';
 import { createNormalizedEditTool } from './editTool';
 import { ENSO_SYSTEM_PROMPT } from './ensoPrompt';
 import { EnsoSafeJournal } from './ensoSafeJournal';
@@ -103,21 +111,19 @@ import { createExploreFoldState, createExploreFoldTools } from './exploreFold';
 import { OperationGate } from './gate';
 import { createGoalTools } from './goal';
 import { readHarnessRuleFiles, resolveHarnessSkillRoots } from './harnessAssets';
-import { createHashlineIo } from './hashline/io';
-import { applyHashlineSessionTools } from './hashline/sessionTools';
-import { InMemorySnapshotStore } from './hashline/snapshots';
-import { wrapHashlineEditDefinition } from './hashline/tools';
-import { withHashlineWrite } from './hashline/withWrite';
-import { type ContextMessage, pruneHistoricalImages } from './imageContext';
+import { type ContextMessage, sanitizeContextMessages } from './imageContext';
 import { createIsolatedSandboxTool } from './isolatedSandbox';
 import { McpManager } from './mcp';
 import { createMessageCoworkerTool } from './messageCoworker';
 import { createMessageMainTool } from './messageMain';
 import { ParentNotifier } from './notify';
+import { withOpenAIResponsesRouting } from './openaiResponsesRouting';
+import { osSandboxSpawnHook, wrapOsSandboxCommand } from './osSandbox';
 import { projectMessage } from './projection';
 import { applyWorkerProxyEnv } from './proxyEnv';
 import { withReadTruncationMeta } from './readTruncation';
 import { projectMessages, projectResumeTail } from './resumeSnapshots';
+import { RunawayGuard } from './runawayGuard';
 import {
   EVICTION_SWEEP_INTERVAL_MS,
   type EvictionCandidate,
@@ -125,6 +131,12 @@ import {
 } from './sessionEviction';
 import { branchSessionFromPersistedFile, resolveForkLeafId } from './sessionFork';
 import { createSessionCommandTool } from './sessionShell';
+import {
+  POST_TOOL_EMPTY_NUDGE,
+  SILENT_TURN_NUDGE,
+  type SilentTurnKind,
+  silentTurnKind,
+} from './silentTurn';
 import { providerKeyFor, smartCompactInlineExtension } from './smartCompact';
 import {
   createSshExecutor,
@@ -142,6 +154,8 @@ import {
   withAgentRead,
 } from './structuredYield';
 import { createSubagentTool, lastAssistantText } from './subagent';
+import { pruneCompletedSubagentDetails } from './subagentRetention';
+import { SystemReminderRegistry } from './systemReminder';
 import {
   buildInitialTitleUserText,
   buildRollingTitleUserText,
@@ -154,13 +168,15 @@ import {
   titleSummaryTimeoutMs,
 } from './titleSummary';
 import { createTodoTool } from './todo';
+import { decorateSessionTools } from './toolDecorators';
+import { ToolOutputBudget } from './toolOutputBudget';
 import { BrowserInvoker, createBrowserTools, withNavigateApproval } from './tools/browser';
 import { createEnsoAppTool, EnsoAppInvoker } from './tools/ensoApp';
 import { createEnsoCapabilitiesTool } from './tools/ensoCapabilities';
 import { createMemoryTools, MemoryInvoker } from './tools/memory';
 import { transcriptMessages } from './transcript';
 import { WorkspaceSwitchGate, workspaceBranchContextExtension } from './workspaceSwitch';
-import { withWriteScope } from './writeScope';
+import { withWritePreflight, withWriteScope } from './writeScope';
 
 /** 子会话产物：实际 session、模型与精确工具集合。 */
 interface ChildSessionResult {
@@ -171,6 +187,7 @@ interface ChildSessionResult {
   proofToolIds: string[];
   ensoApp?: EnsoAppInvoker;
   safeJournal?: EnsoSafeJournal;
+  runawayGuard?: RunawayGuard;
 }
 
 /** 会话工厂：父 runtime/resource/tool 配置的唯一 child 创建入口。 */
@@ -220,6 +237,13 @@ interface ManagedSession {
   adaptiveDowngraded: boolean;
   /** 最近一次 auto_retry_start 携带的原始错误（取消重试时的终态错误文案） */
   lastRetryError?: string;
+  /** 当前用户轮已做过一次空回复自动续跑 */
+  silentTurnNudgeUsed: boolean;
+  /** 空回复续跑已发出、尚未收到对应 agent_start/结束 */
+  silentTurnRecovering: boolean;
+  /** 本次空回复恢复的类型；post-tool 第二次仍空则失败 */
+  silentTurnKind?: SilentTurnKind;
+  runawayGuard?: RunawayGuard;
   timings: (MessageTiming | undefined)[];
   toolStartAt: Map<string, number>;
   toolDurations: Map<string, number>;
@@ -303,8 +327,8 @@ function createSessionResourceLoader(options: {
   /** 加载项目内 .claude/.codex/.cursor 的 skills 与规则文件；远程会话不适用（cwd 不在本机） */
   loadHarnessAssets?: boolean;
   exploreFold?: ReturnType<typeof createExploreFoldState>;
-  /** 仅父会话：加载 Enso compact hook 作为 compact 摘要后端 */
-  smartCompactEnabled?: boolean;
+  /** 仅父会话：互斥压缩策略。 */
+  compactStrategy?: CompactStrategy;
   smartCompactSummaryModel?: SpawnModelConfig;
   smartCompactMode?: SmartCompactMode;
 }): DefaultResourceLoader {
@@ -321,12 +345,13 @@ function createSessionResourceLoader(options: {
     // noExtensions 只挡磁盘上的项目/全局扩展；inline factory 不受影响，图片修剪对所有会话生效
     extensionFactories: [
       options.branchContext,
+      applyPatchResultExtension,
       {
         name: 'image-context',
         hidden: true,
         factory: (pi) => {
           pi.on('context', (event) => ({
-            messages: pruneHistoricalImages(
+            messages: sanitizeContextMessages(
               event.messages as unknown as ContextMessage[]
             ) as unknown as typeof event.messages,
           }));
@@ -364,14 +389,21 @@ function createSessionResourceLoader(options: {
             } satisfies InlineExtension,
           ]
         : []),
-      ...(!options.noExtensions && options.smartCompactEnabled
+      ...(!options.noExtensions && options.compactStrategy === 'continuous-memory'
         ? [
-            smartCompactInlineExtension({
-              summaryModel: options.smartCompactSummaryModel,
+            continuousMemoryInlineExtension({
+              model: options.smartCompactSummaryModel,
               mode: options.smartCompactMode,
             }),
           ]
-        : []),
+        : !options.noExtensions && options.compactStrategy === 'smart'
+          ? [
+              smartCompactInlineExtension({
+                summaryModel: options.smartCompactSummaryModel,
+                mode: options.smartCompactMode,
+              }),
+            ]
+          : []),
     ],
     agentsFilesOverride: options.remoteAgentsFiles
       ? () => ({
@@ -400,7 +432,7 @@ function createEnsoResourceLoader(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [branchContext],
+    extensionFactories: [branchContext, applyPatchResultExtension],
     systemPrompt: ENSO_SYSTEM_PROMPT,
     skillsOverride: () => ({ skills: [], diagnostics: [] }),
     promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -475,12 +507,14 @@ async function refreshWorkerProviderModels(
 export async function initializeWorkerRuntime(runtime: ModelRuntime): Promise<ModelRuntime> {
   // 推理发生在本进程：Main 侧注册过不算，worker 不注册就会以「未知 provider」流不起来
   runtime.registerProvider(ANTIGRAVITY_PROVIDER_ID, antigravityProviderConfig());
+  runtime.registerProvider(DEVIN_PROVIDER_ID, devinProviderConfig());
   await loadCursorProvider(runtime);
   // registerProvider 只触发 allowNetwork:false 的 refresh，拿到的是兜底清单；Main 侧界面
   // 展示的却是联网发现结果。必须拆成两次并各自吞错，避免一个 provider 的发现服务异常
   // 连带另一个拿不到清单；失败方只回退自己的兜底，worker 仍能启动。
   // await 而非 fire-and-forget：resolveBaseModel 紧接着就要用这份清单。
   await refreshWorkerProviderModels(runtime, ANTIGRAVITY_PROVIDER_ID);
+  await refreshWorkerProviderModels(runtime, DEVIN_PROVIDER_ID);
   await refreshWorkerProviderModels(runtime, CURSOR_PROVIDER_ID);
   return runtime;
 }
@@ -503,6 +537,8 @@ export class SessionSupervisor {
   private readonly notifier = new ParentNotifier((sessionId, text) => {
     this.deliverNotification(sessionId, text);
   });
+  private readonly completeTextAborts = new Map<string, AbortController>();
+  private readonly completeTextPendingAborts = new Set<string>();
 
   private branchContextExtension(getSession: () => ManagedSession | undefined): InlineExtension {
     return workspaceBranchContextExtension(getSession, (requestId) => {
@@ -645,6 +681,7 @@ export class SessionSupervisor {
       child.subagentAborts.clear();
       child.gate.cancelAll();
       child.asks.cancelAll();
+      cancelContinuousMemory(child.session.sessionManager);
       child.ensoApp?.cancelAll('Parent released');
       try {
         await child.session.abort();
@@ -661,6 +698,7 @@ export class SessionSupervisor {
     managed.subagentAborts.clear();
     managed.gate.cancelAll();
     managed.asks.cancelAll();
+    cancelContinuousMemory(managed.session.sessionManager);
     managed.ensoApp?.cancelAll('Session released');
     managed.browser?.cancelAll('Session released');
     managed.memory?.cancelAll('Session released');
@@ -775,6 +813,12 @@ export class SessionSupervisor {
       );
       return;
     }
+    if (command.type === 'abort-complete-text') {
+      const active = this.completeTextAborts.get(command.requestId);
+      if (active) active.abort();
+      else this.completeTextPendingAborts.add(command.requestId);
+      return;
+    }
     if (command.type === 'set-proxy-env') {
       applyWorkerProxyEnv(command.env);
       return;
@@ -882,12 +926,13 @@ export class SessionSupervisor {
           command.loadHarnessAssets,
           command.windowsLocalShell,
           command.exploreFoldEnabled,
-          command.bashInterceptEnabled,
           command.hashlineEditEnabled,
-          command.smartCompactEnabled,
+          resolveCompactStrategy(command.compactStrategy, command.smartCompactEnabled),
           command.smartCompactSummaryModel,
           command.smartCompactMode,
-          command.memoryLanguage
+          command.memoryLanguage,
+          command.editMode,
+          command.rolePrompt
         );
         return;
       case 'spawn-child':
@@ -1200,7 +1245,7 @@ export class SessionSupervisor {
           .getBranch()
           .filter((entry) => entry.type === 'message' && entry.message.role === 'user');
         const target = userEntries[userEntries.length - 1 - command.userIndexFromEnd];
-        if (!target) {
+        if (target?.type !== 'message' || target.message.role !== 'user') {
           this.options.emit({
             type: 'rewind-done',
             identity: managed.identity,
@@ -1226,12 +1271,20 @@ export class SessionSupervisor {
           }
         }
         const result = await managed.session.navigateTree(target.id);
+        const editorImages = Array.isArray(target.message.content)
+          ? target.message.content.flatMap((part) =>
+              part.type === 'image' && part.data && part.mimeType
+                ? [{ data: part.data, mimeType: part.mimeType }]
+                : []
+            )
+          : [];
         this.reconcileMessages(managed, this.transcript(managed));
         this.options.emit({
           type: 'rewind-done',
           identity: managed.identity,
           seq: ++managed.seq,
           ...(!result.cancelled && result.editorText ? { editorText: result.editorText } : {}),
+          ...(!result.cancelled && editorImages.length > 0 ? { editorImages } : {}),
           ...(filesRestored ? { filesRestored } : {}),
         });
         return;
@@ -1240,6 +1293,7 @@ export class SessionSupervisor {
         const managed = this.must(command.identity);
         managed.gate.cancelAll();
         managed.asks.cancelAll();
+        cancelContinuousMemory(managed.session.sessionManager);
         managed.ensoApp?.cancelAll('Enso capability invocation aborted');
         managed.browser?.cancelAll('Browser action aborted');
         managed.memory?.cancelAll('Memory action aborted');
@@ -1278,14 +1332,16 @@ export class SessionSupervisor {
     loadHarnessAssets = false,
     windowsLocalShell?: WindowsLocalShell,
     exploreFoldEnabled = false,
-    bashInterceptEnabled = false,
     hashlineEditEnabled = false,
-    smartCompactEnabled = false,
+    compactStrategy: CompactStrategy = 'standard',
     smartCompactSummaryModel?: SpawnModelConfig,
     smartCompactMode?: SmartCompactMode,
-    memoryLanguage?: string
+    memoryLanguage?: string,
+    requestedEditMode?: EditMode,
+    rolePrompt?: string
   ): Promise<void> {
     const sessionId = identity.sessionId;
+    const sessionEditMode = resolveEditMode(requestedEditMode, hashlineEditEnabled);
     const toolEnabled = (id: string) => !disabledTools.includes(id);
     const existing = this.sessions.get(sessionId);
     if (existing) {
@@ -1343,9 +1399,9 @@ export class SessionSupervisor {
       ...(remote ? { remoteSsh: { host: remote.host } } : {}),
       loadHarnessAssets,
       exploreFold,
-      ...(smartCompactEnabled
+      ...(compactStrategy !== 'standard'
         ? {
-            smartCompactEnabled: true,
+            compactStrategy,
             smartCompactSummaryModel,
             smartCompactMode,
           }
@@ -1402,43 +1458,39 @@ export class SessionSupervisor {
     );
     // 工具注入：noTools:'builtin' 下 read 也需重注册（免审）；bash 叠 background 能力
     // 后包审批门（审批先问，批准后分流后台），edit 叠宽容版，MCP 同门，todo/task_* 免审。
-    // 最外层统一包 withTaskReminders：后台任务完成提醒搭任意工具结果送达模型
+    // 最外层 decorateSessionTools：引用 / 输出外置 / runaway / system reminder
     type Def = Parameters<typeof withApproval>[2];
     const takePendingReminders = () => managedRef?.pendingTaskReminders.splice(0) ?? [];
+    const reminders = new SystemReminderRegistry();
+    reminders.register('background-task', () => {
+      const pending = takePendingReminders();
+      return pending.map((text) => `<background-task-update>\n${text}\n</background-task-update>`);
+    });
+    const runaway = new RunawayGuard();
+    const budget = new ToolOutputBudget({
+      rootDir: path.join(this.options.sessionDir, 'tool-output', sessionId),
+    });
     // 只读探索四件套(read/grep/find/ls,免审):readonly 子代理的全部工具,也是 base 的底座。
     // 远程会话经 operations 注入落到 ssh(grep 无注入点,换整个定义)
     const structuredById = new Map<string, unknown>();
-    const hashlineStore = new InMemorySnapshotStore();
-    const hashlineIo = createHashlineIo({
-      cwd,
-      remote: remoteOps
-        ? { readFile: remoteOps.read.readFile, writeFile: remoteOps.edit.writeFile }
-        : undefined,
-    });
     const wrapRead = (definition: Def): Def =>
       withReadTruncationMeta(withAgentRead(definition, () => structuredById));
-    const applyHashline = <T extends Def>(tools: { read: T; grep: T; edit?: T }) =>
-      applyHashlineSessionTools({
-        enabled: hashlineEditEnabled,
-        store: hashlineStore,
-        io: hashlineIo,
-        wrapOuterRead: wrapRead,
-        ...tools,
-      });
     const readOnlyTools = (): Def[] => {
       const stock =
         remoteOps && sshExecutor
           ? {
-              read: createReadToolDefinition(cwd, {
-                operations: remoteOps.read,
-              }) as unknown as Def,
+              read: wrapRead(
+                createReadToolDefinition(cwd, {
+                  operations: remoteOps.read,
+                }) as unknown as Def
+              ),
               grep: createRemoteGrepToolDefinition(cwd, sshExecutor) as unknown as Def,
             }
           : {
-              read: createReadToolDefinition(cwd) as unknown as Def,
+              read: wrapRead(createReadToolDefinition(cwd) as unknown as Def),
               grep: createGrepToolDefinition(cwd) as unknown as Def,
             };
-      const { read, grep } = applyHashline(stock);
+      const { read, grep } = stock;
       return remoteOps && sshExecutor
         ? [
             read,
@@ -1478,17 +1530,31 @@ export class SessionSupervisor {
           return { command: sshCommand, cwd: process.cwd() };
         }
       : undefined;
-    const maybeInterceptBash = (definition: Def): Def =>
-      bashInterceptEnabled ? withBashInterception(definition) : definition;
+    const commandTransform = remoteOps
+      ? backgroundTransform
+      : (command: string, commandCwd: string) => ({
+          command: wrapOsSandboxCommand(command, commandCwd),
+          cwd: commandCwd,
+        });
     const buildBaseTools = (
       toolGate: ApprovalGate,
       cp?: CheckpointManager,
       writeScope?: readonly string[]
     ): Def[] => {
       const guarded = (definition: Def): Def => (cp ? withCheckpoint(definition, cp) : definition);
-      // 写范围在审批之外:越界直接拒绝,不占用审批也不落盘
-      const scoped = (kind: 'file-edit' | 'file-write', definition: Def): Def =>
-        withWriteScope(withApproval(toolGate, kind, guarded(definition)), cwd, writeScope);
+      // scope 与完整只读预检都在审批之外；checkpoint 仅在批准后触发。
+      const scoped = (
+        kind: 'file-edit' | 'file-write',
+        definition: Def,
+        preflight?: (params: unknown, signal: AbortSignal | undefined) => Promise<unknown>
+      ): Def => {
+        const approved = withApproval(toolGate, kind, guarded(definition));
+        return withWriteScope(
+          preflight ? withWritePreflight(approved, preflight) : approved,
+          cwd,
+          writeScope
+        );
+      };
       const stockEdit = createNormalizedEditTool(
         cwd,
         remoteOps ? { operations: remoteOps.edit } : undefined
@@ -1497,6 +1563,21 @@ export class SessionSupervisor {
         cwd,
         remoteOps ? { operations: remoteOps.write } : undefined
       ) as unknown as Def;
+      const patchIo = sshExecutor ? createRemoteApplyPatchIo(cwd, sshExecutor) : undefined;
+      const mutations =
+        sessionEditMode === 'apply_patch'
+          ? [
+              scoped(
+                'file-edit',
+                createApplyPatchTool({
+                  cwd,
+                  ...(patchIo ? { io: patchIo } : {}),
+                }) as unknown as Def,
+                (params: unknown, signal: AbortSignal | undefined) =>
+                  validateApplyPatchTargets(cwd, params, patchIo, signal)
+              ),
+            ]
+          : [scoped('file-edit', stockEdit), scoped('file-write', stockWrite)];
       return [
         ...readOnlyTools(),
         withApproval(
@@ -1504,35 +1585,21 @@ export class SessionSupervisor {
           'command',
           guarded(
             withBackground(
-              maybeInterceptBash(
-                createSessionCommandTool({
-                  cwd,
-                  remote: Boolean(remoteOps),
-                  preference: windowsLocalShell,
-                  operations: remoteOps?.bash,
-                }) as unknown as Def
-              ),
+              createSessionCommandTool({
+                cwd,
+                remote: Boolean(remoteOps),
+                preference: windowsLocalShell,
+                operations: remoteOps?.bash,
+                ...(remoteOps ? {} : { spawnHook: osSandboxSpawnHook(cwd) }),
+              }) as unknown as Def,
               this.bgTasks,
               sessionId,
               cwd,
-              backgroundTransform
+              commandTransform
             )
           )
         ),
-        scoped(
-          'file-edit',
-          hashlineEditEnabled
-            ? wrapHashlineEditDefinition(stockEdit, {
-                store: hashlineStore,
-                readText: hashlineIo.readText,
-                writeText: hashlineIo.writeText,
-              })
-            : stockEdit
-        ),
-        scoped(
-          'file-write',
-          hashlineEditEnabled ? withHashlineWrite(stockWrite, hashlineStore) : stockWrite
-        ),
+        ...mutations,
       ];
     };
     const wrapMcpTools = (toolGate: ApprovalGate): Def[] =>
@@ -1634,7 +1701,16 @@ export class SessionSupervisor {
               ...(childExploreFold ? createExploreFoldTools(childExploreFold) : []),
             ];
         childSandboxCatalog.current = childTools;
-        const subTools = isLockedEnso
+        const childRunaway = new RunawayGuard();
+        const childReminders = new SystemReminderRegistry();
+        const childBudget = new ToolOutputBudget({
+          rootDir: path.join(
+            this.options.sessionDir,
+            'tool-output',
+            childIdentity?.sessionId ?? `${sessionId}-child`
+          ),
+        });
+        const rawSubTools = isLockedEnso
           ? childTools
           : [
               ...childTools,
@@ -1647,6 +1723,13 @@ export class SessionSupervisor {
                   ]
                 : []),
             ];
+        const subTools = isLockedEnso
+          ? rawSubTools
+          : decorateSessionTools(rawSubTools, {
+              reminders: childReminders,
+              runaway: childRunaway,
+              budget: childBudget,
+            });
         const selectedSkillPaths = resolved?.skillPaths ?? agentType?.skillPaths ?? [];
         const branchContext = this.branchContextExtension(() =>
           [...this.sessions.values()].find((managed) => managed.session === session)
@@ -1710,6 +1793,7 @@ export class SessionSupervisor {
             .filter((tool) => !typeMcpTools.includes(tool))
             .map((tool) => tool.name),
           ...(ensoApp ? { ensoApp } : {}),
+          ...(isLockedEnso ? {} : { runawayGuard: childRunaway }),
         };
       },
     };
@@ -1737,12 +1821,23 @@ export class SessionSupervisor {
         const managed = managedRef ?? this.sessions.get(sessionId);
         if (!managed) return;
         managed.subagents.set(agent.id, agent);
-        this.options.emit({
-          type: 'subagent-update',
-          identity: managed.identity,
-          seq: ++managed.seq,
-          agent,
-        });
+        const changed = new Set<string>();
+        if (agent.status !== 'running') {
+          const retained = pruneCompletedSubagentDetails([...managed.subagents.values()]);
+          for (const item of retained.agents) managed.subagents.set(item.id, item);
+          for (const id of retained.prunedIds) changed.add(id);
+        }
+        changed.add(agent.id);
+        for (const id of changed) {
+          const current = managed.subagents.get(id);
+          if (!current) continue;
+          this.options.emit({
+            type: 'subagent-update',
+            identity: managed.identity,
+            seq: ++managed.seq,
+            agent: current,
+          });
+        }
       },
       registerAbort: (id, abort) => {
         const managed = managedRef ?? this.sessions.get(sessionId);
@@ -1868,12 +1963,20 @@ export class SessionSupervisor {
         : []),
     ];
     catalogRef.current = sessionTools;
-    const customTools = [
-      ...sessionTools,
-      ...(toolEnabled('isolated_sandbox')
-        ? [createIsolatedSandboxTool({ getTools: () => catalogRef.current, store: sandboxStore })]
-        : []),
-    ].map((tool) => withTaskReminders(tool, takePendingReminders));
+    const customTools = decorateSessionTools(
+      [
+        ...sessionTools,
+        ...(toolEnabled('isolated_sandbox')
+          ? [
+              createIsolatedSandboxTool({
+                getTools: () => catalogRef.current,
+                store: sandboxStore,
+              }),
+            ]
+          : []),
+      ],
+      { reminders, runaway, budget }
+    );
 
     const { session } = await createAgentSession({
       cwd,
@@ -1901,7 +2004,9 @@ export class SessionSupervisor {
       factory,
       toolIds: customTools.map((tool) => tool.name),
       checkpoints,
+      runawayGuard: runaway,
     });
+    if (rolePrompt && !resumeFile) managedRef.pendingRole = rolePrompt;
     managedRef.browser = browser;
     managedRef.memory = memory;
     this.options.emit({
@@ -1959,6 +2064,7 @@ export class SessionSupervisor {
       toolIds?: string[];
       proofToolIds?: string[];
       safeJournal?: EnsoSafeJournal;
+      runawayGuard?: RunawayGuard;
     } = {}
   ): ManagedSession {
     const customEntries = session.sessionManager.getBranch().flatMap((entry) => {
@@ -1984,6 +2090,9 @@ export class SessionSupervisor {
       ...(opts.ensoApp ? { ensoApp: opts.ensoApp } : {}),
       ...(opts.safeJournal ? { safeJournal: opts.safeJournal } : {}),
       adaptiveDowngraded: false,
+      silentTurnNudgeUsed: false,
+      silentTurnRecovering: false,
+      ...(opts.runawayGuard ? { runawayGuard: opts.runawayGuard } : {}),
       timings: [],
       toolStartAt: new Map(),
       toolDurations: new Map(),
@@ -2187,6 +2296,7 @@ export class SessionSupervisor {
       toolIds: result.toolIds,
       proofToolIds: result.proofToolIds,
       safeJournal: result.safeJournal,
+      ...(result.runawayGuard ? { runawayGuard: result.runawayGuard } : {}),
     });
     if (!resumeFile) managedRef.pendingRole = config.systemPrompt;
     this.options.emit({
@@ -2261,7 +2371,7 @@ export class SessionSupervisor {
       }
     );
     const askManager = this.createAskManager(identity);
-    const { session, modelId, toolIds } = await factory.createChildSession({
+    const { session, modelId, toolIds, runawayGuard } = await factory.createChildSession({
       agentType,
       modelOverride,
       thinkingOverride: thinking,
@@ -2299,6 +2409,7 @@ export class SessionSupervisor {
       asks: askManager,
       toolIds,
       ...(resumeFile ? { resumeFile } : {}),
+      ...(runawayGuard ? { runawayGuard } : {}),
     });
     // 角色提示在首条消息前缀注入(无论来自主 agent send 还是用户 tab);resume 时 jsonl 已有
     if (!resumeFile && agentType?.systemPrompt) {
@@ -2315,6 +2426,7 @@ export class SessionSupervisor {
     if (managed) {
       managed.gate.cancelAll();
       managed.asks.cancelAll();
+      cancelContinuousMemory(managed.session.sessionManager);
       managed.ensoApp?.cancelAll('Child dismissed');
       try {
         await managed.session.abort();
@@ -2562,6 +2674,9 @@ export class SessionSupervisor {
     managed.lastActivityAt = Date.now();
     switch (event.type) {
       case 'agent_start':
+        if (!managed.silentTurnRecovering) managed.silentTurnNudgeUsed = false;
+        if (!managed.silentTurnRecovering) managed.silentTurnKind = undefined;
+        managed.runawayGuard?.resetTurn();
         managed.currentTurnId ??= randomUUID();
         managed.status = 'running';
         managed.checkpoints?.resetTurn();
@@ -2739,6 +2854,7 @@ export class SessionSupervisor {
           this.failTurn(managed, lastAssistant.errorMessage ?? 'Turn failed.');
           return;
         }
+        if (this.trySilentTurnRecovery(managed)) return;
         const turnId = managed.currentTurnId ?? randomUUID();
         managed.currentTurnId = undefined;
         managed.status = 'idle';
@@ -2788,6 +2904,55 @@ export class SessionSupervisor {
       }
     }
     return decorated;
+  }
+
+  private trySilentTurnRecovery(managed: ManagedSession): boolean {
+    const kind = silentTurnKind(managed.messages);
+    if (!kind) return false;
+    if (managed.silentTurnNudgeUsed) {
+      if (kind === 'post-tool') {
+        this.failTurn(managed, 'The tools completed, but the assistant reply was empty.');
+        return true;
+      }
+      return false;
+    }
+    const agent = managed.session.agent;
+    if (!agent) return false;
+    const transcript = agent.state.messages;
+    if (transcript.at(-1)?.role !== 'assistant') return false;
+    agent.state.messages = transcript.slice(0, -1);
+    const tail = agent.state.messages.at(-1)?.role;
+    if (tail !== 'user' && tail !== 'toolResult') {
+      agent.state.messages = transcript;
+      return false;
+    }
+    this.reconcileMessages(managed, this.transcript(managed));
+    managed.silentTurnNudgeUsed = true;
+    managed.silentTurnRecovering = true;
+    managed.silentTurnKind = kind;
+    ensureAssistantUsage(agent.state.messages as unknown[]);
+    const promptBefore = agent.state.systemPrompt;
+    const nudge = kind === 'post-tool' ? POST_TOOL_EMPTY_NUDGE : SILENT_TURN_NUDGE;
+    const promptWithNudge = `${promptBefore}\n\n${nudge}`;
+    agent.state.systemPrompt = promptWithNudge;
+    const restore = () => {
+      managed.silentTurnRecovering = false;
+      if (agent.state.systemPrompt === promptWithNudge) {
+        agent.state.systemPrompt = promptBefore;
+      }
+    };
+    try {
+      void agent
+        .continue()
+        .catch((error) => {
+          this.failTurn(managed, toErrorMessage(error));
+        })
+        .finally(restore);
+    } catch (error) {
+      restore();
+      this.failTurn(managed, toErrorMessage(error));
+    }
+    return true;
   }
 
   private tryAdaptiveDowngrade(managed: ManagedSession): boolean {
@@ -3227,6 +3392,7 @@ export class SessionSupervisor {
     this.workspaceSwitch.clear();
     this.bgTasks.stopAll();
     for (const managed of this.sessions.values()) {
+      cancelContinuousMemory(managed.session.sessionManager);
       managed.ensoApp?.cancelAll('Enso worker shutdown');
       managed.browser?.cancelAll('Enso worker shutdown');
       managed.memory?.cancelAll('Enso worker shutdown');
@@ -3322,52 +3488,131 @@ export class SessionSupervisor {
   }
 
   /**
-   * 通用一次性文本补全（记忆蒸馏）：与 summarizeTitle 同样的候选链，但不对输出做形状判定，
+   * 通用一次性文本补全（记忆蒸馏 / btw）：与 summarizeTitle 同样的候选链，但不对输出做形状判定，
    * 原文回 Main 由调用方容错解析。每个候选共用同一上限超时。
+   * stream 时走 streamSimple 并推 text-delta；记忆蒸馏不设 stream，行为不变。
    */
   private async completeText(
     command: Extract<AgentCommand, { type: 'complete-text' }>
   ): Promise<void> {
-    const runtime = await this.getRuntime();
-    const context = {
-      systemPrompt: command.systemPrompt,
-      messages: [{ role: 'user' as const, content: command.userText, timestamp: Date.now() }],
-    };
-    let lastError = 'no candidates';
-    for (const candidate of command.candidates) {
-      const label = describeTitleModel(candidate);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), command.timeoutMs);
-      try {
-        const model = await resolveBaseModelOrRefresh(runtime, candidate);
-        const message = await runtime.completeSimple(model, context, {
-          signal: controller.signal,
-          ...(command.maxTokens !== undefined ? { maxTokens: command.maxTokens } : {}),
-        });
-        if (message.stopReason === 'aborted') {
-          lastError = `${label}: timed out after ${Math.round(command.timeoutMs / 1000)}s`;
-          continue;
-        }
-        if (message.stopReason === 'error') {
-          lastError = `${label}: ${message.errorMessage?.trim() || 'model error'}`;
-          continue;
-        }
-        const text = message.content
-          .map((part) => (part.type === 'text' ? part.text : ''))
-          .join('');
-        if (!text.trim()) {
-          lastError = `${label}: empty completion`;
-          continue;
-        }
-        this.options.emit({ type: 'text-completed', requestId: command.requestId, text });
-        return;
-      } catch (error) {
-        lastError = `${label}: ${toErrorMessage(error)}`;
-      } finally {
-        clearTimeout(timer);
-      }
+    if (this.completeTextPendingAborts.delete(command.requestId)) {
+      this.options.emit({ type: 'text-failed', requestId: command.requestId, error: 'aborted' });
+      return;
     }
-    this.options.emit({ type: 'text-failed', requestId: command.requestId, error: lastError });
+    const userAbort = new AbortController();
+    this.completeTextAborts.set(command.requestId, userAbort);
+    try {
+      const runtime = await this.getRuntime();
+      const context = {
+        systemPrompt: command.systemPrompt,
+        messages: [{ role: 'user' as const, content: command.userText, timestamp: Date.now() }],
+      };
+      let lastError = 'no candidates';
+      let streamed = false;
+      for (const candidate of command.candidates) {
+        if (userAbort.signal.aborted) break;
+        if (command.stream && streamed) {
+          this.options.emit({ type: 'text-delta', requestId: command.requestId, text: '' });
+          streamed = false;
+        }
+        const label = describeTitleModel(candidate);
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        userAbort.signal.addEventListener('abort', onAbort);
+        const timer = setTimeout(() => controller.abort(), command.timeoutMs);
+        try {
+          const model = await resolveBaseModelOrRefresh(runtime, candidate);
+          const options = {
+            signal: controller.signal,
+            ...(command.maxTokens !== undefined ? { maxTokens: command.maxTokens } : {}),
+            ...(command.reasoning && command.reasoning !== 'off'
+              ? { reasoning: command.reasoning }
+              : {}),
+          };
+          const message = command.stream
+            ? await this.readSimpleStream(
+                runtime,
+                model,
+                context,
+                options,
+                command.requestId,
+                () => {
+                  streamed = true;
+                }
+              )
+            : await runtime.completeSimple(model, context, options);
+          if (message.stopReason === 'aborted') {
+            if (userAbort.signal.aborted) break;
+            lastError = `${label}: timed out after ${Math.round(command.timeoutMs / 1000)}s`;
+            continue;
+          }
+          if (message.stopReason === 'error') {
+            lastError = `${label}: ${message.errorMessage?.trim() || 'model error'}`;
+            continue;
+          }
+          const text = message.content
+            .map((part) => (part.type === 'text' ? part.text : ''))
+            .join('');
+          if (!text.trim()) {
+            lastError = `${label}: empty completion`;
+            continue;
+          }
+          this.options.emit({ type: 'text-completed', requestId: command.requestId, text });
+          return;
+        } catch (error) {
+          lastError = `${label}: ${toErrorMessage(error)}`;
+        } finally {
+          userAbort.signal.removeEventListener('abort', onAbort);
+          clearTimeout(timer);
+        }
+      }
+      if (userAbort.signal.aborted) {
+        this.options.emit({ type: 'text-failed', requestId: command.requestId, error: 'aborted' });
+        return;
+      }
+      this.options.emit({ type: 'text-failed', requestId: command.requestId, error: lastError });
+    } finally {
+      this.completeTextAborts.delete(command.requestId);
+      this.completeTextPendingAborts.delete(command.requestId);
+    }
+  }
+
+  private async readSimpleStream(
+    runtime: ModelRuntime,
+    model: Awaited<ReturnType<typeof resolveBaseModelOrRefresh>>,
+    context: {
+      systemPrompt: string;
+      messages: Array<{ role: 'user'; content: string; timestamp: number }>;
+    },
+    options: { signal: AbortSignal; maxTokens?: number; reasoning?: ThinkingLevel },
+    requestId: string,
+    markStreamed: () => void
+  ) {
+    const stream = runtime.streamSimple(model, context, options);
+    for await (const event of stream) {
+      if (options.signal.aborted) break;
+      if (!event || typeof event !== 'object') continue;
+      const type = (event as { type?: unknown }).type;
+      if (
+        type !== 'text_delta' &&
+        type !== 'thinking_delta' &&
+        type !== 'text_start' &&
+        type !== 'thinking_start' &&
+        type !== 'text_end' &&
+        type !== 'thinking_end'
+      ) {
+        continue;
+      }
+      const live = liveCompletionText((event as { partial?: unknown }).partial);
+      markStreamed();
+      this.options.emit({
+        type: 'text-delta',
+        requestId,
+        text: live.text,
+        ...(live.thinking ? { thinking: live.thinking } : {}),
+      });
+    }
+    return stream.result();
   }
 
   /**
@@ -3457,9 +3702,9 @@ export function waitIdleBounded(
 }
 /** 异步通知里的摘要上限;全文经 coworker report 取 */
 const NOTIFY_SUMMARY_LIMIT = 1500;
-/** 一轮结束回父的摘要尾句：阻塞/非阻塞两条路径共用，把「继续 send」写成默认动作 */
+/** 一轮结束回父的摘要尾句：阻塞/非阻塞两条路径共用，按验收结果决定是否继续 */
 const COWORKER_FOLLOW_UP_HINT =
-  '(follow up with coworker send to verify or steer; dismiss only when its goal is met)';
+  '(assess the report against the goal; send only for a concrete gap or needed follow-up; if the goal is met, dismiss the coworker and finish)';
 
 /** gate 验收:在会话 cwd 跑命令,退出码即结论(比再叫一个模型评审便宜且诚实)。
  * 远程会话传 executor,命令改在远端 cwd 执行 */
@@ -3506,6 +3751,23 @@ const slugify = (value: string): string =>
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+function liveCompletionText(partial: unknown): { text: string; thinking: string } {
+  if (!partial || typeof partial !== 'object') return { text: '', thinking: '' };
+  const content = (partial as { content?: unknown }).content;
+  if (!Array.isArray(content)) return { text: '', thinking: '' };
+  let text = '';
+  let thinking = '';
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    const type = (part as { type?: unknown }).type;
+    const value = (part as { text?: unknown }).text;
+    const piece = typeof value === 'string' ? value : '';
+    if (type === 'text') text += piece;
+    else if (type === 'thinking') thinking += piece;
+  }
+  return { text, thinking };
+}
+
 /**
  * worker 的 ModelRuntime 按进程常驻，订阅清单只在首次建 runtime 时联网拉一次。之后用户
  * 才登录 / 后端上新（如 `gemini-3.8-flash-tiered` 这种不在兜底表里的 wire id），Main 侧
@@ -3541,12 +3803,19 @@ export function resolveBaseModel(runtime: ModelRuntime, model: SpawnModelConfig)
     return oauthModel;
   }
   const providerId = providerKeyFor(model);
-  const catalog = findCatalogModelById(runtime.getModels(), model.modelId);
+  const models = runtime.getModels();
+  const catalog = findCatalogModelById(models, model.modelId);
   const resolved = resolveCustomModelCapabilities(catalog, model);
   const contextWindow = resolved.contextWindow ?? 128_000;
   const maxTokens = resolved.maxTokens ?? 32_000;
+  const piBaseUrl = resolvePiProviderBaseUrl(model.api, model.baseUrl);
+  const compat = resolveCustomModelCompat(
+    model.api,
+    piBaseUrl,
+    selectCatalogEntryForCompat(models, model.api, piBaseUrl, model.modelId)
+  );
   runtime.registerProvider(providerId, {
-    baseUrl: resolvePiProviderBaseUrl(model.api, model.baseUrl),
+    baseUrl: piBaseUrl,
     api: model.api,
     apiKey: model.apiKey,
     // 统一伪装为 enso-code 客户端（覆盖 pi 默认的 "pi (darwin ...)"）
@@ -3563,9 +3832,16 @@ export function resolveBaseModel(runtime: ModelRuntime, model: SpawnModelConfig)
         contextWindow,
         // 太小会把 high/max 的思考预算压扁（预算被限制在 maxTokens-1024 内）
         maxTokens,
+        ...(compat ? { compat } : {}),
       },
     ],
   });
+  if (model.api === 'openai-responses') {
+    const provider = runtime.getProvider(providerId);
+    if (!provider) throw new Error(`provider not found after register: ${providerId}`);
+    // 保留鉴权与 raw/simple 两条流；注册为 native provider 后 runtime.refresh 仍保留适配。
+    runtime.registerNativeProvider(withOpenAIResponsesRouting(provider));
+  }
   const registered = runtime.getModel(providerId, model.modelId);
   if (!registered) throw new Error(`model not found after register: ${model.modelId}`);
   return registered;

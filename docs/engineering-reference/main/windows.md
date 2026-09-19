@@ -52,6 +52,25 @@ Browser guest/devtools 是独立原生 `WebContentsView`，提到 workbench 上�
 `#root` 的圆角裁切和 CSS z-index 约束。普通窗口下，renderer 上报 viewport 的
 `browser-native-stack` 必须给右描边留 2px（1px 窗口裁边 + 1px 描边）、给底部圆角留 8px；flush 状态取消预留。
 
+## Windows 最小化
+
+透明主窗口 + pinned `WebContentsView` 在 Windows 上最小化一段时间后，任务栏可能点不回来。
+主窗口 `html` / `body` 全透明，UI 全靠 workbench 画，所以 occlusion、0×0 bounds、
+renderer 被杀、GPU 丢表面的观感都一样，**未在真机二分，不要把其中一条写成已证实根因**。
+
+已做的防御（`win32Restore.ts` / `rendererGone.ts`）：
+
+- win32 启动时把 `CalculateNativeWinOcclusion` 合并进 `disable-features`（未证实是否仍有效）。
+- 最小化 / 空矩形不写 workbench bounds；`restore` / `show` / `maximize` / `unmaximize` /
+  `display-metrics-changed` 立即同步，并 `setImmediate` 再同步一次。
+- `browserHost.ensureWorkbenchOnTop` 走同一套 bounds。
+- `restore` 只在「刚从 minimize 回来」时尝试 `show()`，避免和 unmaximize 的 `restore` 搅在一起。
+- `render-process-gone` 除 `clean-exit` 外都 reload（含 Windows 后台 `killed`），60s 内最多 3 次。
+- `child-process-gone` 打日志，便于下次对照 GPU / utility 是否先死。
+- 第二实例唤起要 `restore` + `show` + `focus`，不能只 `focus`。
+- 不要给 pinned workbench 关 `backgroundThrottling`：挡不住合成器停帧，还会让最小化期间
+  layout 更勤，更容易把 bounds 写坏。
+
 ## macOS 红绿灯
 
 三条来自实际排查的约束：
@@ -96,6 +115,8 @@ Tailwind 的 `h-11` 会算成 38.5px 而不是 44px，与 `trafficLightPosition:
 - `contentView` 的子视图**全部画在 renderer 之上**，index 0 也不例外；无头只能 `setVisible(false)`。
 - 隐藏后 view 尺寸归零，页面布局 0×0（快照只剩 inline 元素、截图空）。用 CDP
   `Emulation.setDeviceMetricsOverride` 撑出 viewport，可见时 `clearDeviceMetricsOverride`。
+- 隐藏 tab 另外开 `Emulation.setFocusEmulationEnabled`，否则后台页 rAF / 动画仍会被掐
+  （`backgroundThrottling: false` 不够）。亮着的 tab 关掉 focus emulation。
 - 被遮挡 / 隐藏的 view `capturePage` 报 `UnknownVizError`；截图走 CDP
   `Page.captureScreenshot` + `captureBeyondViewport`。
 - **首次 `dom-ready` 之前 `debugger.attach` 会让 Main 段错误**（SIGSEGV）。`Tab.ready`

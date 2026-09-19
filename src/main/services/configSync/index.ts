@@ -21,6 +21,7 @@ import type {
   ConfigSyncPreviewResult,
   ConfigSyncSummary,
 } from '@shared/types';
+import { resolveEditMode } from '@shared/types';
 import { app } from 'electron';
 import {
   commitSettingsTransaction,
@@ -64,8 +65,9 @@ export const CONFIG_SYNC_FIELD_POLICY = {
   loadHarnessAssets: { mode: 'portable' },
   windowsLocalShell: { mode: 'excluded', reason: 'platform-specific shell selection' },
   exploreFoldEnabled: { mode: 'portable' },
-  bashInterceptEnabled: { mode: 'portable' },
-  hashlineEditEnabled: { mode: 'portable' },
+  editMode: { mode: 'portable' },
+  hashlineEditEnabled: { mode: 'excluded', reason: 'legacy read-only edit mode migration' },
+  compactStrategy: { mode: 'portable' },
   smartCompactEnabled: { mode: 'portable' },
   smartCompactModel: { mode: 'portable' },
   smartCompactMode: { mode: 'portable' },
@@ -82,6 +84,7 @@ export const CONFIG_SYNC_FIELD_POLICY = {
   memoryDistillEnabled: { mode: 'portable' },
   memoryKgEnabled: { mode: 'portable' },
   autoUpdate: { mode: 'excluded', reason: 'device update policy' },
+  autoRestartWhenIdle: { mode: 'excluded', reason: 'device update policy' },
   proxyMode: { mode: 'excluded', reason: 'device network configuration' },
   customProxyUrl: { mode: 'excluded', reason: 'device network configuration may contain secrets' },
   openChangesOnFileEdit: { mode: 'portable' },
@@ -120,6 +123,7 @@ export const CONFIG_SYNC_FIELD_POLICY = {
   backgroundRefreshNonce: { mode: 'excluded', reason: 'device appearance preference' },
   providers: { mode: 'portable' },
   defaultModel: { mode: 'portable' },
+  defaultModelFollowLast: { mode: 'portable' },
   titleSummaryEnabled: { mode: 'portable' },
   titleSummaryModel: { mode: 'portable' },
   memoryDistillModel: { mode: 'portable' },
@@ -180,6 +184,11 @@ function portableState(state: Record<string, unknown>): Record<string, unknown> 
   for (const field of SYNC_FIELDS) {
     if (field in state) result[field] = structuredClone(state[field]);
   }
+  if ('editMode' in state || 'hashlineEditEnabled' in state) {
+    result.editMode = resolveEditMode(state.editMode, state.hashlineEditEnabled);
+    delete result.hashlineEditEnabled;
+  }
+  delete result.bashInterceptEnabled;
   for (const field of [
     'providers',
     'skills',

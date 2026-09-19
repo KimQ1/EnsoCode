@@ -1,9 +1,16 @@
+import { pairProjectListLabel, toPairProjectEntry } from '@enso/pair';
 import { describe, expect, it } from 'vitest';
 import {
   catalogSyncFingerprint,
   changedMetaChannels,
   channelsForMetaPush,
+  forgetGuestSyncMeta,
+  mergeStableMeta,
+  PAIR_META_CHANNELS,
   pairJsonFingerprint,
+  providersSyncFingerprint,
+  rememberStableMeta,
+  shouldEmitProviders,
   shouldRelayPairSnapshot,
   slimCatalogForPhone,
   slimProjectsForPhone,
@@ -83,6 +90,52 @@ describe('pairJsonFingerprint', () => {
   });
 });
 
+describe('providersSyncFingerprint', () => {
+  it('忽略名称/标签/顺序，只按 provider 与模型 id', () => {
+    const a = [
+      {
+        id: 'g',
+        name: 'Grok',
+        models: [
+          { id: 'b', label: 'B' },
+          { id: 'a', label: 'A' },
+        ],
+      },
+      { id: 'o', name: 'Other', models: [{ id: 'm' }] },
+    ];
+    const b = [
+      { id: 'o', name: 'Other 2', models: [{ id: 'm', label: 'M' }] },
+      { id: 'g', name: 'Grok 2', models: [{ id: 'a' }, { id: 'b' }] },
+    ];
+    expect(providersSyncFingerprint(a)).toBe(providersSyncFingerprint(b));
+  });
+
+  it('模型集合变化则指纹变', () => {
+    const base = [{ id: 'g', models: [{ id: 'a' }] }];
+    expect(providersSyncFingerprint(base)).not.toBe(
+      providersSyncFingerprint([{ id: 'g', models: [{ id: 'a' }, { id: 'b' }] }])
+    );
+  });
+});
+
+describe('shouldEmitProviders', () => {
+  it('相同指纹不重发', () => {
+    expect(shouldEmitProviders('a', 0, 'a', 1000)).toBe(false);
+  });
+
+  it('窗口内即使指纹变也不重发', () => {
+    expect(shouldEmitProviders('a', 1000, 'b', 1500, 1500)).toBe(false);
+  });
+
+  it('窗口外指纹变则发', () => {
+    expect(shouldEmitProviders('a', 1000, 'b', 3000, 1500)).toBe(true);
+  });
+
+  it('从未发过则发', () => {
+    expect(shouldEmitProviders(undefined, undefined, 'a', 1)).toBe(true);
+  });
+});
+
 describe('slimCatalogForPhone', () => {
   const fat = {
     id: 's1',
@@ -96,9 +149,11 @@ describe('slimCatalogForPhone', () => {
     modelId: 'm',
     reasoningEnabled: true,
     thinkingLevel: 'high' as const,
+    goal: { text: 'ship checkout', status: 'active' as const, autoTurns: 2 },
+    slashCommands: [{ name: '/skill:foo', description: 'do foo' }],
   };
 
-  it('未订阅时剥掉 cwd/排队/模型，只留抽屉字段', () => {
+  it('未订阅时剥掉 cwd/排队/模型/目标，只留抽屉字段', () => {
     expect(slimCatalogForPhone([fat], null)).toEqual([
       { id: 's1', title: 't', projectId: 'p', status: 'idle' },
     ]);
@@ -119,6 +174,23 @@ describe('slimProjectsForPhone', () => {
         { id: 'p', name: 'app', path: '/Users/me/app', kind: 'local' as const },
       ])
     ).toEqual([{ id: 'p', name: 'app', kind: 'local' }]);
+  });
+
+  // 别名全链路：桌面组帧 → 下发前裁剪 → 对端展示，真实 name 不被改写
+  it('裁剪后保留别名，对端按别名展示且 name 仍是真实项目名', () => {
+    const [entry] = slimProjectsForPhone([
+      toPairProjectEntry({ id: 'p', name: 'enso-code', path: '/Users/me/app', alias: '线上' }),
+    ]);
+    expect(entry).toEqual({ id: 'p', name: 'enso-code', alias: '线上' });
+    expect(pairProjectListLabel(entry)).toBe('线上');
+  });
+
+  it('别名新增与删除都会改变 projects 指纹，不被去重吞掉', () => {
+    const base = toPairProjectEntry({ id: 'p', name: 'app', path: '/tmp/app' });
+    const aliased = toPairProjectEntry({ id: 'p', name: 'app', path: '/tmp/app', alias: '线上' });
+    const fingerprint = (project: object) =>
+      pairJsonFingerprint({ projects: slimProjectsForPhone([project]), groups: [] });
+    expect(fingerprint(aliased)).not.toBe(fingerprint(base));
   });
 });
 
@@ -149,6 +221,57 @@ describe('channelsForMetaPush', () => {
 
   it('force 仍尊重 catalogReady：renderer 未就绪时不发空目录', () => {
     expect(channelsForMetaPush({ ...next }, { ...next }, false, true)).toEqual([
+      'pushConfig',
+      'hostInfo',
+    ]);
+  });
+});
+
+describe('forgetGuestSyncMeta', () => {
+  const fps = {
+    catalog: 'c',
+    projects: 'p',
+    providers: 'pr',
+    appearance: 'a',
+    pushConfig: 'push',
+    hostInfo: 'host',
+  } as const;
+
+  it('进房作废全部指纹，模型表也重发', () => {
+    expect(forgetGuestSyncMeta(fps)).toBeUndefined();
+    expect(changedMetaChannels(undefined, fps)).toEqual([
+      'catalog',
+      'projects',
+      'providers',
+      'appearance',
+      'pushConfig',
+      'hostInfo',
+    ]);
+  });
+
+  it('无历史指纹时仍是全新连接，不凭空造指纹', () => {
+    expect(forgetGuestSyncMeta(undefined)).toBeUndefined();
+  });
+
+  it('进房后合并空指纹，模型表仍会重发', () => {
+    const stable = forgetGuestSyncMeta(fps);
+    const sent = forgetGuestSyncMeta({ catalog: 'c-old' });
+    expect(changedMetaChannels(mergeStableMeta(stable, sent), fps)).toEqual([
+      'catalog',
+      'projects',
+      'providers',
+      'appearance',
+      'pushConfig',
+      'hostInfo',
+    ]);
+  });
+
+  it('发出前只锁 providers 指纹，并发 flush 仍补项目和推送配置', () => {
+    const stored = rememberStableMeta(undefined, PAIR_META_CHANNELS, fps);
+    expect(changedMetaChannels(mergeStableMeta(stored, undefined), fps)).toEqual([
+      'catalog',
+      'projects',
+      'appearance',
       'pushConfig',
       'hostInfo',
     ]);

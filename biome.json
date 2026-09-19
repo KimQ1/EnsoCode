@@ -65,7 +65,9 @@
       "!!.claude/worktrees",
       "!!.zvec-grep",
       "!.hce",
-      "!temp"
+      "!temp",
+      "!src/agent/continuousMemory/vendor",
+      "!src/shared/providers/devin/vendor"
     ]
   }
 }

@@ -1,11 +1,18 @@
 import path from 'node:path';
 import { electronApp, optimizer } from '@electron-toolkit/utils';
-import { app, BrowserWindow } from 'electron';
+import { app, type BrowserWindow } from 'electron';
 
 import { registerIpcHandlers } from './ipc';
-import { readSettings } from './ipc/settings';
+import { consumeTrayReenterAfterUpdate, readSettings } from './ipc/settings';
 import { startAgentWorker } from './services/agentHost';
 import { attachAppQuitDrain } from './services/appQuitDrain';
+import {
+  ensureTray,
+  leaveServerMode,
+  restoreFromSecondInstance,
+  scheduleReenterServerMode,
+  shouldQuitOnWindowAllClosed,
+} from './services/appServerMode';
 import { browserHost } from './services/browserHost';
 import { releaseLocalChatSlot } from './services/llama/chat';
 import { disposeLlamaRuntime, llamaRuntimeActive } from './services/llama/runtime';
@@ -26,6 +33,8 @@ import { getProxyConfig } from './services/proxyConfig';
 import { hydrateShellPath, seedProcessPath } from './services/shellPath';
 import { disposeAllTerminals, hasPendingPtys, waitPtyQuitIdle } from './services/terminalService';
 import { createMainWindow, getMainWindow } from './windows/MainWindow';
+import { resolveWindowsAppUserModelId } from './windows/windowIcon';
+import { applyWindowsChromiumSwitches } from './windows/win32Restore';
 
 // 仅开发环境开放 CDP 端口，便于调试；打包后不开，避免暴露远程调试。
 // 同机跑两以上实例（如验证节点互连）时可用 ENSO_CDP_PORT 错开。
@@ -36,6 +45,7 @@ if (!app.isPackaged) {
     /^\d+$/.test(cdpPort ?? '') ? cdpPort! : '9222'
   );
 }
+applyWindowsChromiumSwitches(app.commandLine);
 
 // 自动化可在开发环境显式指定 userData；打包版永不接受环境覆盖。
 // dev 缺省隔离到 appData/enso-code-dev：与打包版彻底分离，避免单实例锁 /
@@ -62,15 +72,21 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    const win = getMainWindow();
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
+    restoreFromSecondInstance();
+  });
+  app.on('child-process-gone', (_event, details) => {
+    console.error(
+      `[process] child-process-gone type=${details.type} reason=${details.reason} exitCode=${details.exitCode} serviceName=${details.serviceName ?? ''} name=${details.name ?? ''}`
+    );
   });
 
   app.whenReady().then(() => {
-    electronApp.setAppUserModelId('com.j3n5en.enso-code');
+    electronApp.setAppUserModelId(
+      resolveWindowsAppUserModelId({
+        execPath: process.execPath,
+        isPackaged: app.isPackaged,
+      })
+    );
 
     // dev 下 dock 显示 Electron 默认图标；手动设为 app 图标（打包由 electron-builder 处理）
     if (!app.isPackaged && process.platform === 'darwin') {
@@ -97,6 +113,7 @@ if (!gotTheLock) {
     syncMemoryKgFromSettings(persistedState);
     // UI shell 必须先创建并发起加载；Agent worker 初始化变重时不得阻塞 renderer spawn。
     const mainWindow = createMainWindow();
+    ensureTray();
     // 内嵌浏览器 guest view 挂主窗口（无头也要 viewport）；窗口重建后 getMainWindow 自动指向新窗
     browserHost.setHostWindow(getMainWindow);
     // 两个后台服务都不依赖窗口，同样延后，避免堵住首帧。
@@ -115,18 +132,15 @@ if (!gotTheLock) {
       startPairGuest();
     });
     void initAutoUpdater(mainWindow);
+    if (consumeTrayReenterAfterUpdate()) scheduleReenterServerMode();
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createMainWindow();
-      }
+      leaveServerMode();
     });
   });
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
-      app.quit();
-    }
+    if (shouldQuitOnWindowAllClosed(process.platform)) app.quit();
   });
 
   // Electron 退出即断开中继，手机侧收到 host-offline
@@ -162,9 +176,9 @@ async function initAutoUpdater(window: BrowserWindow): Promise<void> {
   if (process.platform === 'linux' && !process.env.APPIMAGE) return;
   // 读持久化设置里的 autoUpdate(zustand persist 形状:{ state: {...} });缺省 true
   const persisted = readSettings()?.['enso-settings'] as
-    | { state?: { autoUpdate?: boolean } }
+    | { state?: { autoUpdate?: boolean; autoRestartWhenIdle?: boolean } }
     | undefined;
   const autoUpdate = persisted?.state?.autoUpdate ?? true;
   const { autoUpdaterService } = await import('./services/updater/AutoUpdater');
-  autoUpdaterService.init(window, autoUpdate);
+  autoUpdaterService.init(window, autoUpdate, persisted?.state?.autoRestartWhenIdle === true);
 }

@@ -10,9 +10,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { IPC_CHANNELS } from '@shared/types';
+import { IPC_CHANNELS, isEditMode, resolveEditMode } from '@shared/types';
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { readStoredOauthCredentialKeys } from '../services/oauthProviders';
+import { parseTraySleepPolicy, type TraySleepPolicy } from '../services/pairPowerKeepAlive';
 import { getWindowWebContents, sendToWindow } from '../windows/createAppWindow';
 
 function getSettingsPath(): string {
@@ -44,12 +45,14 @@ export const SETTINGS_STATE_FIELDS = [
   'loadHarnessAssets',
   'windowsLocalShell',
   'exploreFoldEnabled',
-  'bashInterceptEnabled',
+  'editMode',
   'hashlineEditEnabled',
+  'compactStrategy',
   'smartCompactEnabled',
   'smartCompactModel',
   'smartCompactMode',
   'autoUpdate',
+  'autoRestartWhenIdle',
   'proxyMode',
   'customProxyUrl',
   'openChangesOnFileEdit',
@@ -79,6 +82,7 @@ export const SETTINGS_STATE_FIELDS = [
   'backgroundRefreshNonce',
   'providers',
   'defaultModel',
+  'defaultModelFollowLast',
   'titleSummaryEnabled',
   'titleSummaryModel',
   'memoryDistillModel',
@@ -115,10 +119,12 @@ export type SettingsStateField = (typeof SETTINGS_STATE_FIELDS)[number];
 
 /** Device-local keys that config-sync must never fingerprint or write back. */
 const CONFIG_SYNC_EXCLUDED_STATE_FIELDS = new Set<SettingsStateField>([
+  'hashlineEditEnabled',
   'windowsLocalShell',
   'terminalShell',
   'worktreeRoot',
   'autoUpdate',
+  'autoRestartWhenIdle',
   'proxyMode',
   'customProxyUrl',
   'backgroundImageEnabled',
@@ -396,6 +402,7 @@ export function commitSettingsTransaction(
   for (const field of CONFIG_SYNC_COMMIT_FIELDS) {
     if (field in statePatch) currentState[field] = statePatch[field];
   }
+  if ('editMode' in statePatch) delete currentState.hashlineEditEnabled;
   const next = {
     ...latest,
     'enso-settings': {
@@ -440,6 +447,15 @@ export function patchSettingsState(
   if (!SETTINGS_STATE_FIELDS.includes(field as SettingsStateField)) {
     return { ok: false, error: `Unregistered settings field: ${field}` };
   }
+  let targetField = field as SettingsStateField;
+  let targetValue = value;
+  if (targetField === 'hashlineEditEnabled') {
+    if (typeof value !== 'boolean') return { ok: false, error: 'Invalid legacy edit mode' };
+    targetField = 'editMode';
+    targetValue = resolveEditMode(undefined, value);
+  } else if (targetField === 'editMode' && !isEditMode(value)) {
+    return { ok: false, error: 'Invalid edit mode' };
+  }
   const current = readSettings() ?? {};
   const persisted =
     current['enso-settings'] && typeof current['enso-settings'] === 'object'
@@ -449,8 +465,9 @@ export function patchSettingsState(
     persisted.state && typeof persisted.state === 'object'
       ? (persisted.state as Record<string, unknown>)
       : {};
-  const previous = state[field];
-  const nextState = { ...state, [field]: value };
+  const previous = state[targetField];
+  const nextState = { ...state, [targetField]: targetValue };
+  if (targetField === 'editMode') delete nextState.hashlineEditEnabled;
   const next = {
     ...current,
     'enso-settings': {
@@ -459,8 +476,82 @@ export function patchSettingsState(
     },
   };
   return scheduleWrite(next, sender, broadcast)
-    ? { ok: true, previous, value }
+    ? { ok: true, previous, value: targetValue }
     : { ok: false, error: `Failed to write settings field: ${field}` };
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+const TRAY_SETTINGS_KEY = 'enso-tray';
+
+export function readTraySleepPolicy(): TraySleepPolicy {
+  return parseTraySleepPolicy(objectRecord(readSettings()?.[TRAY_SETTINGS_KEY])?.sleepPolicy);
+}
+
+export function writeTraySleepPolicy(policy: TraySleepPolicy): boolean {
+  return writeTrayState({ sleepPolicy: policy });
+}
+
+function trayState(): Record<string, unknown> {
+  return objectRecord(readSettings()?.[TRAY_SETTINGS_KEY]) ?? {};
+}
+
+function writeTrayState(patch: Record<string, unknown>): boolean {
+  const current = readSettings() ?? {};
+  return scheduleWrite({
+    ...current,
+    [TRAY_SETTINGS_KEY]: { ...trayState(), ...patch },
+  });
+}
+
+export function writeTrayReenterAfterUpdate(reenter: boolean): boolean {
+  return writeTrayState({ reenterAfterUpdate: reenter });
+}
+
+export function consumeTrayReenterAfterUpdate(): boolean {
+  if (trayState().reenterAfterUpdate !== true) return false;
+  writeTrayReenterAfterUpdate(false);
+  return true;
+}
+
+/** 无 renderer 时由 Main 改会话元数据；形状与 zustand persist 的 enso-conversations 一致。 */
+export function patchConversationsState(
+  mutate: (state: {
+    conversations: Record<string, Record<string, unknown>>;
+    order: string[];
+    activeId: unknown;
+  }) => void
+): boolean {
+  const current = readSettings() ?? {};
+  const store = objectRecord(current['enso-conversations']) ?? {};
+  const state = objectRecord(store.state) ?? {};
+  const conversations: Record<string, Record<string, unknown>> = {};
+  for (const [id, value] of Object.entries(objectRecord(state.conversations) ?? {})) {
+    const row = objectRecord(value);
+    if (row) conversations[id] = row;
+  }
+  const order = Array.isArray(state.order)
+    ? state.order.filter((id): id is string => typeof id === 'string')
+    : [];
+  const nextState = { conversations, order, activeId: state.activeId };
+  mutate(nextState);
+  return scheduleWrite({
+    ...current,
+    'enso-conversations': {
+      ...store,
+      state: { ...state, ...nextState },
+    },
+  });
+}
+
+export function readPersistedConversation(sessionId: string): Record<string, unknown> | null {
+  const store = objectRecord(readSettings()?.['enso-conversations']);
+  const conversations = objectRecord(objectRecord(store?.state)?.conversations);
+  return conversations ? objectRecord(conversations[sessionId]) : null;
 }
 
 /** 删除项目及其会话元数据；两个 zustand store 在同一次顶层按键合并中原子更新。 */

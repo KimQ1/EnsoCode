@@ -235,6 +235,24 @@ describe('memoryHost 会话结束蒸馏接线', () => {
     expect((await search('pnpm')).results).toEqual([]);
   });
 
+  it('关掉内置 memory 工具后，即使自动蒸馏开着也不写', async () => {
+    closeMemoryDb();
+    configureMemoryEmbedding({ modelId: 'none' });
+    const readTranscript = vi.fn(async () => messages);
+    const complete = vi.fn(llm('pnpm workspaces chosen for monorepo'));
+    syncMemoryDistillFromSettings({
+      memoryDistillEnabled: true,
+      disabledBuiltinTools: ['memory'],
+    });
+    configureMemoryDistill({ readTranscript, complete: () => complete });
+    await scheduleMemoryDistill(payload);
+    await awaitMemoryDistill();
+    expect(readTranscript).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    expect((await search('pnpm')).results).toEqual([]);
+    configureMemoryDistill({ enabled: false });
+  });
+
   it('memoryLanguage 真的进了模型收到的 system prompt，非法值回退英文', async () => {
     closeMemoryDb();
     configureMemoryEmbedding({ modelId: 'none' });
@@ -248,7 +266,11 @@ describe('memoryHost 会话结束蒸馏接线', () => {
       });
     });
     const run = async (language: unknown, sessionId: string) => {
-      syncMemoryDistillFromSettings({ memoryDistillEnabled: true, memoryLanguage: language });
+      syncMemoryDistillFromSettings({
+        memoryDistillEnabled: true,
+        memoryLanguage: language,
+        disabledBuiltinTools: [],
+      });
       configureMemoryDistill({
         readTranscript: async () => [{ role: 'user' as const, text: 'we picked redis for cache' }],
         complete: () => complete,
@@ -275,7 +297,11 @@ describe('memoryHost 会话结束蒸馏接线', () => {
     const transcript = [{ role: 'user' as const, text: 'we picked redis for cache' }];
 
     // 第一次：provider 不可用 → 任务留 pending
-    syncMemoryDistillFromSettings({ memoryDistillEnabled: true, memoryLanguage: 'en' });
+    syncMemoryDistillFromSettings({
+      memoryDistillEnabled: true,
+      memoryLanguage: 'en',
+      disabledBuiltinTools: [],
+    });
     configureMemoryDistill({ readTranscript: async () => transcript, complete: () => null });
     await distillSessionNow(payload);
     await awaitMemoryDistill();
@@ -288,7 +314,11 @@ describe('memoryHost 会话结束蒸馏接线', () => {
       return JSON.stringify({ memories: [{ title: 't', content: 'redis', importance: 0.8 }] });
     });
     closeMemoryDb();
-    syncMemoryDistillFromSettings({ memoryDistillEnabled: true, memoryLanguage: 'zh' });
+    syncMemoryDistillFromSettings({
+      memoryDistillEnabled: true,
+      memoryLanguage: 'zh',
+      disabledBuiltinTools: [],
+    });
     configureMemoryDistill({
       readTranscript: async () => transcript,
       complete: () => complete,
@@ -314,7 +344,11 @@ describe('memoryHost 会话结束蒸馏接线', () => {
     });
     const payload = { sessionId: 'lang-flip', sessionFile: '/fake/lf.jsonl', projectId: null };
     const setLanguage = (language: string) => {
-      syncMemoryDistillFromSettings({ memoryDistillEnabled: true, memoryLanguage: language });
+      syncMemoryDistillFromSettings({
+        memoryDistillEnabled: true,
+        memoryLanguage: language,
+        disabledBuiltinTools: [],
+      });
       configureMemoryDistill({
         readTranscript: async () => [{ role: 'user' as const, text: 'we picked redis' }],
         complete: () => complete,
@@ -495,14 +529,31 @@ describe('memoryHost KG 抽取接线', () => {
     expect(getMemoryKgJobs()).toEqual([]);
   });
 
+  it('开关关闭时写入的记忆，打开 KG 并重开库后补抽', async () => {
+    closeMemoryDb();
+    configureMemoryEmbedding({ modelId: 'none' });
+    configureMemoryDistill({ enabled: false });
+    configureMemoryKg({ enabled: false, complete: null });
+    await capture('We provision infra with Terraform.');
+    await awaitMemoryKg();
+    expect(entityNames()).toEqual([]);
+    const complete = vi.fn(async () => kgJson(['Terraform']));
+    configureMemoryKg({ enabled: true, complete: () => complete });
+    closeMemoryDb();
+    await invokeMemory('search', { query: 'terraform', limit: 5, spaceId: 'global' }, null);
+    await awaitMemoryKg();
+    expect(complete).toHaveBeenCalled();
+    expect(entityNames()).toContain('Terraform');
+  });
+
   it('syncMemoryKgFromSettings 按 unknown 收窄：非布尔 true 视为关', async () => {
     const complete = vi.fn(async () => kgJson(['X']));
     configureMemoryKg({ complete: () => complete });
     syncMemoryKgFromSettings({ memoryKgEnabled: 'true' });
-    await capture('Vault stores our secrets.');
+    const r = await capture('Vault stores our secrets.');
     await awaitMemoryKg();
     expect(complete).not.toHaveBeenCalled();
-    expect(getMemoryKgJobs()).toEqual([]);
+    expect(getMemoryKgJobs().some((j) => j.memoryId === r.memory.id)).toBe(false);
   });
 
   it('开关打开：capture 后异步抽实体；hash 去重的重复 capture 不再调 LLM', async () => {
@@ -532,7 +583,7 @@ describe('memoryHost KG 抽取接线', () => {
     configureMemoryKg({ complete: () => complete });
     await invokeMemory('search', { query: 'ansible', limit: 5, spaceId: 'global' }, null);
     await awaitMemoryKg();
-    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalled();
     expect(entityNames()).toContain('Ansible');
   });
 

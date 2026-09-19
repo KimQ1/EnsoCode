@@ -1,5 +1,6 @@
 import { toPairProjectEntry } from '@enso/pair';
 import { catalogSyncFingerprint, pairJsonFingerprint } from '@shared/pair/metaSync';
+import { projectDisplayName } from '@shared/projectName';
 import type { PairCatalogPayload } from '@shared/types';
 import { getXtermTheme } from '@/lib/ghosttyTheme';
 import { useOauthCredentialStore } from '@/stores/oauthCredentials';
@@ -33,7 +34,8 @@ function buildPayload(): PairCatalogPayload {
   // 与桌面侧栏一致的项目手动顺序（拖拽偏好存 localStorage，不进 settings store）
   const orderedProjects = applyProjectOrder(settings.projects, readSidebarOrder(PROJECT_ORDER_KEY));
   const archivedProjects = new Set(readSidebarOrder(ARCHIVED_PROJECTS_KEY));
-  const projectName = new Map(settings.projects.map((p) => [p.id, p.name]));
+  // 与桌面侧栏同口径的展示名（别名优先），手机端没有 settings.projects 只能拿下发的字符串
+  const projectName = new Map(settings.projects.map((p) => [p.id, projectDisplayName(p)]));
   const projectPath = new Map(settings.projects.map((p) => [p.id, p.path]));
 
   type Conversation = NonNullable<(typeof sessions.conversations)[string]>;
@@ -42,6 +44,9 @@ function buildPayload(): PairCatalogPayload {
     const owner = (c.parentId ? sessions.conversations[c.parentId] : undefined) ?? c;
     return owner.worktree?.path ?? projectPath.get(c.projectId);
   };
+  const slashCommands = settings.skills
+    .filter((skill) => skill.enabled !== false)
+    .map((skill) => ({ name: `/skill:${skill.name}`, description: skill.description }));
   const toEntry = (c: Conversation) => ({
     id: c.id,
     title: c.parentId ? c.coworkerName || c.title : c.title,
@@ -59,6 +64,10 @@ function buildPayload(): PairCatalogPayload {
     ...(c.reasoningEnabled !== undefined ? { reasoningEnabled: c.reasoningEnabled } : {}),
     ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
     ...(c.unread === true ? { unread: true } : {}),
+    ...(c.pendingAsks && c.pendingAsks.length > 0 ? { pendingAskCount: c.pendingAsks.length } : {}),
+    ...(c.pendingApprovals && c.pendingApprovals.length > 0
+      ? { pendingApprovalCount: c.pendingApprovals.length }
+      : {}),
     // 排队消息：手机队列区展示与操作；图片不下发正文，只给个标记
     ...(c.queuedMessages?.length
       ? {
@@ -69,6 +78,17 @@ function buildPayload(): PairCatalogPayload {
           })),
         }
       : {}),
+    ...(c.goal
+      ? {
+          goal: {
+            text: c.goal.text,
+            status: c.goal.status,
+            ...(c.goal.note ? { note: c.goal.note } : {}),
+            autoTurns: c.goal.autoTurns,
+          },
+        }
+      : {}),
+    ...(slashCommands.length ? { slashCommands } : {}),
   });
 
   const topLevel = sessions.order
@@ -171,7 +191,8 @@ export function bindPairCatalogSync(): void {
       state.terminalTheme !== prev.terminalTheme ||
       state.terminalFontFamily !== prev.terminalFontFamily ||
       state.compactReadOnlyTools !== prev.compactReadOnlyTools ||
-      state.expandLiveEdits !== prev.expandLiveEdits
+      state.expandLiveEdits !== prev.expandLiveEdits ||
+      state.skills !== prev.skills
     ) {
       schedulePush();
     }
@@ -219,6 +240,33 @@ export function bindPairCatalogSync(): void {
         break;
       case 'queue-interrupt-send':
         void store.interruptAndSendQueued(action.sessionId, action.messageId);
+        break;
+      case 'goal-pause':
+        store.pauseGoal(action.sessionId);
+        break;
+      case 'goal-resume':
+        store.resumeGoal(action.sessionId);
+        break;
+      case 'goal-clear':
+        store.clearGoal(action.sessionId);
+        break;
+      case 'goal-set':
+        store.setGoal(action.sessionId, action.text);
+        break;
+      case 'compact':
+        store.compact(action.sessionId, action.instructions);
+        break;
+      case 'rewind':
+        store.rewind(action.sessionId, action.userIndexFromEnd, action.restoreFiles);
+        break;
+      case 'retry':
+        store.retry(action.sessionId);
+        break;
+      case 'task-stop':
+        void window.electronAPI.agent.stopTask(action.sessionId, action.taskId);
+        break;
+      case 'subagent-stop':
+        void window.electronAPI.agent.stopSubagent(action.sessionId, action.agentId);
         break;
     }
   });

@@ -3,7 +3,11 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { ChildSessionIdentity, SessionIdentity } from '@shared/builtinAgents';
 import { resolveSshTarget } from '@shared/ssh';
-import { IPC_CHANNELS } from '@shared/types';
+import {
+  IPC_CHANNELS,
+  projectDisabledBuiltinTools,
+  resolveDisabledBuiltinTools,
+} from '@shared/types';
 import type {
   AgentActionResult,
   AgentRemoteConfig,
@@ -49,6 +53,7 @@ import {
   isAgentWorkerReady,
   promptChildSession,
   promptSession,
+  readSettingsState,
   releaseParentSession,
   reloadSession,
   requestSnapshot,
@@ -93,6 +98,10 @@ import {
 import { maybeNotify, setViewedSession } from '../services/notifications';
 import { readStoredOauthCredentialKeys } from '../services/oauthProviders';
 import { forwardAgentEvent, setPairAgentBridge } from '../services/pairHost';
+import {
+  configurePairSessionHost,
+  handlePairHeadlessAgentEvent,
+} from '../services/pairSessionHost';
 import { removeConversationSessionFiles } from '../services/sessionFileCleanup';
 import {
   projectParentHistoryPage,
@@ -173,6 +182,7 @@ function broadcastAgentEvent(event: RendererAgentEvent): void {
   maybeNotify(event);
   // 手机第二屏：按订阅过滤后加密下发（host 在 main，不依赖窗口焦点）
   forwardAgentEvent(event);
+  handlePairHeadlessAgentEvent(event);
 }
 
 export function pushMcpStatus(push: McpStatusPush): void {
@@ -222,6 +232,41 @@ function remoteConfigFor(sessionId: string): AgentRemoteConfig | undefined {
     };
   }
   return project.sshHost ? { host: project.sshHost, auth: 'key' } : undefined;
+}
+
+function projectIdFor(sessionId: string): string | undefined {
+  return sourceAuthority?.conversation(sessionId)?.projectId;
+}
+
+/** 旁路会话继承父会话工作区；路径由 Main 从权威记录推导，不采信 renderer。 */
+export function resolveConversationWorkspace(conversationId: string): {
+  cwd: string;
+  projectId: string;
+  remote?: AgentRemoteConfig;
+} | null {
+  const conversation = sourceAuthority?.conversation(conversationId);
+  const project = conversation ? sourceAuthority?.project(conversation.projectId) : undefined;
+  if (!conversation || conversation.lifecycle === 'ended' || project?.state !== 'active') {
+    return null;
+  }
+  const cwd = sessionWorktree(conversationId)?.path ?? project.canonicalPath;
+  if (!cwd) return null;
+  const remote = remoteConfigFor(conversationId);
+  return { cwd, projectId: conversation.projectId, ...(remote ? { remote } : {}) };
+}
+
+function spawnBoundSession(
+  identity: SessionIdentity,
+  request: AgentSpawnRequest,
+  credentialKeys: ReadonlySet<string>
+) {
+  return spawnSession(
+    identity,
+    request,
+    credentialKeys,
+    remoteConfigFor(request.sessionId),
+    projectIdFor(request.sessionId)
+  );
 }
 
 function parseSpawnRequest(value: unknown): AgentSpawnRequest | null {
@@ -422,13 +467,114 @@ function wirePairAgentBridge(): void {
       } catch {
         return { ok: false, error: 'model credentials unavailable' };
       }
-      return spawnSession(identity, request, credentialKeys, remoteConfigFor(request.sessionId));
+      return spawnBoundSession(identity, request, credentialKeys);
     },
+  });
+}
+
+function wirePairSessionHost(): void {
+  const identityOf = (sessionId: unknown) => {
+    const identity = exactIdentity(sessionId);
+    return identity && !('parent' in identity) ? identity : undefined;
+  };
+  configurePairSessionHost({
+    isAlive: (sessionId) => agentSessionIndex.isAlive(sessionId),
+    requestSnapshot: (sessionId) => {
+      requestSnapshot(sessionId);
+    },
+    spawn: async (request) => {
+      const identity = identityOf(request.sessionId) ?? {
+        sessionId: request.sessionId,
+        generation: randomUUID(),
+      };
+      agentSessionIndex.prepareParent(identity);
+      let credentialKeys: ReadonlySet<string>;
+      try {
+        credentialKeys = await readStoredOauthCredentialKeys();
+      } catch {
+        return { ok: false, error: 'model credentials unavailable' };
+      }
+      return spawnBoundSession(identity, request, credentialKeys);
+    },
+    prompt: (sessionId, text, images) => {
+      const identity = identityOf(sessionId);
+      if (identity) promptSession(identity, text, images);
+    },
+    steer: (sessionId, text, images) => {
+      const identity = identityOf(sessionId);
+      if (identity) steerSession(identity, text, images);
+    },
+    abort: (sessionId) => {
+      const identity = identityOf(sessionId);
+      if (identity) abortSession(identity);
+    },
+    setModel: (sessionId, providerId, modelId) => {
+      const identity = identityOf(sessionId);
+      if (!identity) return;
+      void readStoredOauthCredentialKeys()
+        .then((keys) => setSessionModel(identity, providerId, modelId, keys))
+        .catch(() => {});
+    },
+    setReasoning: (sessionId, enabled, level) => {
+      const identity = identityOf(sessionId);
+      if (!identity) return;
+      const thinking =
+        typeof level === 'string' && (THINKING_LEVELS as readonly string[]).includes(level)
+          ? (level as ThinkingLevel)
+          : undefined;
+      setSessionReasoning(identity, enabled, thinking);
+    },
+    setThinking: (sessionId, level) => {
+      const identity = identityOf(sessionId);
+      if (!identity || !(THINKING_LEVELS as readonly string[]).includes(level)) return;
+      setSessionThinking(identity, level as ThinkingLevel);
+    },
+    compact: (sessionId, instructions) => {
+      const identity = identityOf(sessionId);
+      if (identity) compactSession(identity, instructions);
+    },
+    rewind: (sessionId, userIndexFromEnd, restoreFiles) => {
+      const identity = identityOf(sessionId);
+      if (identity) rewindSession(identity, userIndexFromEnd, restoreFiles);
+    },
+    retry: (sessionId) => {
+      const identity = identityOf(sessionId);
+      if (identity) retrySession(identity);
+    },
+    stopTask: (sessionId, taskId) => {
+      const identity = identityOf(sessionId);
+      if (identity) stopBackgroundTask(identity, taskId);
+    },
+    stopSubagent: (sessionId, agentId) => {
+      const identity = identityOf(sessionId);
+      if (identity) stopSubagent(identity, agentId);
+    },
+    createAuthority: (sessionId, projectId) => {
+      const project = sourceAuthority?.project(projectId);
+      if (!sourceAuthority || !project || project.state !== 'active') return;
+      sourceAuthority.createConversation({
+        requestId: randomUUID(),
+        projectId,
+        projectVersion: project.version,
+        conversationId: sessionId,
+      });
+    },
+    worktreePath: (sessionId) => sessionWorktree(sessionId)?.path,
+    worktreeMissing: (sessionId) => {
+      const worktree = sessionWorktree(sessionId);
+      return Boolean(worktree && !existsSync(worktree.path));
+    },
+    projectPath: (projectId) => {
+      const project = sourceAuthority?.project(projectId);
+      return project?.state === 'active' ? project.canonicalPath : undefined;
+    },
+    loadLocalSkills: () => readSettingsState()?.loadLocalSkills === true,
   });
 }
 
 export function registerAgentHandlers(): void {
   wirePairAgentBridge();
+  wirePairSessionHost();
   configureMemoryDistill({ complete: distillCompletion });
   const agentDataDir = path.join(app.getPath('userData'), 'agent');
   sourceAuthority = new SourceAuthorityRegistry({
@@ -487,7 +633,7 @@ export function registerAgentHandlers(): void {
       registrySnapshot: agentTypeRegistrySnapshot,
       resolveModel: resolveModelSelection,
       resolveAgentType: resolveAgentTypeSpawnConfig,
-      spawnParent: spawnSession,
+      spawnParent: spawnBoundSession,
       spawnChild: spawnChildSession,
       promptChild: promptChildSession,
       appendCustomEntry: appendSessionCustomEntry,
@@ -629,7 +775,19 @@ export function registerAgentHandlers(): void {
       // 项目 space 只认 Main 权威：worker 不上报 projectId，也不上报路径
       const conversation = sourceAuthority?.conversation(rootSessionId(identity));
       const project = conversation ? sourceAuthority?.project(conversation.projectId) : undefined;
-      void invokeMemory(op, params, project?.state === 'active' ? project.projectId : null).then(
+      const projectId = project?.state === 'active' ? project.projectId : null;
+      const state = readSettingsState() ?? {};
+      const disabled = resolveDisabledBuiltinTools(state.disabledBuiltinTools, {
+        disabledBuiltinTools: projectDisabledBuiltinTools(state.projects, projectId ?? undefined),
+      });
+      if (disabled.includes('memory')) {
+        sendMemoryResultToSession(identity, requestId, {
+          ok: false,
+          error: 'Memory tool is disabled',
+        });
+        return;
+      }
+      void invokeMemory(op, params, projectId).then(
         (result) => sendMemoryResultToSession(identity, requestId, { ok: true, result }),
         (error: unknown) =>
           sendMemoryResultToSession(identity, requestId, {
@@ -884,12 +1042,7 @@ export function registerAgentHandlers(): void {
     if (!persistedRootSpawn(currentRequest, event.sender.id)) {
       return { ok: false, error: 'conversation authority changed' };
     }
-    return spawnSession(
-      identity,
-      currentRequest,
-      credentialKeys,
-      remoteConfigFor(parsed.sessionId)
-    );
+    return spawnBoundSession(identity, currentRequest, credentialKeys);
   });
 
   ipcMain.handle(

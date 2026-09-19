@@ -1,6 +1,7 @@
 /**
  * 直连协商状态机（纯 reducer，三端共用）。guest 发起并驱动重试，host 只应答；
  * `gen` 每轮递增，不等于当前代的信令/事件一律丢弃，防网络切换后迟到的候选污染新一轮。
+ * 例外：访客进程重启从 gen=1 再发 offer，主机即使当前代更高也接受（杀 PWA 后不必空等 15s）。
  * 中继侧断开（peer-online false / ws close）不拆直连：直连生死只看自身与本机网络变化。
  */
 
@@ -18,6 +19,8 @@ export interface DirectState {
   /** guest：已见到 host 声明能力；host 不用 */
   capable: boolean;
   peerOnline: boolean;
+  /** guest：本轮直连比中继慢，钉在中继直到网络变化 */
+  preferRelay: boolean;
 }
 
 export type DirectEvent =
@@ -32,7 +35,8 @@ export type DirectEvent =
   | { type: 'negotiate-timeout'; gen: number }
   | { type: 'cooldown-elapsed' }
   | { type: 'network-change' }
-  | { type: 'peer-gone' };
+  | { type: 'peer-gone' }
+  | { type: 'prefer-relay' };
 
 export type DirectAction =
   | { type: 'create-offer'; gen: number }
@@ -55,7 +59,15 @@ export interface DirectStep {
 export const DIRECT_NEGOTIATE_TIMEOUT_MS = 15_000;
 
 export function initialDirectState(role: DirectRole): DirectState {
-  return { role, phase: 'idle', gen: 0, attempt: 0, capable: false, peerOnline: false };
+  return {
+    role,
+    phase: 'idle',
+    gen: 0,
+    attempt: 0,
+    capable: false,
+    peerOnline: false,
+    preferRelay: false,
+  };
 }
 
 const noop = (state: DirectState): DirectStep => ({ state, actions: [] });
@@ -83,6 +95,9 @@ function startNegotiation(state: DirectState): DirectStep {
 
 /** guest 在 idle/cooldown 且对端可用时立即发起，否则落回 idle */
 function maybeStart(state: DirectState, prefix: DirectAction[]): DirectStep {
+  if (state.preferRelay) {
+    return { state: { ...state, phase: 'idle' }, actions: prefix };
+  }
   if (state.capable && state.peerOnline) {
     const next = startNegotiation(state);
     return { state: next.state, actions: [...prefix, ...next.actions] };
@@ -96,7 +111,10 @@ function reduceGuest(state: DirectState, event: DirectEvent): DirectStep {
     case 'peer-capable': {
       if (!event.capable) {
         // host 降级：拆干净，等它再次声明
-        return { state: { ...state, capable: false, phase: 'idle' }, actions: teardown(state) };
+        return {
+          state: { ...state, capable: false, preferRelay: false, phase: 'idle' },
+          actions: teardown(state),
+        };
       }
       const next = { ...state, capable: true };
       return state.phase === 'idle' ? maybeStart(next, []) : noop(next);
@@ -160,13 +178,29 @@ function reduceGuest(state: DirectState, event: DirectEvent): DirectStep {
         state.phase === 'negotiating' || state.phase === 'connected'
           ? [{ type: 'send-close', gen: state.gen }, ...teardown(state)]
           : [];
-      return maybeStart({ ...state, attempt: 0 }, prefix);
+      return maybeStart({ ...state, attempt: 0, preferRelay: false }, prefix);
     }
     case 'peer-gone': {
       const actions = teardown(state).filter((a) => a.type !== 'resync');
       return {
-        state: { ...state, phase: 'idle', attempt: 0, capable: false, peerOnline: false },
+        state: {
+          ...state,
+          phase: 'idle',
+          attempt: 0,
+          capable: false,
+          peerOnline: false,
+          preferRelay: false,
+        },
         actions,
+      };
+    }
+    case 'prefer-relay': {
+      if (state.phase === 'idle' || state.phase === 'cooldown') {
+        return { state: { ...state, preferRelay: true, phase: 'idle' }, actions: [] };
+      }
+      return {
+        state: { ...state, phase: 'idle', preferRelay: true, attempt: 0 },
+        actions: [{ type: 'send-close', gen: state.gen }, ...teardown(state)],
       };
     }
     default:
@@ -184,7 +218,11 @@ function reduceHost(state: DirectState, event: DirectEvent): DirectStep {
     case 'peer-online':
       return noop({ ...state, peerOnline: event.online });
     case 'offer': {
-      if (event.gen <= state.gen) return noop(state);
+      // 杀 PWA / 刷新会新建 DirectLink，访客从 gen=1 再发。主机代次不复位，
+      // 旧规则丢掉首轮 offer，直连要等 15s 超时后 gen=2 才接上。
+      const duplicateGen1 = event.gen === 1 && state.gen === 1 && state.phase === 'negotiating';
+      const guestRestart = event.gen === 1 && state.gen >= 1 && !duplicateGen1;
+      if (!guestRestart && event.gen <= state.gen) return noop(state);
       return {
         state: { ...state, phase: 'negotiating', gen: event.gen },
         actions: [

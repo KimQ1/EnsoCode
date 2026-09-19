@@ -2,9 +2,15 @@ import {
   type CatalogEntry,
   type ProjectEntry,
   type ProjectGroupEntry,
+  pairProjectDisplayName,
   sshProjectLabel,
 } from '@enso/pair';
-import { orderPinned, orderProjectSessions, sortByActivity } from '@shared/pair/drawerOrder';
+import {
+  isDrawerActive,
+  orderPinned,
+  orderProjectSessions,
+  sortByActivity,
+} from '@shared/pair/drawerOrder';
 import {
   ALL_GROUP_ID,
   filterProjectsByGroup,
@@ -27,6 +33,13 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { useI18n } from '@/i18n';
 import { formatRelativeTime } from '@/lib/time';
@@ -180,10 +193,14 @@ export function SessionDrawer({
   const groupSections = sectionsForAllView(projects, groups, archivedProjectIds);
   const slicedIdSet = new Set(activeProjects.map((project) => project.id));
   const topLevel = catalog.filter((c) => !c.parentId);
+  const inSlice = (c: CatalogEntry) => !c.projectId || slicedIdSet.has(c.projectId);
+  const hasRunningChild = (id: string) =>
+    catalog.some((child) => child.parentId === id && child.status === 'running');
+  const activeSessions = sortByActivity(
+    topLevel.filter((c) => !isArchived(c) && inSlice(c) && isDrawerActive(c, hasRunningChild(c.id)))
+  );
   const pinnedSessions = orderPinned(
-    topLevel.filter(
-      (c) => c.pinned && !isArchived(c) && (!c.projectId || slicedIdSet.has(c.projectId))
-    ),
+    topLevel.filter((c) => c.pinned && !isArchived(c) && inSlice(c)),
     pinnedOrder
   );
   const archivedSessions = sortByActivity(
@@ -235,31 +252,46 @@ export function SessionDrawer({
         </div>
         {groups.length > 0 && (
           <div className="shrink-0 border-b px-3 py-2">
-            <select
-              className="h-8 w-full rounded-md border bg-background px-2 text-sm"
+            <Select
+              items={[
+                { value: ALL_GROUP_ID, label: '全部' },
+                ...groups
+                  .slice()
+                  .sort((a, b) => a.order - b.order)
+                  .map((group) => ({
+                    value: group.id,
+                    label: `${group.emoji ? `${group.emoji} ` : ''}${group.name}`,
+                  })),
+                { value: UNGROUPED_GROUP_ID, label: '未分组' },
+              ]}
               value={resolvedGroupId}
-              onChange={(event) => {
-                const next = event.target.value;
-                setSelectedGroupId(next);
+              onValueChange={(value) => {
+                if (!value) return;
+                setSelectedGroupId(value);
                 try {
-                  localStorage.setItem('enso-phone-selected-project-group', next);
+                  localStorage.setItem('enso-phone-selected-project-group', value);
                 } catch {
                   /* ignore */
                 }
               }}
             >
-              <option value={ALL_GROUP_ID}>全部</option>
-              {groups
-                .slice()
-                .sort((a, b) => a.order - b.order)
-                .map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {group.emoji ? `${group.emoji} ` : ''}
-                    {group.name}
-                  </option>
-                ))}
-              <option value={UNGROUPED_GROUP_ID}>未分组</option>
-            </select>
+              <SelectTrigger className="w-full" size="sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectPopup>
+                <SelectItem value={ALL_GROUP_ID}>全部</SelectItem>
+                {groups
+                  .slice()
+                  .sort((a, b) => a.order - b.order)
+                  .map((group) => (
+                    <SelectItem key={group.id} value={group.id}>
+                      {group.emoji ? `${group.emoji} ` : ''}
+                      {group.name}
+                    </SelectItem>
+                  ))}
+                <SelectItem value={UNGROUPED_GROUP_ID}>未分组</SelectItem>
+              </SelectPopup>
+            </Select>
           </div>
         )}
 
@@ -268,6 +300,25 @@ export function SessionDrawer({
             <p className="rounded-lg border border-dashed px-3 py-6 text-center text-muted-foreground text-sm">
               桌面端还没有项目
             </p>
+          )}
+
+          {activeSessions.length > 0 && (
+            <div>
+              <div className="flex items-center gap-1.5 px-2 py-2">
+                <span className="font-medium text-sm">活跃中</span>
+              </div>
+              <div className="flex flex-col gap-y-0.5">
+                {activeSessions.map((session) => (
+                  <SessionRow
+                    key={session.id}
+                    session={session}
+                    active={activeId === session.id}
+                    nowTick={nowTick}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </div>
+            </div>
           )}
 
           {pinnedSessions.length > 0 && (
@@ -339,7 +390,7 @@ export function SessionDrawer({
             ) : (
               <ProjectGroup
                 key={item.project.id}
-                name={item.project.name}
+                name={pairProjectDisplayName(item.project)}
                 badge={sshProjectLabel(item.project)}
                 sessions={orderProjectSessions(
                   active.filter((c) => c.projectId === item.project.id)
@@ -393,7 +444,10 @@ export function SessionDrawer({
                     session={session}
                     active={activeId === session.id}
                     nowTick={nowTick}
-                    subtitle={projects.find((p) => p.id === session.projectId)?.name}
+                    subtitle={(() => {
+                      const project = projects.find((p) => p.id === session.projectId);
+                      return project ? pairProjectDisplayName(project) : undefined;
+                    })()}
                     onSelect={onSelect}
                   />
                 ))}
@@ -594,6 +648,7 @@ function SessionRow({
       )}
     >
       <StatusDot status={session.status} unread={session.unread} />
+      {session.pinned && <Pin className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />}
       <span className="min-w-0 flex-1 truncate">
         {session.title || '新对话'}
         {subtitle && <span className="ml-1.5 text-[10px] text-muted-foreground">{subtitle}</span>}

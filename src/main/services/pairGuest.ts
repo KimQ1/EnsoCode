@@ -57,12 +57,16 @@ interface Connection {
   /** renderer 最后一次订阅：切通道 resync 时原样重发（游标偏旧只会多重放，按 index 幂等） */
   lastSubscribe: PhoneToHost | null;
   hostOnline: boolean;
+  /** 当前业务通道 RTT（ms）；切通道时清空 */
+  rttMs: number | null;
   hostname?: string;
   appVersion?: string;
   attempt: number;
   timer: NodeJS.Timeout | null;
   closed: boolean;
   generation: number;
+  probeNonce: number;
+  probeSentAt: number | null;
 }
 
 const connections = new Map<string, Connection>();
@@ -97,6 +101,7 @@ export function getNodesStatus(): NodesStatus {
         connected: conn?.ws?.readyState === 1,
         hostOnline: conn?.hostOnline ?? false,
         transport: conn?.direct.transport() ?? 'relay',
+        ...(conn?.hostOnline && conn.rttMs != null ? { rttMs: conn.rttMs } : {}),
         ...(conn?.hostname ? { hostname: conn.hostname } : {}),
         ...(conn?.appVersion ? { appVersion: conn.appVersion } : {}),
       };
@@ -138,7 +143,7 @@ function reviveAll(reason: 'resume' | 'network-change'): void {
   for (const conn of connections.values()) {
     if (conn.closed) continue;
     if (reason === 'network-change') conn.direct.networkChange();
-    if (shouldReplaceOnNudge(reason, conn.ws !== null)) {
+    if (shouldReplaceOnNudge(reason, conn.ws !== null, conn.ws?.readyState ?? null)) {
       if (conn.timer) clearTimeout(conn.timer);
       conn.attempt = 0;
       if (conn.ws) {
@@ -267,10 +272,13 @@ function openConnection(node: RemoteNode): void {
     direct: null as unknown as DirectLink,
     lastSubscribe: null,
     hostOnline: false,
+    rttMs: null,
     attempt: 0,
     timer: null,
     closed: false,
     generation: 0,
+    probeNonce: 0,
+    probeSentAt: null,
   };
   conn.direct = new DirectLink({
     role: 'guest',
@@ -278,13 +286,25 @@ function openConnection(node: RemoteNode): void {
     factory: PAIR_DIRECT_ENABLED && isDirectPeerAvailable() ? mainDirectPeerFactory : null,
     sendSignal: (signal) => void sendViaRelay(conn, signal as PhoneToHost),
     onFrame: (frame) => void handleFrame(conn, frame),
-    onTransportChange: () => notifyStatus(),
+    onTransportChange: () => {
+      conn.rttMs = null;
+      notifyStatus();
+    },
+    onRtt: (ms) => {
+      conn.rttMs = ms;
+      notifyStatus();
+    },
     // 切通道瞬间旧通道在途帧可能丢：重要目录 + 重发订阅（renderer 不感知通道切换，由 main 代补）
     onResync: () => {
       void sendFrame(conn, { type: 'snapshot' });
       if (conn.lastSubscribe) void sendFrame(conn, conn.lastSubscribe);
     },
     onDiagnostic: (line) => console.log(`[nodes] ${conn.node.label}: ${line}`),
+    onNeedRelayProbe: () => {
+      conn.probeNonce = (conn.probeNonce + 1) >>> 0;
+      conn.probeSentAt = Date.now();
+      void sendViaRelay(conn, { type: 'probe', nonce: conn.probeNonce });
+    },
   });
   connections.set(node.nodeId, conn);
   connect(conn);
@@ -329,12 +349,21 @@ function attachGuestSocket(conn: Connection, ws: WebSocket, generation: number):
     notifyStatus();
     scheduleReconnect(conn);
   };
-  conn.heartbeat = attachHeartbeat(ws, () => {
-    try {
-      ws.close();
-    } catch {}
-    closed(null);
-  });
+  conn.heartbeat = attachHeartbeat(
+    ws,
+    () => {
+      try {
+        ws.close();
+      } catch {}
+      closed(null);
+    },
+    (ms) => {
+      if (conn.direct.transport() === 'relay') {
+        conn.rttMs = ms;
+        notifyStatus();
+      }
+    }
+  );
 
   ws.onopen = () => {
     conn.attempt = 0;
@@ -421,6 +450,12 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
     case 'direct-answer':
     case 'direct-ice':
       conn.direct.handleSignal(payload);
+      return;
+    case 'probe-ack':
+      if (payload.nonce === conn.probeNonce && conn.probeSentAt !== null) {
+        conn.direct.noteRelayRtt(Date.now() - conn.probeSentAt);
+        conn.probeSentAt = null;
+      }
       return;
     // 桌面保留自己的主题；桌面没有 Web Push
     case 'appearance':

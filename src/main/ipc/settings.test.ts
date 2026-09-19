@@ -48,6 +48,27 @@ afterAll(async () => {
 });
 
 describe('settings广播策略', () => {
+  it('设置白名单同时保留 canonical editMode 与只读迁移用旧字段', async () => {
+    const { CONFIG_SYNC_COMMIT_FIELDS, SETTINGS_STATE_FIELDS } = await import('./settings');
+    expect(SETTINGS_STATE_FIELDS).toContain('editMode');
+    expect(SETTINGS_STATE_FIELDS).toContain('hashlineEditEnabled');
+    expect(CONFIG_SYNC_COMMIT_FIELDS).toContain('editMode');
+    expect(CONFIG_SYNC_COMMIT_FIELDS).not.toContain('hashlineEditEnabled');
+  });
+
+  it('旧字段写请求收敛到 canonical mode，不形成双状态', async () => {
+    const { patchSettingsState, readSettings } = await import('./settings');
+    expect(patchSettingsState('hashlineEditEnabled', true)).toMatchObject({
+      ok: true,
+      value: 'apply_patch',
+    });
+    const persisted = readSettings()?.['enso-settings'] as
+      | { state?: Record<string, unknown> }
+      | undefined;
+    expect(persisted?.state).toMatchObject({ editMode: 'apply_patch' });
+    expect(persisted?.state).not.toHaveProperty('hashlineEditEnabled');
+  });
+
   it('Gateway写广播全部renderer，包含发起窗口', async () => {
     const { patchSettingsState } = await import('./settings');
     const [owner] = mocks.windows;
@@ -72,5 +93,19 @@ describe('settings广播策略', () => {
 
     expect(mocks.sends[0]).not.toHaveBeenCalled();
     expect(mocks.sends[1]).toHaveBeenCalledWith(IPC_CHANNELS.SETTINGS_CHANGED);
+  });
+
+  it('托盘休眠策略写入不会清掉更新后回托盘标记', async () => {
+    const {
+      consumeTrayReenterAfterUpdate,
+      readTraySleepPolicy,
+      writeTrayReenterAfterUpdate,
+      writeTraySleepPolicy,
+    } = await import('./settings');
+    expect(writeTrayReenterAfterUpdate(true)).toBe(true);
+    expect(writeTraySleepPolicy('never')).toBe(true);
+    expect(readTraySleepPolicy()).toBe('never');
+    expect(consumeTrayReenterAfterUpdate()).toBe(true);
+    expect(consumeTrayReenterAfterUpdate()).toBe(false);
   });
 });

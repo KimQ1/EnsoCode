@@ -39,6 +39,9 @@ export const zhTranslations: Record<string, string> = {
   'Restart to update': '重启更新',
   'Automatic updates': '自动更新',
   'Download and install updates automatically': '自动下载并安装更新',
+  'Restart and apply when idle': '空闲时重启并应用更新',
+  'After the update is downloaded, restart automatically if no agent is running, nothing is queued, and there are no pending questions or approvals. The idle state must last 5 minutes, and a focused window also blocks it.':
+    '更新下载完成后，没有 agent 在跑、没有排队消息、也没有待回答/待审批时自动重启。该状态需连续保持 5 分钟；窗口在前台时也会拦住。',
   'Network proxy': '网络代理',
   'Used by model requests, the built-in browser, and agent tools':
     '作用于模型请求、内嵌浏览器和 agent 工具',
@@ -70,6 +73,7 @@ export const zhTranslations: Record<string, string> = {
   'No matching conversations': '没有匹配的会话',
   'Search messages...': '搜索消息...',
   'Only when the chat input is focused': '仅在输入框聚焦时生效',
+  'Send message': '发送消息',
   'Next coworker tab': '下一个 coworker 标签',
   'Previous coworker tab': '上一个 coworker 标签',
   'Press shortcut…': '按下新快捷键…',
@@ -145,11 +149,16 @@ export const zhTranslations: Record<string, string> = {
   'Open in side panel': '在侧栏打开',
   'Compact read-only tool calls': '精简只读工具调用',
   'Expand file edits while running': '运行中自动展开文件改动',
-  'Automatically unfold the diff or written content of edit/write calls while the agent is still running':
-    'agent 运行中，edit/write 调用的 diff 或写入内容自动展开',
-  'Verified smart compaction': '验证式智能压缩',
-  'Use Enso verified summary for long-session compact. Falls back to default compact on failure. May be slower and use more tokens. Takes effect on the next session.':
-    'Enso 自有验证式摘要做长会话 compact。失败回退默认压缩。可能更慢、更费 token。下一个会话生效。',
+  'Automatically unfold diffs or written content from file modification tools while the agent is still running':
+    'agent 运行中，文件修改工具的 diff 或写入内容自动展开',
+  'Context compaction strategy': '上下文压缩策略',
+  'Standard uses default compact. Smart compaction uses Enso verified summary at compact time. Continuous memory records observations in the background so compact keeps more context; both fall back to default compact on failure and take effect on the next session.':
+    '标准使用默认压缩。智能压缩在压缩时用 Enso 验证式摘要。持续记忆在后台持续记录观察，压缩时保留更多上下文；两者失败都回退默认压缩，下一个会话生效。',
+  Standard: '标准',
+  'Smart compaction': '智能压缩',
+  'Continuous memory (experimental)': '持续记忆（实验性）',
+  'Summary model': '摘要模型',
+  'Background memory model': '后台记忆模型',
   'Compaction mode': '压缩档位',
   'Auto (by usage)': '自动（按占用）',
   Fast: '快速',
@@ -321,7 +330,9 @@ export const zhTranslations: Record<string, string> = {
   'Connection failed': '连接失败',
   Cancel: '取消',
   'Confirm exit': '确认退出',
-  'Are you sure you want to exit the app?': '确定要退出应用吗？',
+  'Exit closes the app completely, so your phone can no longer connect. Minimize to tray keeps the app running in the background so your phone can still connect.':
+    '退出会完全关闭应用，手机将无法连接。最小化到托盘后应用会在后台继续运行，手机仍可连接。',
+  'Minimize to tray': '最小化到托盘',
   Exit: '退出',
   // Unified provider setup, default model, and Enso
   'Add a provider subscription or API Key, or import providers from local AI apps':
@@ -352,12 +363,17 @@ export const zhTranslations: Record<string, string> = {
   Local: '本地',
   'Default model': '默认模型',
   'Used for new conversations.': '用于普通新对话。',
+  'Follow last selection': '跟随最后一次选择',
+  'New conversations use the last model you picked.': '新对话使用你上次选择的模型。',
   'Used for new conversations in this project.': '用于本项目的新对话。',
   'Used for new conversations in this group.': '用于本组的新对话。',
   'Project settings': '项目设置',
   'Default model for {{name}}': '{{name}} 的默认模型',
   'Follows group, then global default': '跟随分组默认，再跟随全局默认',
   'Follows the global default': '跟随全局默认',
+  'Follow global built-in tools': '跟随全局内置工具',
+  'When off, configure built-in tools for this project. They override the global setting on the next session.':
+    '关闭后可为本项目单独配置内置工具，优先级高于全局，下次会话生效。',
   'Session choice overrides the project default.': '会话里手动选的模型优先于项目默认。',
   'Conversation title summary': '会话标题总结',
   'Generate a short AI title from the first message of a new conversation.':
@@ -391,6 +407,7 @@ export const zhTranslations: Record<string, string> = {
   Agents: 'Agent',
   File: '文件',
   Files: '文件',
+  Folder: '文件夹',
   'Open a file from the tree.': '从左侧树打开文件。',
   'This file is too large to open in the editor.': '文件太大，无法在编辑器中打开。',
   'This file changed on disk.': '磁盘上的文件已更改。',
@@ -449,6 +466,8 @@ export const zhTranslations: Record<string, string> = {
   Failed: '失败',
   succeeded: '已成功',
   denied: '已拒绝',
+  running: '进行中',
+  done: '已完成',
   failed: '失败',
   unavailable: '不可用',
   cancelled: '已取消',
@@ -817,6 +836,8 @@ export const zhTranslations: Record<string, string> = {
   'Working tree clean': '工作区干净',
   '{{n}} unmerged commits': '{{n}} 个未合并提交',
   'Isolated worktree · uncommitted changes': '隔离 worktree · 有未提交改动',
+  '{{n}} browsers': '{{n}} 个浏览器',
+  '{{n}} terminals': '{{n}} 个终端',
   'Isolated worktree · {{n}} unmerged commits': '隔离 worktree · {{n}} 个未合并提交',
   'Isolated worktree is missing': '隔离 worktree 已丢失',
   'The worktree of this session was deleted. Rebuild it from branch "{{branch}}" (committed work is preserved), or fall back to the main working tree.':
@@ -827,6 +848,9 @@ export const zhTranslations: Record<string, string> = {
   'Remove project': '移除项目',
   'Archive project': '归档项目',
   'Unarchive project': '恢复项目',
+  'Pin project': '置顶项目',
+  'Unpin project': '取消置顶项目',
+  'Pinned projects': '置顶项目',
   'Select or create a conversation': '选择或新建一个对话',
   'Collapse sidebar': '折叠侧边栏',
   'Show {{n}} more': '展开其余 {{n}} 条',
@@ -838,6 +862,7 @@ export const zhTranslations: Record<string, string> = {
   'Type an answer…': '输入回答…',
   'Message will queue until this round finishes…': '消息将排队,本轮结束后发送…',
   Queued: '排队',
+  attachments: '个附件',
   Edit: '编辑',
   'Send now': '立即发送',
   'Interrupt and send now': '打断并立即发送',
@@ -867,7 +892,7 @@ export const zhTranslations: Record<string, string> = {
   'Downloading…': '下载中…',
   'Semantic search stays off until the model is on disk.': '模型落盘前语义检索不会生效。',
   Download: '下载',
-  'Embedding provider': '嵌入服务商',
+  'Remote model': '远程模型',
   'Credentials stay in the main process and are never sent to the renderer.':
     '凭证只留在主进程,不会下发到渲染层。',
   'Unload automatically when idle': '空闲自动卸载',
@@ -1047,6 +1072,11 @@ export const zhTranslations: Record<string, string> = {
     '验证式压缩完成（压缩前 {{tokens}} tokens）',
   'Verified summary from smart compaction. Messages above are no longer in the model context.':
     '这次用了验证式摘要。此线之上的历史已不在模型上下文中。',
+  'Memory context compacted': '持续记忆压缩完成',
+  'Memory context compacted ({{tokens}} tokens before)':
+    '持续记忆压缩完成（压缩前 {{tokens}} tokens）',
+  'Summary rendered from continuous memory. Messages above are no longer in the model context; use recall for sources.':
+    '这次由持续记忆直接渲染摘要。此线之上的历史已不在模型上下文中，可用 recall 查看来源。',
   'Messages above are no longer in the model context; only this summary is.':
     '以上消息已不在模型上下文中，模型只看到这份摘要。',
   'Latest compaction summary — expand to read what the model kept.':
@@ -1122,6 +1152,7 @@ export const zhTranslations: Record<string, string> = {
   'All tools (bash/edit/write)': '全部工具(bash/edit/write)',
   'Read-only (read/grep/find/ls)': '只读(read/grep/find/ls)',
   Stop: '停止',
+  'Attach image': '添加图片',
   'Stop task': '停止任务',
   'Stop subagent': '停止子代理',
   'Dismiss coworker': '解雇 coworker',
@@ -1136,6 +1167,7 @@ export const zhTranslations: Record<string, string> = {
   waiting: '等待中',
   blocked: '受阻',
   completed: '已完成',
+  aborted: '已中止',
   'Goal completed': '目标完成',
   'Goal blocked': '目标受阻',
   'Goal waiting': '目标等待中',
@@ -1148,6 +1180,13 @@ export const zhTranslations: Record<string, string> = {
   Hire: '雇佣',
   'Dismiss this coworker? Its session will be closed.': '解雇这个 coworker?其会话将被关闭。',
   Output: '输出',
+  Assistant: '助手输出',
+  Arguments: '参数',
+  Result: '结果',
+  'Final report': '最终报告',
+  '{{count}} chars': '{{count}} 字符',
+  'Earlier activity details were cleared; the final report is still available.':
+    '较早的过程详情已清理，最终报告仍然保留。',
   '(no output yet)': '(暂无输出)',
   Deny: '拒绝',
   Allow: '允许',
@@ -1172,6 +1211,7 @@ export const zhTranslations: Record<string, string> = {
   'No conversations yet': '暂无对话',
   'Preparing session…': '正在读取历史…',
   'Loading earlier messages…': '加载更早的消息…',
+  'Load earlier messages': '加载更早的消息',
   'Beginning of conversation': '已到对话开头',
   'Retry resume': '重新恢复',
   Todos: '任务清单',
@@ -1241,14 +1281,15 @@ export const zhTranslations: Record<string, string> = {
   'Explore fold': '探后折叠',
   'Let the agent mark exploratory reads and keep only a short report in later model context. Timeline stays intact.':
     '让模型在探仓库前打点，探完只把报告留在后续模型上下文里；时间线仍完整。',
-  'Force read/find tools': '强制走 read/find 工具',
-  'Block cat/head/grep/sed -i in the shell and require the dedicated file tools. Off by default. Takes effect on the next session.':
-    '拦截 shell 里的 cat/head/grep/sed -i，要求改用专用文件工具。默认关。下次开会话生效。',
-  'Hashline edit': 'Hashline 编辑',
-  'Line-anchored read/edit with snapshot tags. Off by default. Takes effect on the next session. oldText replace still works when Force read/find is off.':
-    '带快照标签的行锚点 read/edit。默认关。下次开会话生效。未开强制 read/find 时仍可用 oldText 替换。',
-  'Also turn on Force read/find tools so the model uses tagged read more often. Edit still accepts oldText replace either way.':
-    '建议同时打开强制走 read/find 工具，模型会更多用带标签的 read。无论是否打开，edit 仍接受 oldText 替换。',
+  'File edit mode': '文件编辑模式',
+  'Choose how files are modified. Apply patch is the default. New and cold-restored sessions use this mode; already warm sessions keep their current mode.':
+    '选择文件修改方式。默认为应用补丁。新建和冷恢复的会话使用此模式；已在内存中的会话保持原模式。',
+  'Text replacement': '文本替换',
+  'Apply patch': '应用补丁',
+  'Apply patch (default)': '应用补丁（默认）',
+  'Truncated preview': '截断预览',
+  'Diff unavailable because the original snapshot was truncated.':
+    '原始快照已截断，无法显示完整差异。',
   'Load project harness assets': '加载项目内其它工具目录',
   'Also load skills from .claude/.codex/.cursor and rule files (.cursorrules, .cursor/rules, .claude/rules) in the project':
     '同时加载项目内 .claude/.codex/.cursor 下的 skills，以及规则文件（.cursorrules、.cursor/rules、.claude/rules）',
@@ -1485,6 +1526,14 @@ export const zhTranslations: Record<string, string> = {
     '请重新打开设置，以在此窗口载入导入后的配置。',
   'Import complete': '导入完成',
   'Backup of previous settings:': '之前设置的备份位置：',
+  Btw: '旁路',
+  Contextual: '带上下文',
+  Tangent: '独立旁路',
+  'Insert into chat': '填入主输入框',
+  'Ask aside…': '旁路提问…',
+  'Ask a side question without sending it to the main agent.': '旁路提问，不会发给主 agent。',
+  'New Btw tab': '新建旁路标签',
+  'Open a Btw tab in the side panel': '在右侧栏打开旁路对话',
 };
 
 export function normalizeLocale(input?: string): Locale {

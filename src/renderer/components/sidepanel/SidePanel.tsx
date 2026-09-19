@@ -13,6 +13,7 @@ import {
   GitCompare,
   Globe,
   Maximize2,
+  MessageCircle,
   Minimize2,
   Plus,
   SquareTerminal,
@@ -28,12 +29,19 @@ import {
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu';
 import { useI18n } from '@/i18n';
 import { easeOutLayout, springStandard } from '@/lib/motion';
-import { addSidePanelBrowser, bindSidePanelDock, closeSidePanelBrowser } from '@/lib/sidePanelDock';
+import {
+  addSidePanelBrowser,
+  bindSidePanelDock,
+  closeSidePanelBrowser,
+  disposeConversationResources,
+} from '@/lib/sidePanelDock';
 import { releaseTerminal } from '@/lib/terminalRegistry';
 import { cn } from '@/lib/utils';
 import { useSessionsStore } from '@/stores/sessions';
 import { useSidePanelStore } from '@/stores/sidePanel';
+import { sanitizeSidePanelLayout } from '@/stores/sidePanel/layoutSanitize';
 import { BrowserView } from './BrowserView';
+import { BtwView } from './BtwView';
 import { ChangesView } from './ChangesView';
 import { FilesView } from './FilesView';
 import { shouldSkipSidePanelWidthAnim } from './sidePanelWidthAnim';
@@ -127,6 +135,27 @@ function FilesPanel(props: IDockviewPanelProps<{ conversationId?: string; projec
   return <FilesView conversationId={conversationId} projectId={projectId} />;
 }
 
+function addBtwPanel(
+  api: DockviewApi,
+  conversationId: string | undefined,
+  projectId: string | undefined,
+  label: string
+): void {
+  const count = api.panels.filter((panel) => panel.id.startsWith('btw:')).length;
+  api.addPanel({
+    id: `btw:${crypto.randomUUID()}`,
+    component: 'btw',
+    title: count === 0 ? label : `${label} ${count + 1}`,
+    params: { conversationId, projectId },
+  });
+}
+
+function BtwPanel(props: IDockviewPanelProps<{ conversationId?: string; projectId?: string }>) {
+  const { conversationId } = props.params;
+  if (!conversationId) return null;
+  return <BtwView conversationId={conversationId} panelApi={props.api} />;
+}
+
 function addBrowserPanel(
   api: DockviewApi,
   conversationId: string | undefined,
@@ -201,6 +230,8 @@ function SidePanelTab(props: IDockviewPanelHeaderProps<{ favicon?: string | null
         <GitCompare className="h-3 w-3 shrink-0" />
       ) : props.api.id === 'files' ? (
         <FolderOpen className="h-3 w-3 shrink-0" />
+      ) : props.api.id.startsWith('btw:') ? (
+        <MessageCircle className="h-3 w-3 shrink-0" />
       ) : isBrowser && favicon && !faviconBroken ? (
         <img
           src={favicon}
@@ -253,12 +284,14 @@ function NewTabMenu({
   onNewChanges,
   onNewFiles,
   onNewBrowser,
+  onNewBtw,
   compact,
 }: {
   onNewTerminal: () => void;
   onNewChanges: () => void;
   onNewFiles: () => void;
   onNewBrowser: () => void;
+  onNewBtw: () => void;
   compact?: boolean;
 }) {
   const { t } = useI18n();
@@ -292,6 +325,10 @@ function NewTabMenu({
         <MenuItem onClick={onNewBrowser}>
           <Globe className="h-4 w-4" />
           {t('Browser')}
+        </MenuItem>
+        <MenuItem onClick={onNewBtw}>
+          <MessageCircle className="h-4 w-4" />
+          {t('Btw')}
         </MenuItem>
       </MenuPopup>
     </Menu>
@@ -338,6 +375,20 @@ function SidePanelHeaderActions({
         onNewChanges={() => addChangesPanel(containerApi, conversationId, projectId, t('Changes'))}
         onNewFiles={() => addFilesPanel(containerApi, conversationId, projectId, t('Files'))}
         onNewBrowser={() => addBrowserPanel(containerApi, conversationId, projectId, t('Browser'))}
+        onNewBtw={() => {
+          if (group) {
+            const count = containerApi.panels.filter((panel) => panel.id.startsWith('btw:')).length;
+            containerApi.addPanel({
+              id: `btw:${crypto.randomUUID()}`,
+              component: 'btw',
+              title: count === 0 ? t('Btw') : `${t('Btw')} ${count + 1}`,
+              params: { conversationId, projectId },
+              position: { referenceGroup: group },
+            });
+            return;
+          }
+          addBtwPanel(containerApi, conversationId, projectId, t('Btw'));
+        }}
       />
     </div>
   );
@@ -369,6 +420,7 @@ function Watermark(props: IWatermarkPanelProps) {
           onNewBrowser={() =>
             addBrowserPanel(props.containerApi, conversationId, projectId, t('Browser'))
           }
+          onNewBtw={() => addBtwPanel(props.containerApi, conversationId, projectId, t('Btw'))}
         />
       </div>
     </div>
@@ -385,6 +437,7 @@ const DOCK_COMPONENTS = {
   changes: ChangesPanel,
   files: FilesPanel,
   browser: BrowserPanel,
+  btw: BtwPanel,
 };
 
 /** 跟随应用暗色模式(applyAppTheme 切换 documentElement 的 dark class) */
@@ -398,6 +451,22 @@ function useIsDark(): boolean {
     return () => observer.disconnect();
   }, []);
   return isDark;
+}
+
+function MountedConversationDock({
+  conversationId,
+  hidden,
+}: {
+  conversationId: string;
+  hidden: boolean;
+}) {
+  const projectId = useSessionsStore((s) => s.conversations[conversationId]?.projectId);
+  if (!projectId) return null;
+  return (
+    <div className={cn('absolute inset-0', hidden && 'hidden')}>
+      <ConversationDock conversationId={conversationId} projectId={projectId} />
+    </div>
+  );
 }
 
 function ConversationDock({
@@ -415,21 +484,31 @@ function ConversationDock({
       (window as unknown as Record<string, unknown>).__dockviewApi = event.api;
     }
     const saved = useSidePanelStore.getState().layouts[conversationId];
-    if (saved) {
+    const layout = sanitizeSidePanelLayout(saved, new Set(Object.keys(DOCK_COMPONENTS)));
+    let ignoreEmptySave = Boolean(saved) && !layout;
+    if (layout) {
       try {
-        event.api.fromJSON(saved);
+        event.api.fromJSON(layout);
       } catch {
-        // 布局与当前版本不兼容:从空态开始
+        // 布局与当前版本不兼容:从空态开始，且不要把空 dock 写回把旧布局盖掉
+        ignoreEmptySave = true;
       }
     }
     event.api.onDidLayoutChange(() => {
-      useSidePanelStore.getState().saveLayout(conversationId, event.api.toJSON());
+      const json = event.api.toJSON();
+      if (ignoreEmptySave && Object.keys(json.panels ?? {}).length === 0) return;
+      ignoreEmptySave = false;
+      useSidePanelStore.getState().saveLayout(conversationId, json);
     });
     // 只有用户关 tab 才回收;dock 本身不随切会话卸载
     event.api.onDidRemovePanel((panel) => {
       if (panel.id === 'changes' || panel.id === 'files') return;
       if (panel.id === 'browser' || panel.id.startsWith('browser:')) {
         void window.electronAPI.browser.closeTab(panel.id);
+        return;
+      }
+      if (panel.id.startsWith('btw:')) {
+        void useSessionsStore.getState().disposeBtwConversation(panel.id.slice(4));
         return;
       }
       releaseTerminal(panel.id);
@@ -476,18 +555,29 @@ export function SidePanel({ width, resizing = false }: { width: number; resizing
       stopClosed();
     };
   }, []);
-  const conversation = useSessionsStore((s) => (s.activeId ? s.conversations[s.activeId] : null));
-  const conversations = useSessionsStore((s) => s.conversations);
+  useEffect(
+    () =>
+      useSessionsStore.subscribe((state, prev) => {
+        for (const id of Object.keys(prev.conversations)) {
+          if (!state.conversations[id]) disposeConversationResources(id);
+        }
+      }),
+    []
+  );
+  const conversationId = useSessionsStore((s) => s.activeId);
   const [mountedIds, setMountedIds] = useState<string[]>([]);
+  const visibleKey = useSessionsStore((s) =>
+    mountedIds.filter((id) => Boolean(s.conversations[id])).join('\n')
+  );
   const [cover, setCover] = useState(fullscreen);
   const [workspaceW, setWorkspaceW] = useState(0);
   const asideRef = useRef<HTMLElement>(null);
   const [widthAnim, setWidthAnim] = useState({
-    id: conversation?.id,
-    from: conversation?.id,
+    id: conversationId,
+    from: conversationId,
   });
-  if (conversation?.id !== widthAnim.id) {
-    setWidthAnim({ id: conversation?.id, from: widthAnim.id });
+  if (conversationId !== widthAnim.id) {
+    setWidthAnim({ id: conversationId, from: widthAnim.id });
   }
   if (fullscreen && !cover) setCover(true);
   useEffect(() => {
@@ -511,17 +601,17 @@ export function SidePanel({ width, resizing = false }: { width: number; resizing
    * 全屏 cover 态 aside 本身是实底，内容照常铺满。border-l 占 1px，内容按 content-box 扣掉。
    */
   const contentW = cover ? undefined : Math.max(0, width - (open ? 1 : 0));
-  const activeId = conversation?.id;
+  const activeId = conversationId;
   const skipWidthAnim = shouldSkipSidePanelWidthAnim({
     resizing,
-    conversationId: widthAnim.id,
-    previousConversationId: widthAnim.from,
+    conversationId: widthAnim.id ?? undefined,
+    previousConversationId: widthAnim.from ?? undefined,
   });
   const targetW = fullscreen ? workspaceW || width : open ? width : 0;
   if (activeId && !mountedIds.includes(activeId)) {
     setMountedIds((ids) => (ids.includes(activeId) ? ids : [...ids, activeId]));
   }
-  const visibleIds = mountedIds.filter((id) => conversations[id]);
+  const visibleIds = visibleKey === '' ? [] : visibleKey.split('\n');
 
   return (
     <>
@@ -562,14 +652,9 @@ export function SidePanel({ width, resizing = false }: { width: number; resizing
         >
           {visibleIds.length > 0 ? (
             <div className="relative min-h-0 flex-1">
-              {visibleIds.map((id) => {
-                const conv = conversations[id];
-                return (
-                  <div key={id} className={cn('absolute inset-0', id !== activeId && 'hidden')}>
-                    <ConversationDock conversationId={id} projectId={conv.projectId} />
-                  </div>
-                );
-              })}
+              {visibleIds.map((id) => (
+                <MountedConversationDock key={id} conversationId={id} hidden={id !== activeId} />
+              ))}
             </div>
           ) : (
             <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">

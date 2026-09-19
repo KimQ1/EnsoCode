@@ -14,6 +14,7 @@ import {
   type HostToPhone,
   openFrame,
   type PairedDevice,
+  type PairSyncCursor,
   type ProjectEntry,
   type ProjectGroupEntry,
   type ProviderEntry,
@@ -29,8 +30,13 @@ import {
 import {
   catalogSyncFingerprint,
   channelsForMetaPush,
+  forgetGuestSyncMeta,
+  mergeStableMeta,
   type PairMetaFingerprints,
   pairJsonFingerprint,
+  providersSyncFingerprint,
+  rememberStableMeta,
+  shouldEmitProviders,
   shouldRelayPairSnapshot,
   slimCatalogForPhone,
   slimProjectsForPhone,
@@ -48,13 +54,14 @@ import type {
   PairStatus,
 } from '@shared/types/pair';
 import { app, powerMonitor, powerSaveBlocker } from 'electron';
+import { readTraySleepPolicy } from '../ipc/settings';
 // 会话命令一律走 agentBridge（身份解析留在 ipc/agent.ts），这里只留无需身份的 snapshot。
 import { requestSnapshot, setPinnedSessions } from './agentHost';
 import { MacosSystemSleepAssertion } from './macosSystemSleepAssertion';
 import { readNotifyMainAgentOnly } from './notifications';
 import { PAIR_DIRECT_ENABLED, PAIR_STUN_SERVERS } from './pairDirectConfig';
 import { isDirectPeerAvailable, mainDirectPeerFactory, preloadDirectPeer } from './pairDirectPeer';
-import { bumpPairMetaEpoch, flushChangedMeta, requestPairMeta } from './pairMetaFlush';
+import { flushChangedMeta, requestPairMeta } from './pairMetaFlush';
 import { startPairNetworkWatch } from './pairNetworkWatch';
 import {
   checkSetModel,
@@ -68,6 +75,7 @@ import {
 import { applyPairPowerTaskEvent, shouldHoldPairPowerKeepAlive } from './pairPowerKeepAlive';
 import { seedRelayHostCache } from './pairRelayLookup';
 import { openPairRelayWebSocket } from './pairRelayOpen';
+import { PairReplayLog } from './pairReplay';
 import {
   isSecureStorageAvailable,
   loadDevices,
@@ -100,6 +108,7 @@ export interface PairStatusDevice {
   connected: boolean;
   phoneOnline: boolean;
   transport?: 'relay' | 'direct';
+  rttMs?: number;
 }
 
 interface Connection {
@@ -116,21 +125,41 @@ interface Connection {
   pendingHistory?: number;
   /** 手机 subscribe 已点名会话快照；桌面自发 snapshot 不转 */
   pendingSnapshot?: boolean;
+  pendingSync?: {
+    sessionId: string;
+    requestId: string;
+    revision: number;
+    answered?: boolean;
+  };
+  syncRevision: number;
+  syncLiveRevision?: number;
+  /** 该连接用过 session-sync；之后 live 事件带 cursor，不受 pendingSync 应答影响 */
+  syncCapable?: boolean;
   /** 已下发 meta 各通道指纹；相同内容不重发 */
   sentMeta?: PairMetaFingerprints;
   metaDirty: boolean;
   metaSending: boolean;
   metaEpoch?: number;
+  providersSentFp?: string;
+  providersSentAt?: number;
   phoneOnline: boolean;
+  /** 当前业务通道 RTT（ms）；切通道时清空 */
+  rttMs: number | null;
   /** 手机页面可见性（presence 帧上报）：锁屏/切后台时 socket 半开不会 close，推送据此门控 */
   phoneVisible: boolean;
   attempt: number;
   timer: NodeJS.Timeout | null;
   closed: boolean;
   generation: number;
+  ioEpoch: number;
+  receiveQueue: Promise<void>;
+  sendQueue: Promise<void>;
 }
 
 const connections = new Map<string, Connection>();
+const stableMetaByPair = new Map<string, PairMetaFingerprints>();
+const sentProviderFp = new Map<string, string>();
+const replayLog = new PairReplayLog();
 let pairingSession: HostPairSession | null = null;
 let pairingTimer: NodeJS.Timeout | null = null;
 let pairingInviteUri: string | null = null;
@@ -212,13 +241,11 @@ const macosSystemSleepAssertion = new MacosSystemSleepAssertion();
 let runningTaskIds = new Set<string>();
 
 /**
- * 手机在线或任务在跑时阻止 idle 休眠（屏幕仍可熄）。
- * 任务在跑也锁：手机切后台后 socket 常断，不锁会睡死、任务和重连一起没。
+ * 按托盘休眠策略持锁（屏幕仍可熄）。
  * macOS 额外请求 caffeinate -i -s：尝试挡住系统睡 / 合盖睡（插电才有 -s；合盖仍可能被系统强制睡）。
  */
 function syncPowerBlocker(): void {
-  const anyOnline = [...connections.values()].some((c) => c.phoneOnline);
-  const shouldBlock = shouldHoldPairPowerKeepAlive(anyOnline, runningTaskIds.size);
+  const shouldBlock = shouldHoldPairPowerKeepAlive(readTraySleepPolicy(), runningTaskIds.size);
   if (shouldBlock) {
     if (powerBlockerId === null) {
       powerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
@@ -233,8 +260,11 @@ function syncPowerBlocker(): void {
   }
 }
 
+export function refreshPowerKeepAlive(): void {
+  syncPowerBlocker();
+}
+
 function notifyStatus(): void {
-  // phoneOnline 的每次变化都会走到这里，顺带同步休眠锁
   syncPowerBlocker();
   syncPinnedSessions();
   onStatusChange?.();
@@ -263,6 +293,7 @@ function ensureRelayCacheSeeded(): void {
 
 export function startPairHost(): void {
   ensureRelayCacheSeeded();
+  syncPowerBlocker();
   if (!resumeHooked) {
     resumeHooked = true;
     // 睡眠唤醒后 TCP 多半已死但 close 事件不会来：活链立即探测，死链立即重连
@@ -281,7 +312,7 @@ function reviveAll(reason: 'resume' | 'network-change'): void {
   for (const conn of connections.values()) {
     if (conn.closed) continue;
     if (reason === 'network-change') conn.direct.networkChange();
-    if (shouldReplaceOnNudge(reason, conn.ws !== null)) {
+    if (shouldReplaceOnNudge(reason, conn.ws !== null, conn.ws?.readyState ?? null)) {
       if (conn.timer) clearTimeout(conn.timer);
       conn.attempt = 0;
       if (conn.ws) {
@@ -303,6 +334,8 @@ export function stopPairHost(): void {
   cancelPairing();
   for (const conn of connections.values()) {
     conn.closed = true;
+    conn.ioEpoch++;
+    conn.syncRevision++;
     if (conn.timer) clearTimeout(conn.timer);
     conn.heartbeat?.stop();
     conn.heartbeat = null;
@@ -312,6 +345,7 @@ export function stopPairHost(): void {
     } catch {}
   }
   connections.clear();
+  replayLog.invalidateAll();
   syncPowerBlocker();
 }
 
@@ -439,6 +473,7 @@ export function getPairStatus(): PairStatus {
         connected: conn?.ws?.readyState === 1,
         phoneOnline: conn?.phoneOnline ?? false,
         transport: conn?.direct.transport() ?? 'relay',
+        ...(conn?.phoneOnline && conn.rttMs != null ? { rttMs: conn.rttMs } : {}),
       };
     }),
   };
@@ -450,6 +485,8 @@ function openConnection(device: PairedDevice): void {
   const existing = connections.get(device.pairId);
   if (existing) {
     existing.closed = true;
+    existing.ioEpoch++;
+    existing.syncRevision++;
     if (existing.timer) clearTimeout(existing.timer);
     existing.heartbeat?.stop();
     existing.heartbeat = null;
@@ -468,11 +505,16 @@ function openConnection(device: PairedDevice): void {
     metaDirty: false,
     metaSending: false,
     phoneOnline: false,
+    rttMs: null,
     phoneVisible: true,
     attempt: 0,
     timer: null,
     closed: false,
     generation: 0,
+    ioEpoch: 0,
+    syncRevision: 0,
+    receiveQueue: Promise.resolve(),
+    sendQueue: Promise.resolve(),
   };
   conn.direct = new DirectLink({
     role: 'host',
@@ -480,16 +522,21 @@ function openConnection(device: PairedDevice): void {
     iceServers: PAIR_STUN_SERVERS,
     // 信令只走中继：绕过 send() 的出口选择
     sendSignal: (signal) => void sendViaRelay(conn, signal),
-    onFrame: (frame) => void handleFrame(conn, frame),
+    onFrame: (frame) => enqueueFrame(conn, frame, conn.generation, conn.ioEpoch),
     onTransportChange: (transport) => {
+      conn.rttMs = null;
       // 直连掉了且中继也不在：两条路都没了才算离线，转系统推送
       if (transport === 'relay' && conn.ws?.readyState !== 1) conn.phoneOnline = false;
       notifyStatus();
     },
+    onRtt: (ms) => {
+      conn.rttMs = ms;
+      notifyStatus();
+    },
     // 切通道的瞬间旧通道在途帧可能丢：目录类重推，会话正文由手机自己 subscribe 补
     onResync: () => {
-      bumpPairMetaEpoch(conn);
-      requestMeta(conn);
+      // 直连打开不是新进房：catalog 指纹还在就别再打一遍 14kB 瘦目录
+      resyncGuestMeta(conn, false);
     },
     onDiagnostic: (line) => console.log(`[pair] ${device.deviceName}: ${line}`),
   });
@@ -509,6 +556,19 @@ function connect(conn: Connection): void {
     });
 }
 
+function clearConnectionSubscription(conn: Connection): void {
+  conn.ioEpoch++;
+  conn.syncRevision++;
+  conn.receiveQueue = Promise.resolve();
+  conn.sendQueue = Promise.resolve();
+  conn.subscribedId = null;
+  conn.sinceIndex = undefined;
+  conn.pendingSnapshot = undefined;
+  conn.pendingHistory = undefined;
+  conn.pendingSync = undefined;
+  conn.syncLiveRevision = undefined;
+}
+
 function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): void {
   if (conn.closed || conn.generation !== generation) {
     try {
@@ -524,11 +584,15 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
   const closed = (code: number | null): void => {
     if (settled) return;
     settled = true;
+    if (conn.closed || conn.generation !== generation || conn.ws !== ws) return;
     conn.heartbeat?.stop();
     conn.heartbeat = null;
     conn.ws = null;
     // 直连还活着就不算手机离线：业务帧继续走 DataChannel（直连再掉时由 onTransportChange 补置离线）
-    if (conn.direct.transport() !== 'direct') conn.phoneOnline = false;
+    if (conn.direct.transport() !== 'direct') {
+      conn.phoneOnline = false;
+      clearConnectionSubscription(conn);
+    }
     // 1008 = 中继明确告知凭据已失效（解绑时下发，或带失效凭据重连时下发）。
     // 不能只看「连不上」就放弃，那是正常的网络波动，仍需重连。
     if (code === 1008) {
@@ -538,12 +602,21 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
     notifyStatus();
     scheduleReconnect(conn);
   };
-  conn.heartbeat = attachHeartbeat(ws, () => {
-    try {
-      ws.close();
-    } catch {}
-    closed(null);
-  });
+  conn.heartbeat = attachHeartbeat(
+    ws,
+    () => {
+      try {
+        ws.close();
+      } catch {}
+      closed(null);
+    },
+    (ms) => {
+      if (conn.direct.transport() === 'relay') {
+        conn.rttMs = ms;
+        notifyStatus();
+      }
+    }
+  );
 
   ws.onopen = () => {
     conn.attempt = 0;
@@ -551,6 +624,7 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
   };
 
   ws.onmessage = (event) => {
+    if (conn.closed || conn.generation !== generation || conn.ws !== ws) return;
     if (typeof event.data === 'string') {
       // 中继明文控制帧
       try {
@@ -561,17 +635,15 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
           conn.direct.peerOnline(true);
           // 中继重连期间直连一直在用：订阅没断过，不清
           if (conn.direct.transport() !== 'direct') {
-            conn.subscribedId = null;
-            conn.pendingSnapshot = undefined;
-            conn.pendingHistory = undefined;
+            clearConnectionSubscription(conn);
           }
-          bumpPairMetaEpoch(conn);
-          // 手机进房即推目录（它也会发 snapshot，指纹相同则不重发）
-          requestMeta(conn);
+          // 进房重推 catalog；providers 等低频通道按指纹跳过
+          resyncGuestMeta(conn);
           notifyStatus();
         } else if (control.type === 'peer-left') {
           conn.phoneOnline = false;
           conn.direct.peerOnline(false);
+          if (conn.direct.transport() !== 'direct') clearConnectionSubscription(conn);
           notifyStatus();
         } else if (control.type === 'revoked') {
           // 手机端解除了配对：连凭据一起清掉，否则设置页会一直挂着一个连不上的设备
@@ -580,7 +652,7 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
       } catch {}
       return;
     }
-    void handleFrame(conn, new Uint8Array(event.data as ArrayBuffer));
+    enqueueFrame(conn, new Uint8Array(event.data as ArrayBuffer), generation, conn.ioEpoch);
   };
 
   ws.onclose = (event) => closed(event.code);
@@ -594,9 +666,13 @@ function attachHostSocket(conn: Connection, ws: WebSocket, generation: number): 
 
 /** 断开并忘记某台设备（本端解绑与对端解绑共用） */
 function forgetDevice(pairId: string): void {
+  stableMetaByPair.delete(pairId);
+  sentProviderFp.delete(pairId);
   const conn = connections.get(pairId);
   if (conn) {
     conn.closed = true;
+    conn.ioEpoch++;
+    conn.syncRevision++;
     if (conn.timer) clearTimeout(conn.timer);
     conn.heartbeat?.stop();
     conn.heartbeat = null;
@@ -627,19 +703,51 @@ function scheduleReconnect(conn: Connection): void {
 
 // ── 收：解密 + 白名单 + 打进 agentHost ─────────────────────────────────
 
-async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
-  // 收到手机的加密帧即证明它在房间里（控制帧可能因时序丢失）
-  if (!conn.phoneOnline) {
-    conn.phoneOnline = true;
-    bumpPairMetaEpoch(conn);
-    notifyStatus();
-  }
+function connectionCurrent(conn: Connection, generation: number, ioEpoch: number): boolean {
+  return !conn.closed && conn.generation === generation && conn.ioEpoch === ioEpoch;
+}
+
+function enqueueFrame(
+  conn: Connection,
+  frame: Uint8Array,
+  generation: number,
+  ioEpoch: number
+): void {
+  const task = conn.receiveQueue.then(async () => {
+    if (!connectionCurrent(conn, generation, ioEpoch)) return;
+    await handleFrame(conn, frame, generation, ioEpoch);
+  });
+  conn.receiveQueue = task.catch((error) => {
+    console.warn('[pair] receive failed', error);
+  });
+}
+
+function isCurrentSync(conn: Connection, revision: number, sessionId: string): boolean {
+  return (
+    conn.syncRevision === revision &&
+    conn.subscribedId === sessionId &&
+    conn.pendingSync?.revision === revision
+  );
+}
+
+async function handleFrame(
+  conn: Connection,
+  frame: Uint8Array,
+  generation: number,
+  ioEpoch: number
+): Promise<void> {
   let payload: unknown;
   try {
     payload = await openFrame(conn.contentKey, frame);
   } catch {
     console.warn('[pair] frame decrypt failed, dropped');
     return;
+  }
+  if (!connectionCurrent(conn, generation, ioEpoch)) return;
+  // 解密成功才证明当前连接的手机仍在房间里，旧队列不能复活已关闭连接。
+  if (!conn.phoneOnline) {
+    conn.phoneOnline = true;
+    notifyStatus();
   }
   const parsed = parsePhoneCommand(payload);
   if (!parsed.ok) {
@@ -663,27 +771,68 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
     case 'ask-respond':
       agentBridge?.respondAsk(command.sessionId, command.requestId, command.answer);
       break;
-    case 'subscribe':
+    case 'subscribe': {
+      const waiting =
+        Boolean(command.sessionId) &&
+        Boolean(command.sync) &&
+        conn.pendingSync !== undefined &&
+        !conn.pendingSync.answered &&
+        conn.pendingSync.sessionId === command.sessionId;
+      const revision = ++conn.syncRevision;
       conn.subscribedId = command.sessionId;
-      conn.sinceIndex = command.sinceIndex;
+      conn.sinceIndex = command.sync ? undefined : command.sinceIndex;
       // 换了订阅，旧会话的分页请求作废
       conn.pendingHistory = undefined;
-      // 历史会话在 worker 里没有投影，先请渲染层恢复（与桌面点开会话同路径），
-      // 再要快照；已启动的会话 resume 会自行忽略。
-      if (command.sessionId) {
+      conn.pendingSnapshot = undefined;
+      conn.syncLiveRevision = undefined;
+      if (command.sessionId && command.sync) {
+        const sessionId = command.sessionId;
+        const replay = command.sync.cursor
+          ? replayLog.replay(sessionId, command.sync.cursor)
+          : null;
+        conn.syncCapable = true;
+        conn.pendingSync = {
+          sessionId,
+          requestId: command.sync.requestId,
+          revision,
+        };
+        if (replay) {
+          void send(
+            conn,
+            {
+              type: 'session-sync',
+              sessionId,
+              requestId: command.sync.requestId,
+              cursor: replay.cursor,
+              mode: 'replay',
+              fromSeq: replay.fromSeq,
+              events: replay.events,
+            },
+            () => isCurrentSync(conn, revision, sessionId)
+          );
+          conn.pendingSync.answered = true;
+          conn.syncLiveRevision = revision;
+        } else if (!waiting) {
+          onResumeRequest?.(sessionId);
+          requestSnapshot(sessionId);
+        }
+      } else if (command.sessionId) {
+        // 历史会话在 worker 里没有投影，先请渲染层恢复（与桌面点开会话同路径）。
+        conn.pendingSync = undefined;
         conn.pendingSnapshot = true;
         onResumeRequest?.(command.sessionId);
         requestSnapshot(command.sessionId);
       } else {
-        conn.pendingSnapshot = undefined;
+        conn.pendingSync = undefined;
       }
-      // 切换订阅后目录要重裁（cwd/排队只挂当前会话）
+      // 切换订阅后目录要重裁（cwd/排队/目标只挂当前会话）
       requestMeta(conn);
       break;
+    }
     case 'snapshot':
-      // 只要目录/外观；会话正文走 subscribe。强制重发：renderer 重载会丢已推 IPC，清指纹后整包重推。
-      bumpPairMetaEpoch(conn);
-      requestMeta(conn);
+      // 只要目录；会话正文走 subscribe。peer-joined 已经 forget 过 catalog，
+      // 这里再 forget 会把刚发出的 14kB 瘦目录再打一遍。
+      resyncGuestMeta(conn, false);
       break;
     case 'set-model': {
       const check = checkSetModel(command, whitelist);
@@ -704,7 +853,16 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
     case 'queue-update':
     case 'queue-send-now':
     case 'queue-interrupt-send':
-      // 结构已校验；交 renderer 的会话 store（与桌面队列区同一路径）
+    case 'goal-pause':
+    case 'goal-resume':
+    case 'goal-clear':
+    case 'goal-set':
+    case 'compact':
+    case 'rewind':
+    case 'retry':
+    case 'task-stop':
+    case 'subagent-stop':
+      // 结构已校验；交 renderer 的会话 store / electronAPI（与桌面同一路径）
       onQueueAction?.(command);
       break;
     case 'history':
@@ -727,6 +885,10 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
     case 'direct-close':
       conn.direct.handleSignal(command);
       break;
+    case 'probe':
+      // 测速必须走中继，走直连会测到 DC 而不是中继路径
+      void enqueueSend(conn, { type: 'probe-ack', nonce: command.nonce }, true);
+      break;
     case 'spawn': {
       const check = checkSpawn(command, whitelist);
       if (!check.ok) {
@@ -743,10 +905,14 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
         ...(command.reasoningEnabled ? { reasoningEnabled: true } : {}),
         ...(command.thinkingLevel ? { thinkingLevel: command.thinkingLevel } : {}),
       })) ?? { ok: false, error: 'pair agent bridge is not wired' };
+      if (!connectionCurrent(conn, generation, ioEpoch)) return;
       if (!result.ok) {
         console.warn(`[pair] spawn failed: ${result.error}`);
         break;
       }
+      conn.syncRevision++;
+      conn.pendingSync = undefined;
+      conn.syncLiveRevision = undefined;
       conn.subscribedId = command.sessionId;
       /*
        * 会话已在 worker 侧起来，但 renderer 的 store 里没有它——桌面列表看不到，
@@ -770,23 +936,69 @@ async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
 
 // ── 发：加密下行 ──────────────────────────────────────────────────────
 
-async function send(conn: Connection, message: HostToPhone): Promise<boolean> {
-  const direct = conn.direct.transport() === 'direct';
-  if (!direct && conn.ws?.readyState !== 1) return false;
+type SendGuard = () => boolean;
+
+async function sendNow(
+  conn: Connection,
+  message: HostToPhone | DirectSignal,
+  relayOnly: boolean,
+  generation: number,
+  ioEpoch: number,
+  guard?: SendGuard
+): Promise<boolean> {
+  if (!connectionCurrent(conn, generation, ioEpoch) || (guard && !guard())) return false;
+  if (
+    relayOnly
+      ? conn.ws?.readyState !== 1
+      : conn.direct.transport() !== 'direct' && conn.ws?.readyState !== 1
+  ) {
+    return false;
+  }
+  if (!relayOnly && message.type === 'providers') {
+    const fp = providersSyncFingerprint(message.providers);
+    if (sentProviderFp.get(conn.device.pairId) === fp) return true;
+    sentProviderFp.set(conn.device.pairId, fp);
+  }
   try {
     const frame = await sealFrame(conn.contentKey, message);
+    if (!connectionCurrent(conn, generation, ioEpoch) || (guard && !guard())) return false;
     // 中继对超过 1MB 的帧直接丢弃且不通知发送方：本地拦下并留痕，别白发（直连同限，分片上限对齐）
-    if (frame.byteLength > 1_000_000) {
+    if (frame.byteLength >= 1_000_000) {
       console.warn(`[pair] frame ${frame.byteLength}B over relay limit, dropped locally`);
       return false;
     }
-    // 直连优先；背压/刚好断掉时无缝退回中继
-    if (conn.direct.send(frame)) return true;
-    return sendFrameViaRelay(conn, frame);
+    // 直连优先；背压/刚好断掉时无缝退回中继。信令始终只走中继。
+    if (!relayOnly && conn.direct.send(frame)) return true;
+    const ok = sendFrameViaRelay(conn, frame);
+    if (!ok && message.type === 'providers') sentProviderFp.delete(conn.device.pairId);
+    return ok;
   } catch (error) {
+    if (message.type === 'providers') sentProviderFp.delete(conn.device.pairId);
     console.warn('[pair] send failed', error);
     return false;
   }
+}
+
+function enqueueSend(
+  conn: Connection,
+  message: HostToPhone | DirectSignal,
+  relayOnly: boolean,
+  guard?: SendGuard
+): Promise<boolean> {
+  const generation = conn.generation;
+  const ioEpoch = conn.ioEpoch;
+  const task = conn.sendQueue.then(() =>
+    sendNow(conn, message, relayOnly, generation, ioEpoch, guard)
+  );
+  conn.sendQueue = task.then(
+    () => undefined,
+    () => undefined
+  );
+  return task;
+}
+
+function send(conn: Connection, message: HostToPhone, guard?: SendGuard): Promise<boolean> {
+  return enqueueSend(conn, message, false, guard);
 }
 
 function sendFrameViaRelay(conn: Connection, frame: Uint8Array): boolean {
@@ -798,15 +1010,24 @@ function sendFrameViaRelay(conn: Connection, frame: Uint8Array): boolean {
 
 /** 直连信令只能走中继（直连未建/已坏时信令就是为了修它） */
 async function sendViaRelay(conn: Connection, message: DirectSignal): Promise<void> {
-  try {
-    sendFrameViaRelay(conn, await sealFrame(conn.contentKey, message as HostToPhone));
-  } catch (error) {
-    console.warn('[pair] signal send failed', error);
-  }
+  await enqueueSend(conn, message, true);
 }
 
 function requestMeta(conn: Connection): void {
   requestPairMeta(conn, sendMeta);
+}
+
+/** 进房重发目录/项目/模型表/推送配置。 */
+function resyncGuestMeta(conn: Connection, forgetCatalog = true): void {
+  if (forgetCatalog && !conn.metaSending) {
+    conn.sentMeta = forgetGuestSyncMeta(conn.sentMeta);
+    const next = forgetGuestSyncMeta(stableMetaByPair.get(conn.device.pairId));
+    if (next) stableMetaByPair.set(conn.device.pairId, next);
+    else stableMetaByPair.delete(conn.device.pairId);
+    conn.providersSentFp = undefined;
+    conn.providersSentAt = undefined;
+  }
+  requestMeta(conn);
 }
 
 async function sendMeta(conn: Connection): Promise<void> {
@@ -830,7 +1051,7 @@ async function sendMeta(conn: Connection): Promise<void> {
   const next: PairMetaFingerprints = {
     catalog: catalogSyncFingerprint(catalogEntries, pinnedOrder),
     projects: pairJsonFingerprint({ projects: projectEntries, groups: projectGroups }),
-    providers: pairJsonFingerprint(providers),
+    providers: providersSyncFingerprint(providers),
     appearance: pairJsonFingerprint(appearance),
     pushConfig: pairJsonFingerprint(vapidPublicKey),
     hostInfo: pairJsonFingerprint(hostInfo),
@@ -838,11 +1059,14 @@ async function sendMeta(conn: Connection): Promise<void> {
   // renderer 尚未推过目录时扣下 renderer-owned 通道（catalog/projects/providers/appearance）：
   // host 重启后 guest 往往已在房里，peer-joined 先于 renderer 首推到达，空 catalog 当真目录发出去
   // 会让 guest 把仍在订阅的会话误判为幽灵。被扣下的通道不进 next，flushChangedMeta 只记实际发出的。
-  const allowed = new Set(channelsForMetaPush(conn.sentMeta, next, catalogReady));
+  const last = mergeStableMeta(stableMetaByPair.get(conn.device.pairId), conn.sentMeta);
+  const allowed = new Set(channelsForMetaPush(last, next, catalogReady));
+  const remembered = rememberStableMeta(stableMetaByPair.get(conn.device.pairId), allowed, next);
+  if (remembered) stableMetaByPair.set(conn.device.pairId, remembered);
   const gated: PairMetaFingerprints = {};
   for (const key of allowed) gated[key] = next[key];
   await flushChangedMeta(
-    conn.sentMeta,
+    last,
     gated,
     {
       catalog: () => send(conn, { type: 'catalog', entries: catalogEntries, pinnedOrder }),
@@ -852,7 +1076,17 @@ async function sendMeta(conn: Connection): Promise<void> {
           projects: projectEntries,
           ...(projectGroups.length > 0 ? { groups: projectGroups } : {}),
         }),
-      providers: () => send(conn, { type: 'providers', providers }),
+      providers: async () => {
+        const fp = next.providers ?? providersSyncFingerprint(providers);
+        const now = Date.now();
+        if (!shouldEmitProviders(conn.providersSentFp, conn.providersSentAt, fp, now)) return true;
+        const ok = await send(conn, { type: 'providers', providers });
+        if (ok) {
+          conn.providersSentFp = fp;
+          conn.providersSentAt = now;
+        }
+        return ok;
+      },
       appearance: () => send(conn, appearance),
       pushConfig: () => send(conn, { type: 'push-config', vapidPublicKey }),
       hostInfo: () => send(conn, { type: 'host-info', ...hostInfo }),
@@ -861,7 +1095,106 @@ async function sendMeta(conn: Connection): Promise<void> {
   );
 }
 
-/** agentHost 事件出口：按订阅过滤后加密发给每台在线手机 */
+interface PairSnapshotSession {
+  sessionId?: string;
+  identity?: { sessionId?: string; generation?: string };
+  messages?: unknown[];
+}
+
+function forwardSnapshot(event: RendererAgentEvent): void {
+  const full = event as { type: string; sessions?: PairSnapshotSession[] };
+  const baselines = new Map<string, { cursor: PairSyncCursor; rotated: boolean }>();
+  for (const session of full.sessions ?? []) {
+    const sessionId = session.identity?.sessionId ?? session.sessionId;
+    if (!sessionId) continue;
+    const previous = replayLog.cursorOf(sessionId);
+    const snapshot = narrowSnapshot({ type: 'snapshot', sessions: [session] }, sessionId) ?? {
+      type: 'snapshot' as const,
+      sessions: [{ ...session, sessionId }],
+    };
+    const cursor = replayLog.checkpoint(sessionId, snapshot, session.identity?.generation);
+    baselines.set(sessionId, {
+      cursor,
+      rotated: !previous || previous.epoch !== cursor.epoch,
+    });
+  }
+
+  for (const conn of connections.values()) {
+    if (!conn.phoneOnline || !conn.subscribedId) continue;
+    const subscribedId = conn.subscribedId;
+    const revision = conn.syncRevision;
+    const session = full.sessions?.find(
+      (candidate) => (candidate.identity?.sessionId ?? candidate.sessionId) === subscribedId
+    );
+    const sync = conn.pendingSync;
+    if (conn.pendingHistory !== undefined) {
+      if (session && Array.isArray(session.messages)) {
+        const page = sliceHistory(session.messages, conn.pendingHistory);
+        void send(
+          conn,
+          {
+            type: 'history',
+            sessionId: subscribedId,
+            baseIndex: page.baseIndex,
+            messages: page.messages,
+          },
+          () => conn.syncRevision === revision && conn.subscribedId === subscribedId
+        );
+      }
+      conn.pendingHistory = undefined;
+      if (!(sync?.sessionId === subscribedId && !sync.answered)) {
+        continue;
+      }
+    }
+
+    const narrowed = narrowSnapshot(full, subscribedId);
+    const baseline = baselines.get(subscribedId);
+    if (narrowed && baseline && sync?.sessionId === subscribedId && !sync.answered) {
+      conn.syncLiveRevision = sync.revision;
+      conn.sinceIndex = undefined;
+      conn.pendingSnapshot = undefined;
+      sync.answered = true;
+      void send(
+        conn,
+        {
+          type: 'session-sync',
+          sessionId: subscribedId,
+          requestId: sync.requestId,
+          cursor: baseline.cursor,
+          mode: 'snapshot',
+          snapshot: narrowed,
+        },
+        () => isCurrentSync(conn, sync.revision, subscribedId)
+      );
+      continue;
+    }
+
+    if (baseline?.rotated && conn.syncCapable) {
+      void send(
+        conn,
+        {
+          type: 'agent-event',
+          event: { type: 'session-invalidated', sessionId: subscribedId },
+          cursor: baseline.cursor,
+        },
+        () => conn.syncRevision === revision && conn.subscribedId === subscribedId
+      );
+      continue;
+    }
+
+    if (!shouldRelayPairSnapshot(conn) || !narrowed) continue;
+    // 旧端仍收原 agent-event snapshot；新协议不用 sinceIndex 猜增量。
+    conn.sinceIndex = undefined;
+    conn.pendingSnapshot = undefined;
+    void send(
+      conn,
+      { type: 'agent-event', event: narrowed },
+      () => conn.syncRevision === revision && conn.subscribedId === subscribedId
+    );
+  }
+}
+
+/** agentHost 事件出口：所有会话事件先入日志，再按订阅规则下发。 */
 export function forwardAgentEvent(event: RendererAgentEvent): void {
   runningTaskIds = applyPairPowerTaskEvent(runningTaskIds, event);
   syncPowerBlocker();
@@ -871,9 +1204,17 @@ export function forwardAgentEvent(event: RendererAgentEvent): void {
     identity?: { sessionId?: string };
     index?: number;
   };
-  // worker 新格式把会话归属嵌在 identity 里；手机端按扁平 sessionId 消费
-  //（线上 PWA 不随桌面版同步发布），下发前归一化补上
-  const flatSessionId = e.identity?.sessionId ?? e.sessionId;
+  if (e.type === 'snapshot') {
+    forwardSnapshot(event);
+    return;
+  }
+  if (e.type === 'worker-exited') replayLog.invalidateAll();
+  const recorded = replayLog.record(event);
+  // worker 新格式把会话归属嵌在 identity 里；日志和下行都补扁平 sessionId。
+  const flatSessionId = recorded?.sessionId ?? e.identity?.sessionId ?? e.sessionId;
+  const outgoingEvent =
+    recorded?.event ?? (flatSessionId ? { ...event, sessionId: flatSessionId } : event);
+
   for (const conn of connections.values()) {
     // 离线或锁屏/切后台（socket 半开不算离线）都转系统推送，只发通用文案
     if (!conn.phoneOnline || !conn.phoneVisible) {
@@ -887,42 +1228,9 @@ export function forwardAgentEvent(event: RendererAgentEvent): void {
       }
       if (!conn.phoneOnline) continue;
     }
-    // snapshot 是全量批事件，裁成只含订阅会话再发
-    if (e.type === 'snapshot') {
-      const full = event as {
-        type: string;
-        sessions?: {
-          sessionId?: string;
-          identity?: { sessionId?: string };
-          messages?: unknown[];
-        }[];
-      };
-      if (!shouldRelayPairSnapshot(conn)) continue;
-      // 有挂起的分页请求：切 beforeIndex 之前的一页发回，不重复发尾窗
-      if (conn.pendingHistory !== undefined && conn.subscribedId) {
-        const session = full.sessions?.find(
-          (s) => (s.identity?.sessionId ?? s.sessionId) === conn.subscribedId
-        );
-        if (session && Array.isArray(session.messages)) {
-          const page = sliceHistory(session.messages, conn.pendingHistory);
-          void send(conn, {
-            type: 'history',
-            sessionId: conn.subscribedId,
-            baseIndex: page.baseIndex,
-            messages: page.messages,
-          });
-        }
-        conn.pendingHistory = undefined;
-        continue;
-      }
-      const narrowed = narrowSnapshot(full, conn.subscribedId);
-      if (narrowed) {
-        // 尾窗已覆盖手机所有已知内容，续传游标完成使命；继续拿它过滤会在
-        // 截断/压缩后把新消息当旧消息丢掉，手机就「卡住」直到重开
-        conn.sinceIndex = undefined;
-        conn.pendingSnapshot = undefined;
-        void send(conn, { type: 'agent-event', event: narrowed });
-      }
+    // snapshot/replay 响应已先入发送队列；在途期间不让被快照覆盖的会话事件抢跑。
+    const sync = conn.pendingSync;
+    if (sync && flatSessionId === conn.subscribedId && conn.syncLiveRevision !== sync.revision) {
       continue;
     }
     // 时间线被截断：后续同 index 重建的消息必须放行
@@ -930,10 +1238,19 @@ export function forwardAgentEvent(event: RendererAgentEvent): void {
       conn.sinceIndex = undefined;
     }
     if (!shouldForward(e, conn.subscribedId, conn.sinceIndex)) continue;
-    void send(conn, {
-      type: 'agent-event',
-      event: flatSessionId ? { ...event, sessionId: flatSessionId } : event,
-    });
+    const revision = conn.syncRevision;
+    const subscribedId = conn.subscribedId;
+    void send(
+      conn,
+      {
+        type: 'agent-event',
+        event: outgoingEvent,
+        ...(conn.syncCapable && recorded && recorded.sessionId === subscribedId
+          ? { cursor: recorded.cursor }
+          : {}),
+      },
+      () => conn.syncRevision === revision && conn.subscribedId === subscribedId
+    );
   }
 }
 
@@ -971,6 +1288,22 @@ export function updatePairCatalog(payload: {
   };
   for (const conn of connections.values()) {
     // 人对端在房才推：readyState 开着但 peer-left 时往 relay 白发且会误记 sentMeta
+    if (conn.phoneOnline) requestMeta(conn);
+  }
+}
+
+export function getPairCatalog(): CatalogEntry[] {
+  return catalog;
+}
+
+export function getPairProjects(): ProjectEntry[] {
+  return projects;
+}
+
+export function mutatePairCatalog(mutate: (entries: CatalogEntry[]) => CatalogEntry[]): void {
+  if (!catalogReady) return;
+  catalog = mutate(catalog);
+  for (const conn of connections.values()) {
     if (conn.phoneOnline) requestMeta(conn);
   }
 }

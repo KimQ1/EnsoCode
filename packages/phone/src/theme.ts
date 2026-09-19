@@ -1,5 +1,7 @@
 import type { HostAppearance } from '@enso/pair';
 import { applyTerminalThemeToApp, clearTerminalThemeFromApp } from './stubs/ghostty-theme';
+import { setAppearanceTheme } from './stubs/settings-store';
+import { settingsThemeFromPhone, type ThemePreference } from './themePreference';
 
 /**
  * 主题优先级：本地覆盖 > 桌面下发 > 跟随系统。
@@ -7,7 +9,7 @@ import { applyTerminalThemeToApp, clearTerminalThemeFromApp } from './stubs/ghos
  * sync-terminal 与桌面同语义：整套 UI 配色由终端调色板推导。
  */
 
-export type ThemePreference = 'auto' | 'light' | 'dark';
+export type { ThemePreference } from './themePreference';
 
 const OVERRIDE_KEY = 'enso-phone-theme';
 
@@ -33,8 +35,6 @@ function syncThemeColorMeta(): void {
   requestAnimationFrame(() => {
     const computed = getComputedStyle(document.body).backgroundColor;
     if (!computed) return;
-    // 计算值可能是 oklch()（主题变量就是 oklch），theme-color 对新色彩空间的
-    // 支持不一，统一过一遍 canvas 转成 rgb
     const color = toRgb(computed);
     for (const meta of document.querySelectorAll('meta[name="theme-color"]')) meta.remove();
     const meta = document.createElement('meta');
@@ -79,6 +79,8 @@ function apply(): void {
   }
   for (const listener of listeners) listener();
   syncThemeColorMeta();
+  const appearance = settingsThemeFromPhone(override, hostTheme);
+  setAppearanceTheme(appearance.theme, appearance.syncTerminalTheme);
 }
 
 /** 桌面下发的偏好（仅在未本地覆盖时生效） */

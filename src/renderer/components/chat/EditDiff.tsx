@@ -1,15 +1,15 @@
 import { parseDiffFromFile } from '@pierre/diffs';
 import { FileDiff } from '@pierre/diffs/react';
 import { useEffect, useMemo, useState } from 'react';
+import { useCodeHighlightOptions } from '@/hooks/useColorScheme';
 import { useI18n } from '@/i18n';
 import { diffCacheKey } from '@/lib/diffCacheKey';
 import { reconstructOld } from '@/lib/sessionChanges';
 import type { EditBlock } from '@/stores/sessions/timeline';
 import { CODE_THEME, ensureHighlighter } from './codeHighlighter';
 
-/** 主题跟随系统深浅色，split 左右分栏 + 词级高亮，纯 JS 高亮器（免 WASM）；高亮走根部 DiffWorkerPool */
+/** 主题跟随应用明暗，split 左右分栏 + 词级高亮，纯 JS 高亮器（免 WASM）；高亮走根部 DiffWorkerPool */
 const DIFF_OPTIONS = {
-  themeType: 'system',
   theme: CODE_THEME,
   diffStyle: 'split',
   lineDiffType: 'word',
@@ -25,13 +25,37 @@ type Loaded =
   | { kind: 'blocks' };
 
 /** 用 @pierre/diffs 渲染 edit 工具的改动：优先读实际文件给出真实行号+上下文，否则回退片段 diff */
-export function EditDiff({ path, blocks }: { path: string; blocks: EditBlock[] }) {
+export function EditDiff({
+  path,
+  blocks,
+  snapshot,
+}: {
+  path: string;
+  blocks: EditBlock[];
+  /** 已知的前后完整文本；用于历史结果，避免按当前磁盘重建原始 diff */
+  snapshot?: EditBlock;
+}) {
   const { t } = useI18n();
   const name = path.split('/').pop() || 'file';
   const [state, setState] = useState<Loaded>({ kind: 'loading' });
 
   useEffect(() => {
     let alive = true;
+    if (snapshot) {
+      setState({ kind: 'loading' });
+      ensureHighlighter()
+        .then(() => {
+          if (alive) {
+            setState({ kind: 'full', oldText: snapshot.oldText, newText: snapshot.newText });
+          }
+        })
+        .catch(() => {
+          if (alive) setState({ kind: 'blocks' });
+        });
+      return () => {
+        alive = false;
+      };
+    }
     Promise.all([ensureHighlighter(), window.electronAPI.files.read(path)])
       .then(([, current]) => {
         if (!alive) return;
@@ -50,7 +74,7 @@ export function EditDiff({ path, blocks }: { path: string; blocks: EditBlock[] }
     return () => {
       alive = false;
     };
-  }, [path, blocks]);
+  }, [path, blocks, snapshot]);
 
   if (state.kind === 'loading') {
     return (
@@ -76,11 +100,12 @@ export function EditDiff({ path, blocks }: { path: string; blocks: EditBlock[] }
 }
 
 function DiffView({ name, oldText, newText }: { name: string; oldText: string; newText: string }) {
+  const options = useCodeHighlightOptions(DIFF_OPTIONS);
   const fileDiff = useMemo(() => {
     const diff = parseDiffFromFile({ name, contents: oldText }, { name, contents: newText });
     // 同一文件多条 edit 同名不同内容，默认按名缓存会串高亮
     diff.cacheKey = diffCacheKey(name, oldText, newText);
     return diff;
   }, [name, oldText, newText]);
-  return <FileDiff fileDiff={fileDiff} options={DIFF_OPTIONS} />;
+  return <FileDiff fileDiff={fileDiff} options={options} />;
 }

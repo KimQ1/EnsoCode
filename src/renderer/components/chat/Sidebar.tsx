@@ -24,6 +24,7 @@ import {
   ArchiveRestore,
   ChevronRight,
   CircleAlert,
+  Ellipsis,
   Eraser,
   FileText,
   FolderGit2,
@@ -56,6 +57,7 @@ import { ConversationTitleEdit } from '@/components/chat/ConversationTitleEdit';
 import { matchesQuery } from '@/components/chat/chatSearch';
 import { insertComposerMention } from '@/components/chat/composerMentionBridge';
 import {
+  activeChatDragId,
   chatDragId,
   type DragPayload,
   PINNED_DROP_ID,
@@ -82,7 +84,16 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import { Input } from '@/components/ui/input';
-import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu';
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
+  MenuTrigger,
+} from '@/components/ui/menu';
 import { addToast } from '@/components/ui/toast';
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
 import { useI18n } from '@/i18n';
@@ -110,14 +121,22 @@ import {
 import { selectSidebarConversations } from '@/stores/sessions/sidebarDirectory';
 import { DIRTY_MAIN_TREE, worktreeHasPendingWork } from '@/stores/sessions/worktree';
 import { useSettingsStore } from '@/stores/settings';
-import { applyProjectOrder, moveProject } from '@/stores/settings/projectOrder';
+import {
+  applyProjectOrder,
+  moveProject,
+  partitionPinnedProjects,
+  projectReorderScope,
+  togglePinnedProjectId,
+} from '@/stores/settings/projectOrder';
 import {
   ARCHIVED_PROJECTS_KEY,
   PINNED_ORDER_KEY,
+  PINNED_PROJECTS_KEY,
   PROJECT_ORDER_KEY,
   readSidebarOrder,
   writeSidebarOrder,
 } from '@/stores/settings/sidebarOrderStorage';
+import { SessionTabCounts } from './SessionTabCounts';
 import { WorktreeBadge } from './WorktreeBadge';
 import { WorktreeRenameDialog } from './WorktreeRenameDialog';
 
@@ -189,12 +208,30 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
   const [archivedProjectIds, setArchivedProjectIds] = useState<string[]>(() =>
     readSidebarOrder(ARCHIVED_PROJECTS_KEY)
   );
+  const [pinnedProjectIds, setPinnedProjectIds] = useState<string[]>(() =>
+    readSidebarOrder(PINNED_PROJECTS_KEY)
+  );
+  const persistPinnedProjects = (next: string[]) => {
+    setPinnedProjectIds(next);
+    writeSidebarOrder(PINNED_PROJECTS_KEY, next);
+  };
+  const togglePinProject = (id: string) => {
+    persistPinnedProjects(togglePinnedProjectId(pinnedProjectIds, id));
+    if (!pinnedProjectIds.includes(id) && archivedProjectIds.includes(id)) {
+      const next = archivedProjectIds.filter((entry) => entry !== id);
+      setArchivedProjectIds(next);
+      writeSidebarOrder(ARCHIVED_PROJECTS_KEY, next);
+    }
+  };
   const toggleArchiveProject = (id: string) => {
     const next = archivedProjectIds.includes(id)
       ? archivedProjectIds.filter((entry) => entry !== id)
       : [...archivedProjectIds, id];
     setArchivedProjectIds(next);
     writeSidebarOrder(ARCHIVED_PROJECTS_KEY, next);
+    if (!archivedProjectIds.includes(id) && pinnedProjectIds.includes(id)) {
+      persistPinnedProjects(pinnedProjectIds.filter((entry) => entry !== id));
+    }
   };
   const [selectedGroupId, setSelectedGroupId] = useState(() => {
     try {
@@ -234,8 +271,12 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
     archivedProjectIds,
     resolvedGroupId
   );
-  const groupSections = sectionsForAllView(orderedProjects, projectGroups, archivedProjectIds);
-  const activeProjects = slicedProjects;
+  const { pinned: pinnedProjects, rest: unpinnedProjects } = partitionPinnedProjects(
+    slicedProjects,
+    pinnedProjectIds
+  );
+  const groupSections = sectionsForAllView(unpinnedProjects, projectGroups, []);
+  const activeProjects = [...pinnedProjects, ...unpinnedProjects];
   const activeProjectIds = activeProjects.map((project) => project.id);
   const slicedIdSet = new Set(activeProjectIds);
 
@@ -277,6 +318,18 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
           reorderProjectGroups(action.activeId, action.overId);
           break;
         case 'reorder-projects': {
+          const scope = projectReorderScope(action.activeId, action.overId, pinnedProjectIds);
+          if (scope === 'pinned') {
+            const next = moveProject(
+              pinnedProjectIds.map((id) => ({ id })),
+              pinnedProjectIds,
+              action.activeId,
+              action.overId
+            );
+            persistPinnedProjects(next);
+            break;
+          }
+          if (scope !== 'order') break;
           const next = moveProject(projects, projectOrderIds, action.activeId, action.overId);
           setProjectOrderIds(next);
           writeSidebarOrder(PROJECT_ORDER_KEY, next);
@@ -768,26 +821,34 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
               <SidebarSectionLabel>{t('Active')}</SidebarSectionLabel>
               <div className="flex flex-col gap-y-0.5">
                 {visibleActiveIds.map((id) => (
-                  <ConversationRow
+                  <DraggableChat
                     key={id}
                     id={id}
+                    dragId={activeChatDragId(id)}
                     conversation={conversations[id]}
-                    active={activeId === id}
-                    switchHint={switchHintFor(id, 'active')}
-                    locale={locale}
-                    nowTick={nowTick}
-                    hoverTitle={hoverProjectName(projects, conversations[id].projectId)}
-                    worktreeStatus={conversations[id].worktree ? worktreeStatuses[id] : undefined}
-                    isolated={Boolean(conversations[id].worktree)}
-                    onSelect={selectConversation}
-                    onTogglePin={togglePinConversation}
-                    onToggleArchive={(conversationId) => void handleToggleArchive(conversationId)}
-                    onCleanupWorktree={(conversationId) =>
-                      void handleCleanupWorktree(conversationId)
-                    }
-                    onMoveToWorktree={(conversationId) => void handleMoveToWorktree(conversationId)}
-                    onRemove={(conversationId) => void openRemoveConversation(conversationId)}
-                  />
+                  >
+                    <ConversationRow
+                      id={id}
+                      conversation={conversations[id]}
+                      active={activeId === id}
+                      switchHint={switchHintFor(id, 'active')}
+                      locale={locale}
+                      nowTick={nowTick}
+                      hoverTitle={hoverProjectName(projects, conversations[id].projectId)}
+                      worktreeStatus={conversations[id].worktree ? worktreeStatuses[id] : undefined}
+                      isolated={Boolean(conversations[id].worktree)}
+                      onSelect={selectConversation}
+                      onTogglePin={togglePinConversation}
+                      onToggleArchive={(conversationId) => void handleToggleArchive(conversationId)}
+                      onCleanupWorktree={(conversationId) =>
+                        void handleCleanupWorktree(conversationId)
+                      }
+                      onMoveToWorktree={(conversationId) =>
+                        void handleMoveToWorktree(conversationId)
+                      }
+                      onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                    />
+                  </DraggableChat>
                 ))}
               </div>
             </div>
@@ -898,7 +959,15 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                   : shownConversationCount(visibleConversations.length, revealedExtra);
                 const hiddenIds = visibleConversations.slice(shownCount);
                 // 项目右键菜单项;抽成数据是为了把动态分组列表与固定项平铺在一起
+                const projectPinned = pinnedProjectIds.includes(project.id);
                 const projectActions: ProjectAction[] = [
+                  {
+                    kind: 'item',
+                    key: 'pin',
+                    label: projectPinned ? t('Unpin project') : t('Pin project'),
+                    icon: projectPinned ? <PinOff /> : <Pin />,
+                    onSelect: () => togglePinProject(project.id),
+                  },
                   {
                     kind: 'item',
                     key: 'settings',
@@ -1002,7 +1071,27 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                       )}
                                     </span>
                                   </button>
-                                  {/* 只留高频的新建会话;其余操作全部走右键菜单 */}
+                                  {projectPinned && (
+                                    <span
+                                      className="flex shrink-0 items-center justify-center rounded p-1 group-hover:hidden"
+                                      aria-hidden
+                                    >
+                                      <Pin className="h-3.5 w-3.5 text-muted-foreground/70" />
+                                    </span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => togglePinProject(project.id)}
+                                    className="hidden shrink-0 rounded p-1 text-muted-foreground group-hover:block hover:bg-muted hover:text-foreground"
+                                    title={projectPinned ? t('Unpin project') : t('Pin project')}
+                                  >
+                                    {projectPinned ? (
+                                      <PinOff className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <Pin className="h-3.5 w-3.5" />
+                                    )}
+                                  </button>
+                                  {/* 高频新建会话常驻;其余走三点菜单,右键仍可用 */}
                                   <button
                                     type="button"
                                     onClick={() => void newConversation(project.id)}
@@ -1011,6 +1100,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                   >
                                     <MessageSquarePlus className="h-3.5 w-3.5" />
                                   </button>
+                                  <ProjectOverflowMenu actions={projectActions} />
                                 </div>
                                 <AnimatePresence initial={false}>
                                   {!folded && (
@@ -1026,7 +1116,9 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                         {visibleConversations.slice(0, shownCount).map((id) => (
                                           <motion.div
                                             key={id}
-                                            layout="position"
+                                            layout={
+                                              dragPayload?.type === 'project' ? false : 'position'
+                                            }
                                             transition={springStandard}
                                           >
                                             <DraggableChat id={id} conversation={conversations[id]}>
@@ -1147,6 +1239,12 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
               if (resolvedGroupId === ALL_GROUP_ID && projectGroups.length > 0) {
                 return (
                   <div className="space-y-2">
+                    {pinnedProjects.length > 0 && (
+                      <div>
+                        <SidebarSectionLabel>{t('Pinned projects')}</SidebarSectionLabel>
+                        <div className="space-y-1">{pinnedProjects.map(projectNode)}</div>
+                      </div>
+                    )}
                     {groupSections.map((section) => {
                       const foldedSection = searching
                         ? false
@@ -1188,6 +1286,17 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                         </div>
                       );
                     })}
+                  </div>
+                );
+              }
+              if (pinnedProjects.length > 0 && unpinnedProjects.length > 0) {
+                return (
+                  <div className="space-y-2">
+                    <div>
+                      <SidebarSectionLabel>{t('Pinned projects')}</SidebarSectionLabel>
+                      <div className="space-y-1">{pinnedProjects.map(projectNode)}</div>
+                    </div>
+                    <div className="space-y-1">{unpinnedProjects.map(projectNode)}</div>
                   </div>
                 );
               }
@@ -1529,25 +1638,29 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
       {createPortal(
         <DragOverlay dropAnimation={null}>
           {/* 只认侧栏自己的 payload:同一 DndContext 里其它区域(如右侧面板 tab)的拖拽不在这里预览 */}
-          {(dragPayload?.type === 'project' ||
-            dragPayload?.type === 'chat' ||
-            dragPayload?.type === 'workspace-file') && (
-            <div className="flex w-56 items-center gap-2 rounded-lg border bg-background/95 px-3 py-1.5 text-sm shadow-md">
-              {dragPayload.type === 'project' ? (
-                <FolderGit2 className="size-4 shrink-0 text-muted-foreground" />
-              ) : dragPayload.type === 'workspace-file' ? (
-                <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
-              ) : (
-                <Pin className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              )}
-              <span className="min-w-0 flex-1 truncate">
-                {dragPayload.type === 'project'
-                  ? dragPayload.name
-                  : dragPayload.type === 'workspace-file'
+          {dragPayload?.type === 'project' ? (
+            <ProjectDragPreview
+              projectId={dragPayload.projectId}
+              name={projectDragPreviewName(projects, dragPayload.projectId, dragPayload.name)}
+              folded={collapsedProjects[dragPayload.projectId] === true}
+              revealedExtra={revealedExtras[dragPayload.projectId] ?? 0}
+              width={width}
+            />
+          ) : (
+            (dragPayload?.type === 'chat' || dragPayload?.type === 'workspace-file') && (
+              <div className="flex w-56 items-center gap-2 rounded-lg border bg-background/95 px-3 py-1.5 text-sm shadow-md">
+                {dragPayload.type === 'workspace-file' ? (
+                  <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <Pin className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate">
+                  {dragPayload.type === 'workspace-file'
                     ? dragPayload.name
                     : dragPayload.title.split('\n')[0].trim() || t('New conversation')}
-              </span>
-            </div>
+                </span>
+              </div>
+            )
           )}
         </DragOverlay>,
         document.body
@@ -1647,6 +1760,83 @@ function ProjectGroupHeader({
         >
           <Pencil className="h-3.5 w-3.5" />
         </button>
+      )}
+    </div>
+  );
+}
+
+function projectDragPreviewName(projects: Project[], projectId: string, fallback: string): string {
+  const project = projects.find((entry) => entry.id === projectId);
+  return project ? projectDisplayName(project) : fallback;
+}
+
+function ProjectDragPreview({
+  projectId,
+  name,
+  folded,
+  revealedExtra,
+  width,
+}: {
+  projectId: string;
+  name: string;
+  folded: boolean;
+  revealedExtra: number;
+  width?: number;
+}) {
+  const { t } = useI18n();
+  const conversations = useSessionsStore((state) =>
+    selectSidebarConversations(state.conversations)
+  );
+  const order = useSessionsStore((state) => state.order);
+  const sessionIds = projectConversationIds(order, conversations, projectId);
+  const shownIds = folded
+    ? []
+    : sessionIds.slice(0, shownConversationCount(sessionIds.length, revealedExtra));
+  const hiddenCount = Math.max(0, sessionIds.length - shownIds.length);
+  return (
+    <div
+      className="pointer-events-none rounded-lg border bg-background/95 py-0.5 shadow-md"
+      style={{ width: width ?? 224 }}
+    >
+      <div className="flex items-center gap-2 px-2 py-2 text-sm font-medium">
+        <IconSlot>{folded ? <FolderGit2 /> : <FolderOpen />}</IconSlot>
+        <span className="min-w-0 flex-1 truncate">{name}</span>
+      </div>
+      {!folded && (
+        <div className="flex flex-col gap-y-0.5">
+          {shownIds.map((id) => {
+            const conversation = conversations[id];
+            if (!conversation) return null;
+            return (
+              <div
+                key={id}
+                className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 py-1.5 pr-2 pl-2 text-sm text-muted-foreground"
+              >
+                <ConversationDot conversation={conversation} />
+                <span className="min-w-0 truncate">
+                  {conversation.title || t('New conversation')}
+                </span>
+              </div>
+            );
+          })}
+          {sessionIds.length > COLLAPSED_SESSION_LIMIT && (
+            <div className="flex items-center gap-1">
+              {hiddenCount > 0 && (
+                <div className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground">
+                  {t('Show {{n}} more', { n: hiddenCount })}
+                </div>
+              )}
+              {revealedExtra > 0 && (
+                <div className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground">
+                  {t('Collapse')}
+                </div>
+              )}
+            </div>
+          )}
+          {sessionIds.length === 0 && (
+            <p className="py-1.5 pl-8 text-xs text-muted-foreground">{t('No conversations yet')}</p>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1778,13 +1968,15 @@ function DraggableChat({
   id,
   conversation,
   children,
+  dragId,
 }: {
   id: string;
   conversation: { title: string; sessionFile?: string; pinned?: boolean };
   children: React.ReactNode;
+  dragId?: string;
 }) {
   const { setNodeRef, listeners, isDragging } = useDraggable({
-    id: chatDragId(id),
+    id: dragId ?? chatDragId(id),
     data: {
       type: 'chat',
       conversationId: id,
@@ -1932,7 +2124,7 @@ function ConversationRow({
       data-slot="conversation-row"
       data-pinned={pinned ? 'true' : 'false'}
       className={cn(
-        // 会话行与项目行共用图标/文字基准，worktree 标签独占第二行
+        // 会话行与项目行共用图标/文字基准，worktree 与浏览器/终端计数在第二行
         'group grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-0.5 rounded-lg py-1.5 pr-2 pl-2 text-sm transition-colors',
         active
           ? 'bg-muted text-foreground'
@@ -2050,13 +2242,19 @@ function ConversationRow({
             </>
           ))}
       </div>
-      {isolated && worktree && (
+      {isolated && worktree ? (
         <div
           data-slot="conversation-worktree-row"
           className="col-span-2 grid min-w-0 grid-cols-subgrid"
         >
-          <WorktreeBadge worktree={worktree} status={worktreeStatus} />
+          <WorktreeBadge
+            worktree={worktree}
+            status={worktreeStatus}
+            after={<SessionTabCounts conversationId={id} />}
+          />
         </div>
+      ) : (
+        <SessionTabCounts conversationId={id} row />
       )}
     </div>
   );
@@ -2233,10 +2431,32 @@ type ProjectAction =
     };
 
 /** 菜单项渲染:submenu 递归展开,让动态分组列表不把主菜单撑长 */
-function renderProjectActions(actions: ProjectAction[]): React.ReactNode {
+function renderProjectActions(
+  actions: ProjectAction[],
+  surface: 'context' | 'menu' = 'context'
+): React.ReactNode {
   return actions.map((action) => {
-    if (action.kind === 'separator') return <ContextMenuSeparator key={action.key} />;
+    if (action.kind === 'separator') {
+      return surface === 'menu' ? (
+        <MenuSeparator key={action.key} />
+      ) : (
+        <ContextMenuSeparator key={action.key} />
+      );
+    }
     if (action.kind === 'submenu') {
+      if (surface === 'menu') {
+        return (
+          <MenuSub key={action.key}>
+            <MenuSubTrigger>
+              {action.icon}
+              {action.label}
+            </MenuSubTrigger>
+            <MenuSubPopup className="min-w-40">
+              {renderProjectActions(action.items, 'menu')}
+            </MenuSubPopup>
+          </MenuSub>
+        );
+      }
       return (
         <ContextMenuSub key={action.key}>
           <ContextMenuSubTrigger>
@@ -2247,6 +2467,18 @@ function renderProjectActions(actions: ProjectAction[]): React.ReactNode {
             {renderProjectActions(action.items)}
           </ContextMenuSubPopup>
         </ContextMenuSub>
+      );
+    }
+    if (surface === 'menu') {
+      return (
+        <MenuItem
+          key={action.key}
+          onClick={action.onSelect}
+          variant={action.destructive ? 'destructive' : 'default'}
+        >
+          {action.icon}
+          {action.label}
+        </MenuItem>
       );
     }
     return (
@@ -2260,6 +2492,25 @@ function renderProjectActions(actions: ProjectAction[]): React.ReactNode {
       </ContextMenuItem>
     );
   });
+}
+
+function ProjectOverflowMenu({ actions }: { actions: ProjectAction[] }) {
+  const { t } = useI18n();
+  return (
+    <Menu>
+      <MenuTrigger
+        aria-label={t('More actions')}
+        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground data-popup-open:bg-muted data-popup-open:text-foreground"
+        title={t('More actions')}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <Ellipsis className="h-3.5 w-3.5" />
+      </MenuTrigger>
+      <MenuPopup align="end" className="min-w-40">
+        {renderProjectActions(actions, 'menu')}
+      </MenuPopup>
+    </Menu>
+  );
 }
 
 /** 区块标签:纯文字,不占图标列(对应不可折叠的 Active / Pinned 等分区) */

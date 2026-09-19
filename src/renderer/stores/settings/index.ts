@@ -26,6 +26,7 @@ import { parseUsageModelPricing } from '@shared/usage/pricing';
 import { parseWindowsLocalShell } from '@shared/windowsLocalShell';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
+import { resolveColorScheme } from '@/lib/colorScheme';
 import {
   applyTerminalThemeToApp,
   clearTerminalThemeFromApp,
@@ -42,7 +43,7 @@ import {
   normalizeAutoArchiveIdleDays,
   normalizeAutoDeleteArchivedDays,
 } from './autoArchiveIdleDays';
-import { migrateSettings, SETTINGS_VERSION } from './migrate';
+import { mergeSettingsState, migrateSettings, SETTINGS_VERSION } from './migrate';
 import { electronStorage, getWriteGeneration, openPersistWriteGate } from './storage';
 import type {
   BackgroundSizeMode,
@@ -64,23 +65,11 @@ function applyTerminalFont(fontFamily: string, fontSize: number): void {
 
 // Apply app theme (dark/light mode)
 function applyAppTheme(theme: Theme, terminalTheme: string): void {
-  let isDark: boolean;
-
-  switch (theme) {
-    case 'light':
-      isDark = false;
-      break;
-    case 'dark':
-      isDark = true;
-      break;
-    case 'system':
-      isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      break;
-    case 'sync-terminal':
-      isDark = isTerminalThemeDark(terminalTheme);
-      break;
-  }
-
+  const isDark =
+    resolveColorScheme(theme, {
+      prefersDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
+      terminalIsDark: isTerminalThemeDark(terminalTheme),
+    }) === 'dark';
   document.documentElement.classList.toggle('dark', isDark);
 }
 
@@ -130,8 +119,8 @@ const initialState = {
   loadHarnessAssets: false,
   windowsLocalShell: 'auto' as const,
   exploreFoldEnabled: false,
-  bashInterceptEnabled: false,
-  hashlineEditEnabled: false,
+  editMode: 'apply_patch' as import('@shared/types').EditMode,
+  compactStrategy: 'standard' as import('@shared/compactStrategy').CompactStrategy,
   smartCompactEnabled: false,
   smartCompactModel: null as import('@shared/defaultModel').DefaultModelRef | null,
   smartCompactMode: 'auto' as import('@shared/smartCompactMode').SmartCompactMode,
@@ -142,6 +131,7 @@ const initialState = {
   memoryDistillEnabled: false,
   memoryKgEnabled: false,
   autoUpdate: true,
+  autoRestartWhenIdle: false,
   proxyMode: 'system' as ProxyMode,
   customProxyUrl: '',
   openChangesOnFileEdit: false,
@@ -171,6 +161,7 @@ const initialState = {
   backgroundRefreshNonce: 0,
   providers: [] as import('@shared/types').ModelProvider[],
   defaultModel: null,
+  defaultModelFollowLast: false,
   titleSummaryEnabled: false,
   titleSummaryModel: null as import('@shared/defaultModel').DefaultModelRef | null,
   memoryDistillModel: null as import('@shared/defaultModel').DefaultModelRef | null,
@@ -274,15 +265,18 @@ export const useSettingsStore = create<SettingsState>()(
         set({ memoryEmbeddingRemoteProviderId }),
       setMemoryDistillEnabled: (memoryDistillEnabled) => set({ memoryDistillEnabled }),
       setMemoryKgEnabled: (memoryKgEnabled) => set({ memoryKgEnabled }),
-      setBashInterceptEnabled: (bashInterceptEnabled) => set({ bashInterceptEnabled }),
-      setHashlineEditEnabled: (hashlineEditEnabled) => set({ hashlineEditEnabled }),
-      setSmartCompactEnabled: (smartCompactEnabled) => set({ smartCompactEnabled }),
+      setEditMode: (editMode) => set({ editMode }),
+      setCompactStrategy: (compactStrategy) =>
+        set({ compactStrategy, smartCompactEnabled: compactStrategy === 'smart' }),
+      setSmartCompactEnabled: (smartCompactEnabled) =>
+        set({ smartCompactEnabled, compactStrategy: smartCompactEnabled ? 'smart' : 'standard' }),
       setSmartCompactModel: (smartCompactModel) => set({ smartCompactModel }),
       setSmartCompactMode: (smartCompactMode) =>
         set({
           smartCompactMode: parseSmartCompactMode(smartCompactMode) ?? 'auto',
         }),
       setAutoUpdate: (autoUpdate) => set({ autoUpdate }),
+      setAutoRestartWhenIdle: (autoRestartWhenIdle) => set({ autoRestartWhenIdle }),
       setProxyMode: (proxyMode) => set({ proxyMode: normalizeProxyMode(proxyMode) }),
       setCustomProxyUrl: (customProxyUrl) => set({ customProxyUrl }),
       setOpenChangesOnFileEdit: (openChangesOnFileEdit) => set({ openChangesOnFileEdit }),
@@ -362,7 +356,22 @@ export const useSettingsStore = create<SettingsState>()(
 
       setDefaultModel: (defaultModel) => {
         useDefaultModelRevalidationStore.setState({ latest: null });
-        set({ defaultModel });
+        set({ defaultModel, defaultModelFollowLast: false });
+      },
+
+      setDefaultModelFollowLast: (defaultModelFollowLast) => set({ defaultModelFollowLast }),
+
+      rememberDefaultModelFromSelection: (selection) => {
+        const state = get();
+        if (!state.defaultModelFollowLast) return;
+        if (
+          state.defaultModel?.providerId === selection.providerId &&
+          state.defaultModel?.modelId === selection.modelId
+        ) {
+          return;
+        }
+        useDefaultModelRevalidationStore.setState({ latest: null });
+        set({ defaultModel: selection });
       },
 
       setDefaultReasoningEnabled: (defaultReasoningEnabled) => set({ defaultReasoningEnabled }),
@@ -785,6 +794,22 @@ export const useSettingsStore = create<SettingsState>()(
         }));
       },
 
+      setProjectDisabledBuiltinTools: (projectId, disabled) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!disabled) {
+              const { disabledBuiltinTools: _removed, ...rest } = project;
+              return rest;
+            }
+            return {
+              ...project,
+              disabledBuiltinTools: [...new Set(disabled.filter((id) => typeof id === 'string'))],
+            };
+          }),
+        }));
+      },
+
       removeProject: async (id) => {
         const projection = await window.electronAPI.sourceAuthority.read();
         const project = projection.projects.find(
@@ -826,6 +851,7 @@ export const useSettingsStore = create<SettingsState>()(
       storage: createJSONStorage(() => electronStorage),
       version: SETTINGS_VERSION,
       migrate: (persisted, version) => migrateSettings(persisted, version) as SettingsState,
+      merge: (persisted, current) => mergeSettingsState(persisted, current),
       onRehydrateStorage: () => (state, error) => {
         // merge 已完成：此后（含下面的补写）才允许落盘；读失败保持关闸
         if (!error) openPersistWriteGate('enso-settings');
@@ -890,6 +916,30 @@ export const useSettingsStore = create<SettingsState>()(
   )
 );
 
+type ProjectEntry = SettingsState['projects'][number];
+
+/**
+ * 投影里没有的字段：别名、分组、项目级默认模型/内置工具只存在于渲染侧设置。
+ * 重建 projects 时不原样带回就会被 source-authority 广播抹掉（新建对话必定触发一次广播）。
+ */
+const LOCAL_PROJECT_KEYS = [
+  'alias',
+  'groupId',
+  'defaultModel',
+  'defaultReasoningEnabled',
+  'defaultThinkingLevel',
+  'disabledBuiltinTools',
+] as const satisfies readonly (keyof ProjectEntry)[];
+
+function localProjectFields(previous: ProjectEntry | undefined): Partial<ProjectEntry> {
+  const local: Partial<ProjectEntry> = {};
+  if (!previous) return local;
+  for (const key of LOCAL_PROJECT_KEYS) {
+    if (previous[key] !== undefined) Object.assign(local, { [key]: previous[key] });
+  }
+  return local;
+}
+
 function applyProjectAuthorityProjection(projection: SourceAuthorityProjection): void {
   const previousById = new Map(
     useSettingsStore.getState().projects.map((project) => [project.id, project])
@@ -902,7 +952,7 @@ function applyProjectAuthorityProjection(projection: SourceAuthorityProjection):
         id: project.projectId,
         name: projectNameFromPath(project.canonicalPath),
         path: project.canonicalPath,
-        ...(previous?.groupId ? { groupId: previous.groupId } : {}),
+        ...localProjectFields(previous),
         ...(project.kind === 'ssh'
           ? {
               kind: 'ssh' as const,
@@ -925,10 +975,13 @@ function sameProjectProjection(
   next: SettingsState['projects']
 ): boolean {
   if (current.length !== next.length) return false;
-  return current.every((project, index) => {
-    const candidate = next[index];
+  // 按 id 比对而非按下标：投影按 registry 插入顺序下发，本地数组顺序可能不同
+  // （项目删除后重建会错位）。按下标比会把纯顺序差异当成内容变化，每次广播都重写整个数组。
+  const currentById = new Map(current.map((project) => [project.id, project]));
+  return next.every((candidate) => {
+    const project = currentById.get(candidate.id);
     return (
-      project.id === candidate.id &&
+      project !== undefined &&
       project.name === candidate.name &&
       project.path === candidate.path &&
       project.kind === candidate.kind &&

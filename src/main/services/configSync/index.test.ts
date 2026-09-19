@@ -129,8 +129,9 @@ describe('config sync sender-bound import flow', () => {
       .map((match) => match[1])
       .sort();
 
-    expect([...SETTINGS_STATE_FIELDS].sort()).toEqual(persistedFields);
-    expect(Object.keys(CONFIG_SYNC_FIELD_POLICY).sort()).toEqual(persistedFields);
+    const fieldsWithLegacy = [...persistedFields, 'hashlineEditEnabled'].sort();
+    expect([...SETTINGS_STATE_FIELDS].sort()).toEqual(fieldsWithLegacy);
+    expect(Object.keys(CONFIG_SYNC_FIELD_POLICY).sort()).toEqual(fieldsWithLegacy);
   });
   it('token 仅限打开它的 renderer，且提交保留非同步设置', async () => {
     const bundle: ConfigSyncBundle = {
@@ -257,6 +258,7 @@ describe('config sync sender-bound import flow', () => {
       },
     ]);
     settings.patchSettingsState('smartCompactEnabled', true);
+    settings.patchSettingsState('compactStrategy', 'continuous-memory');
     settings.patchSettingsState('smartCompactModel', {
       providerId: 'smart-provider',
       modelId: 'model-1',
@@ -269,9 +271,11 @@ describe('config sync sender-bound import flow', () => {
     const decoded = await decodeBundle(readFileSync(exported));
     expect(decoded.state).toMatchObject({
       smartCompactEnabled: true,
+      compactStrategy: 'continuous-memory',
       smartCompactModel: { providerId: 'smart-provider', modelId: 'model-1' },
     });
     settings.patchSettingsState('smartCompactEnabled', false);
+    settings.patchSettingsState('compactStrategy', 'standard');
     settings.patchSettingsState('smartCompactModel', null);
   });
 
@@ -516,7 +520,9 @@ describe('config sync sender-bound import flow', () => {
     const sync = [...SYNC_FIELDS].sort();
 
     expect([...CONFIG_SYNC_COMMIT_FIELDS].sort()).toEqual(sync);
-    expect(listFrom('src/main/services/configSync/codec.ts', 'STATE_KEYS')).toEqual(sync);
+    expect(listFrom('src/main/services/configSync/codec.ts', 'STATE_KEYS')).toEqual(
+      [...sync, 'hashlineEditEnabled', 'bashInterceptEnabled'].sort()
+    );
     expect(listFrom('src/main/services/configSync/merge.ts', 'SCALAR_SETTING_KEYS')).toEqual(
       sync.filter((field) => !collections.includes(field))
     );

@@ -48,6 +48,18 @@ export interface DirectCandidate {
 /** 信令帧单字段上限：SDP 通常 < 4KB，候选 < 300B；超出即非法 */
 export const DIRECT_SIGNAL_MAX_CHARS = 16_384;
 
+export type PairSyncCursor = { epoch: string; seq: number };
+
+export type PairSessionSync = {
+  type: 'session-sync';
+  sessionId: string;
+  requestId: string;
+  cursor: PairSyncCursor;
+} & (
+  | { mode: 'snapshot'; snapshot: unknown }
+  | { mode: 'replay'; fromSeq: number; events: unknown[] }
+);
+
 // ── 上行：手机 → Electron（加密 payload，白名单）─────────────────────────
 export type PhoneToHost =
   | { type: 'prompt'; sessionId: string; text: string; images?: AttachedImage[] }
@@ -56,7 +68,12 @@ export type PhoneToHost =
   | { type: 'approval-respond'; sessionId: string; requestId: string; decision: ApprovalDecision }
   | { type: 'ask-respond'; sessionId: string; requestId: string; answer: string }
   | { type: 'snapshot' }
-  | { type: 'subscribe'; sessionId: string | null; sinceIndex?: number }
+  | {
+      type: 'subscribe';
+      sessionId: string | null;
+      sinceIndex?: number;
+      sync?: { requestId: string; cursor?: PairSyncCursor };
+    }
   | {
       type: 'spawn';
       sessionId: string;
@@ -80,6 +97,15 @@ export type PhoneToHost =
   | { type: 'queue-update'; sessionId: string; messageId: string; text: string }
   | { type: 'queue-send-now'; sessionId: string; messageId: string }
   | { type: 'queue-interrupt-send'; sessionId: string; messageId: string }
+  | { type: 'goal-pause'; sessionId: string }
+  | { type: 'goal-resume'; sessionId: string }
+  | { type: 'goal-clear'; sessionId: string }
+  | { type: 'goal-set'; sessionId: string; text: string }
+  | { type: 'compact'; sessionId: string; instructions?: string }
+  | { type: 'rewind'; sessionId: string; userIndexFromEnd: number; restoreFiles?: boolean }
+  | { type: 'retry'; sessionId: string }
+  | { type: 'task-stop'; sessionId: string; taskId: string }
+  | { type: 'subagent-stop'; sessionId: string; agentId: string }
   /** 登记/解除 Web Push 订阅：手机离线时桌面用它发系统推送 */
   | { type: 'push-subscribe'; subscription: PushSubscriptionJson }
   | { type: 'push-unsubscribe' }
@@ -92,7 +118,9 @@ export type PhoneToHost =
   | { type: 'direct-offer'; gen: number; sdp: string }
   | ({ type: 'direct-ice'; gen: number } & DirectCandidate)
   /** guest 放弃本代（超时/网络变化），host 释放对应 PeerConnection */
-  | { type: 'direct-close'; gen: number };
+  | { type: 'direct-close'; gen: number }
+  /** 经中继的端到端测速；必须走中继，不能走直连 */
+  | { type: 'probe'; nonce: number };
 
 /** 手机命令白名单：main 只接受这些 type，其余（set-approval-mode、设置写入等）拒绝 */
 export const PHONE_COMMAND_TYPES = [
@@ -113,12 +141,22 @@ export const PHONE_COMMAND_TYPES = [
   'queue-update',
   'queue-send-now',
   'queue-interrupt-send',
+  'goal-pause',
+  'goal-resume',
+  'goal-clear',
+  'goal-set',
+  'compact',
+  'rewind',
+  'retry',
+  'task-stop',
+  'subagent-stop',
   'push-subscribe',
   'push-unsubscribe',
   'presence',
   'direct-offer',
   'direct-ice',
   'direct-close',
+  'probe',
 ] as const satisfies readonly PhoneToHost['type'][];
 
 export function isPhoneCommand(value: unknown): value is PhoneToHost {
@@ -142,6 +180,10 @@ export interface CatalogEntry {
   status: string;
   /** 完成后未查看：桌面绿点、手机灰点 */
   unread?: boolean;
+  /** 挂起的 ask_user 数：抽屉「活跃中」与桌面 waiting 色点同口径 */
+  pendingAskCount?: number;
+  /** 挂起的工具审批数：手机主屏幕角标与待审批入口 */
+  pendingApprovalCount?: number;
   parentId?: string;
   /** 最后活动时间（末条消息或创建时间），手机端显示相对时间 */
   updatedAt?: number;
@@ -155,11 +197,22 @@ export interface CatalogEntry {
   thinkingLevel?: ThinkingLevel;
   /** 排队中的消息（桌面 renderer 独有状态），手机队列区展示与操作用 */
   queued?: { id: string; text: string; hasImages?: boolean }[];
+  /** 会话目标（桌面 renderer 独有状态），手机 GoalBar 展示与操作用 */
+  goal?: {
+    text: string;
+    status: 'active' | 'paused' | 'completed' | 'blocked' | 'waiting';
+    note?: string;
+    autoTurns: number;
+  };
+  /** 斜杠命令（技能名），仅当前订阅会话下发 */
+  slashCommands?: { name: string; description: string }[];
 }
 export interface ProjectEntry {
   id: string;
   name: string;
   path: string;
+  /** 用户设置的项目别名；展示一律走 pairProjectDisplayName，name 保持真实项目名 */
+  alias?: string;
   kind?: 'local' | 'ssh';
   sshConnectionName?: string;
   sshHost?: string;
@@ -241,7 +294,8 @@ export type HostToPhone =
       /** 桌面「运行中自动展开文件改动」偏好；缺省（旧桌面）时手机按默认开处理 */
       expandLiveEdits?: boolean;
     }
-  | { type: 'agent-event'; event: unknown }
+  | { type: 'agent-event'; event: unknown; cursor?: PairSyncCursor }
+  | PairSessionSync
   /** Web Push 能力下发：手机拿 VAPID 公钥才能 pushManager.subscribe */
   | { type: 'push-config'; vapidPublicKey: string }
   /** history 命令的应答：baseIndex 之前拼接的一页消息，手机按绝对 index 合并 */
@@ -260,4 +314,5 @@ export type HostToPhone =
       iceServers?: IceServerEntry[];
     }
   | { type: 'direct-answer'; gen: number; sdp: string }
-  | ({ type: 'direct-ice'; gen: number } & DirectCandidate);
+  | ({ type: 'direct-ice'; gen: number } & DirectCandidate)
+  | { type: 'probe-ack'; nonce: number };

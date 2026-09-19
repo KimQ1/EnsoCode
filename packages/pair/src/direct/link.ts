@@ -17,6 +17,7 @@ import {
   isAllowedCandidate,
   normalizeCandidate,
 } from './peer';
+import { DIRECT_QUALITY_TIMEOUT_MS, shouldPreferRelay } from './rttPrefer';
 
 /** 经中继 E2E 帧交换的直连信令（上下行并集） */
 export type DirectSignal = Extract<
@@ -39,6 +40,10 @@ export interface DirectLinkDeps {
   onResync(): void;
   /** 每代协商的结果与双方候选摘要（NAT 类型 / 地址族），供日志判断为何打不通 */
   onDiagnostic?(line: string): void;
+  /** DataChannel ping→pong 往返（ms）；仅直连通道 */
+  onRtt?(ms: number): void;
+  /** guest：DC 刚开时测中继 E2E；缺省则跳过比速、打开即切直连 */
+  onNeedRelayProbe?(): void;
 }
 
 /** DataChannel 心跳字节：与分片头（0x00/0x01）区分，在拆片之前拦截 */
@@ -62,7 +67,12 @@ export class DirectLink {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heartbeatDeadline: ReturnType<typeof setTimeout> | null = null;
+  private pingSentAt: number | null = null;
   private closed = false;
+  private qualityGen: number | null = null;
+  private qualityTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastDirectRtt: number | null = null;
+  private lastRelayRtt: number | null = null;
 
   constructor(private deps: DirectLinkDeps) {
     this.state = initialDirectState(deps.role);
@@ -105,6 +115,13 @@ export class DirectLink {
 
   networkChange(): void {
     this.dispatch({ type: 'network-change' });
+  }
+
+  /** 中继业务 probe 往返（ms）；仅 guest 比速窗口消费 */
+  noteRelayRtt(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    this.lastRelayRtt = ms;
+    this.maybeFinishQuality();
   }
 
   /** 对端解绑 / 本端遗忘设备：拆干净但对象仍可复用 */
@@ -262,6 +279,10 @@ export class DirectLink {
       this.dcOpen = true;
       this.clearNegotiateTimer();
       this.startHeartbeat(peer, gen);
+      if (this.deps.role === 'guest' && this.deps.onNeedRelayProbe) {
+        this.beginQuality(gen);
+        return;
+      }
       this.dispatch({ type: 'dc-open', gen });
     });
     peer.onMessage((bytes) => {
@@ -271,7 +292,16 @@ export class DirectLink {
         peer.send(new Uint8Array([PONG]));
         return;
       }
-      if (bytes.byteLength === 1 && bytes[0] === PONG) return;
+      if (bytes.byteLength === 1 && bytes[0] === PONG) {
+        if (this.pingSentAt !== null) {
+          const rtt = Date.now() - this.pingSentAt;
+          this.deps.onRtt?.(rtt);
+          this.lastDirectRtt = rtt;
+          this.pingSentAt = null;
+          this.maybeFinishQuality();
+        }
+        return;
+      }
       const frame = this.reassembler.push(bytes);
       if (frame) this.deps.onFrame(frame);
     });
@@ -290,6 +320,7 @@ export class DirectLink {
 
   private destroyPeer(): void {
     this.clearNegotiateTimer();
+    this.clearQuality();
     this.stopHeartbeat();
     this.dcOpen = false;
     const peer = this.peer;
@@ -304,14 +335,17 @@ export class DirectLink {
 
   private startHeartbeat(peer: DirectPeer, gen: number): void {
     this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
+    const ping = (): void => {
       if (this.peerGen !== gen) return;
+      this.pingSentAt = Date.now();
       peer.send(new Uint8Array([PING]));
       this.heartbeatDeadline ??= setTimeout(() => {
         this.heartbeatDeadline = null;
         if (this.peerGen === gen) this.dispatch({ type: 'dc-close', gen });
       }, HEARTBEAT_TIMEOUT_MS);
-    }, HEARTBEAT_INTERVAL_MS);
+    };
+    ping();
+    this.heartbeatTimer = setInterval(ping, HEARTBEAT_INTERVAL_MS);
   }
 
   private alive(): void {
@@ -322,6 +356,7 @@ export class DirectLink {
   private stopHeartbeat(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+    this.pingSentAt = null;
     this.alive();
   }
 
@@ -333,5 +368,44 @@ export class DirectLink {
   private clearRetry(): void {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+  }
+
+  private beginQuality(gen: number): void {
+    this.clearQuality();
+    this.qualityGen = gen;
+    this.lastDirectRtt = null;
+    this.lastRelayRtt = null;
+    this.deps.onNeedRelayProbe?.();
+    this.qualityTimer = setTimeout(() => this.finishQuality(gen), DIRECT_QUALITY_TIMEOUT_MS);
+  }
+
+  private maybeFinishQuality(): void {
+    if (this.qualityGen === null || this.qualityGen !== this.peerGen) return;
+    if (this.lastDirectRtt === null || this.lastRelayRtt === null) return;
+    this.finishQuality(this.qualityGen);
+  }
+
+  private finishQuality(gen: number): void {
+    if (this.qualityGen !== gen) return;
+    this.clearQuality();
+    if (this.peerGen !== gen || !this.dcOpen) return;
+    if (
+      this.lastDirectRtt !== null &&
+      this.lastRelayRtt !== null &&
+      shouldPreferRelay(this.lastDirectRtt, this.lastRelayRtt)
+    ) {
+      this.deps.onDiagnostic?.(
+        `direct slower than relay ${Math.round(this.lastDirectRtt)}ms>${Math.round(this.lastRelayRtt)}ms, stay relay`
+      );
+      this.dispatch({ type: 'prefer-relay' });
+      return;
+    }
+    this.dispatch({ type: 'dc-open', gen });
+  }
+
+  private clearQuality(): void {
+    if (this.qualityTimer) clearTimeout(this.qualityTimer);
+    this.qualityTimer = null;
+    this.qualityGen = null;
   }
 }

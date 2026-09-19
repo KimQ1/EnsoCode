@@ -1,7 +1,24 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { is } from '@electron-toolkit/utils';
-import { app, BrowserWindow, Menu, shell, type WebContents, WebContentsView } from 'electron';
+import { firstExistingPath } from '@shared/appServerMode';
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  screen,
+  shell,
+  type WebContents,
+  WebContentsView,
+} from 'electron';
+import { shouldReloadRenderer } from './rendererGone';
+import { attachPinnedWorkbenchBoundsSync, attachWindowsRestoreWake } from './win32Restore';
+import {
+  resolveWindowsAppUserModelId,
+  shouldSetWindowIcon,
+  windowIconCandidates,
+  windowsTaskbarAppDetails,
+} from './windowIcon';
 
 export interface CreateWindowOptions {
   /** renderer 入口 html 文件名（不含扩展名），对应 electron.vite renderer input */
@@ -44,6 +61,14 @@ export function getWorkbenchView(win: BrowserWindow): WebContentsView | undefine
 /** 主窗口 UI 的 webContents（pin 后不是 win.webContents） */
 export function getWindowWebContents(win: BrowserWindow): WebContents {
   return workbenchViews.get(win)?.webContents ?? win.webContents;
+}
+
+/** destroy 窗口前先 close，避免 WebContentsView 把 renderer 进程留下来。 */
+export function closeWindowWebContents(win: BrowserWindow): void {
+  if (win.isDestroyed()) return;
+  const workbench = workbenchViews.get(win);
+  if (workbench && !workbench.webContents.isDestroyed()) workbench.webContents.close();
+  if (!win.webContents.isDestroyed()) win.webContents.close();
 }
 
 export function sendToWindow(win: BrowserWindow, channel: string, ...args: unknown[]): void {
@@ -96,7 +121,6 @@ function attachWebContentsHandlers(win: BrowserWindow, contents: WebContents, en
     return { action: 'deny' };
   });
 
-  const recoverable = new Set(['crashed', 'abnormal-exit', 'oom', 'launch-failed']);
   let goneAt = 0;
   let goneCount = 0;
   contents.on('render-process-gone', (_event, details) => {
@@ -108,7 +132,7 @@ function attachWebContentsHandlers(win: BrowserWindow, contents: WebContents, en
       `[renderer] render-process-gone entry=${entry} reason=${details.reason} exitCode=${details.exitCode} count=${goneCount}`
     );
     if (win.isDestroyed() || contents.isDestroyed()) return;
-    if (!recoverable.has(details.reason) || goneCount > 3) return;
+    if (!shouldReloadRenderer(details.reason, goneCount)) return;
     contents.reload();
   });
 }
@@ -123,15 +147,15 @@ function loadRenderer(contents: WebContents, entry: string): void {
 
 function createPinnedWorkbench(win: BrowserWindow, entry: string): WebContentsView {
   const view = new WebContentsView({ webPreferences: webPreferences() });
-  const sync = (): void => {
-    if (win.isDestroyed()) return;
-    const { width, height } = win.getContentBounds();
-    view.setBounds({ x: 0, y: 0, width, height });
-  };
   view.setBackgroundColor('#00000000');
   win.contentView.addChildView(view);
-  win.on('resize', sync);
-  sync();
+  const { resync } = attachPinnedWorkbenchBoundsSync(win, view);
+  if (process.platform === 'win32') {
+    screen.on('display-metrics-changed', resync);
+    win.on('closed', () => {
+      screen.removeListener('display-metrics-changed', resync);
+    });
+  }
   workbenchViews.set(win, view);
   attachWebContentsHandlers(win, view.webContents, entry);
   view.webContents.once('did-finish-load', () => {
@@ -152,6 +176,27 @@ function saveWindowState(win: BrowserWindow, stateFile: string): void {
 /** macOS 红绿灯自定义位置（按 44px 标题栏垂直居中） */
 export const TRAFFIC_LIGHT_POSITION = { x: 16, y: 16 };
 
+function resolveWindowIcon(): string | undefined {
+  if (
+    !shouldSetWindowIcon({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+    })
+  ) {
+    return undefined;
+  }
+  return (
+    firstExistingPath(
+      windowIconCandidates({
+        resourcesPath: process.resourcesPath,
+        appPath: app.getAppPath(),
+        cwd: process.cwd(),
+      }),
+      existsSync
+    ) ?? undefined
+  );
+}
+
 /**
  * 通用无边框窗口创建：
  * - macOS: hiddenInset 保留 traffic lights
@@ -164,6 +209,7 @@ export function createAppWindow(options: CreateWindowOptions): BrowserWindow {
   const defaults: WindowState = { width: options.width, height: options.height };
   const state = options.stateFile ? loadWindowState(options.stateFile, defaults) : defaults;
 
+  const icon = resolveWindowIcon();
   const win = new BrowserWindow({
     width: state.width,
     height: state.height,
@@ -177,13 +223,39 @@ export function createAppWindow(options: CreateWindowOptions): BrowserWindow {
     ...(isMac && { trafficLightPosition: TRAFFIC_LIGHT_POSITION }),
     ...(isWindows && { thickFrame: true }),
     show: false,
-    backgroundColor: '#00000000',
-    ...(options.pinWorkbenchView ? { transparent: true } : {}),
+    ...(icon ? { icon } : {}),
+    ...(options.pinWorkbenchView ? { transparent: true, backgroundColor: '#00000000' } : {}),
     webPreferences: webPreferences(),
   });
 
+  if (icon) win.setIcon(icon);
+
+  // Taskbar icon is keyed by AUMID → Start Menu shortcut. win-unpacked must
+  // use a distinct AUMID or Windows keeps painting the installed square plate.
+  if (isWindows) {
+    try {
+      const appId = resolveWindowsAppUserModelId({
+        execPath: process.execPath,
+        isPackaged: app.isPackaged,
+      });
+      win.setAppDetails(
+        windowsTaskbarAppDetails({
+          execPath: process.execPath,
+          appId,
+          displayName: app.getName(),
+        })
+      );
+    } catch (error) {
+      console.warn('[window] setAppDetails failed', error);
+    }
+  }
+
   if (state.isMaximized) {
     win.maximize();
+  }
+
+  if (isWindows) {
+    attachWindowsRestoreWake(win);
   }
 
   if (options.stateFile) {

@@ -250,8 +250,79 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: packages/relay-go/go.sum
+
+      - name: Get pnpm store directory
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test relay
+        working-directory: packages/relay-go
+        run: go test -count=1 ./...
+
+      - name: Embed phone PWA
+        run: ./packages/relay-go/sync-frontend.sh
+
+      - name: Install UPX
+        run: |
+          curl -fsSL https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz \
+            | sudo tar -xJ -C /usr/local/bin --strip-components=1 --wildcards '*/upx'
+          upx --version
+
+      - name: Build linux amd64 and arm64
+        working-directory: packages/relay-go
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          VERSION="${{ github.ref_name }}"
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -trimpath -buildmode=exe -ldflags="-s -w -X main.version=${VERSION}" -o dist/enso-relay-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -trimpath -buildmode=exe -ldflags="-s -w -X main.version=${VERSION}" -o dist/enso-relay-linux-arm64 .
+          ls -lh dist/enso-relay-linux-*
+          upx --best --lzma dist/enso-relay-linux-amd64 dist/enso-relay-linux-arm64
+          ls -lh dist/enso-relay-linux-*
+          chmod +x dist/enso-relay-linux-*
+          cd dist
+          sha256sum enso-relay-linux-amd64 enso-relay-linux-arm64 > enso-relay-checksums.txt
+
+      - name: Upload relay binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: enso-relay
+          path: packages/relay-go/dist/enso-relay-*
+          retention-days: 7
+
+
   generate-release-notes:
-    needs: [build-mac, build-windows, build-linux]
+    needs: [build-mac, build-windows, build-linux, build-relay]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     timeout-minutes: 10
@@ -293,6 +364,23 @@ jobs:
           TAG="${{ github.ref_name }}"
           gh release delete-asset "$TAG" latest-mac.yml --yes 2>/dev/null || true
           gh release upload "$TAG" latest-mac.yml --clobber
+
+      - name: Download relay binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: enso-relay
+          path: relay-artifacts
+
+      - name: Upload relay binaries to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          gh release upload "$TAG" \
+            relay-artifacts/enso-relay-linux-amd64 \
+            relay-artifacts/enso-relay-linux-arm64 \
+            relay-artifacts/enso-relay-checksums.txt \
+            --clobber
 
       - name: Set Tag
         id: tag
@@ -371,6 +459,7 @@ jobs:
             echo "- macOS: \`.dmg\`（Apple Silicon / Intel）"
             echo "- Windows: \`EnsoCode-Setup-${VERSION}.exe\`"
             echo "- Linux: \`.AppImage\` / \`.deb\`"
+            echo "- 自建中继: \`enso-relay-linux-amd64\` / \`enso-relay-linux-arm64\`"
             echo ""
             echo "---"
             echo ""

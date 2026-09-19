@@ -58,8 +58,13 @@ export {
   revokePairing,
   startHostPairing,
 } from './handshake';
-export { attachHeartbeat, type Heartbeat } from './heartbeat';
-export { pairProjectListLabel, sshProjectLabel, toPairProjectEntry } from './projectEntry';
+export { attachHeartbeat, type Heartbeat, VISIBILITY_PROBE_MS } from './heartbeat';
+export {
+  pairProjectDisplayName,
+  pairProjectListLabel,
+  sshProjectLabel,
+  toPairProjectEntry,
+} from './projectEntry';
 export {
   type ApprovalDecision,
   type ApprovalMode,
@@ -73,6 +78,8 @@ export {
   type IceServerEntry,
   isPhoneCommand,
   type PairControl,
+  type PairSessionSync,
+  type PairSyncCursor,
   PHONE_COMMAND_TYPES,
   type PhoneToHost,
   type ProjectEntry,
@@ -91,6 +98,8 @@ export {
 } from './relay';
 export {
   createCachedHostLookup,
+  isConnectStuck,
+  isForegroundSocketStale,
   isMagicDnsOnly,
   type NetworkInterfaceSnapshot,
   type NudgeReason,
@@ -100,6 +109,7 @@ export {
   parseResolvConfNameservers,
   parseScutilGlobalNameservers,
   pickRelayConnectAddress,
+  RELAY_CONNECT_TIMEOUT_MS,
   type RelayHostAddress,
   serializeRelayHostCache,
   shouldReplaceOnNudge,
@@ -107,3 +117,4 @@ export {
   shouldUsePinnedRelaySocket,
   TAILSCALE_MAGIC_DNS,
 } from './revive';
+export { isPairSyncCursor, parsePairSessionSync } from './sessionSync';

@@ -1,0 +1,11 @@
+/enso-relay
+/enso-relay-*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/dist/
+# sync-frontend.sh 产物；只保留占位 index.html 入库
+/frontend/assets/
+/frontend/icons/
+/frontend/manifest.webmanifest
+/frontend/sw.js

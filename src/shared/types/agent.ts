@@ -18,11 +18,21 @@ import {
   parseCapabilityReceipt,
   parseCapabilityResult,
 } from '../capabilities/types';
+import { type CompactStrategy, parseCompactStrategy } from '../compactStrategy';
 import type { DefaultModelRef } from '../defaultModel';
 import { parseMaxActiveCoworkers } from '../maxActiveCoworkers';
 import { PRODUCT_SURFACE_INVENTORY, type ProductSurfaceId } from '../productSurfaces';
 import { parseSmartCompactMode } from '../smartCompactMode';
 import { WINDOWS_LOCAL_SHELLS, type WindowsLocalShell } from '../windowsLocalShell';
+import { type EditMode, isEditMode } from './editMode';
+import {
+  PROJECTED_APPLY_PATCH_PATH_COUNT_LIMIT,
+  PROJECTED_APPLY_PATCH_PATH_TEXT_LIMIT,
+  PROJECTED_FILE_CHANGE_LIMIT,
+  PROJECTED_FILE_TEXT_LIMIT,
+  type ProjectedApplyPatchOutcome,
+  type ProjectedFileChange,
+} from './fileChanges';
 import {
   MODEL_API_KINDS,
   type ModelApiKind,
@@ -186,6 +196,23 @@ export interface SubagentModelOption {
   description?: string;
 }
 
+export type SubagentActivity =
+  | {
+      id: string;
+      type: 'assistant';
+      /** 仅可见 text part，不含 thinking */
+      text: string;
+      streaming: boolean;
+    }
+  | {
+      id: string;
+      type: 'tool';
+      toolName: string;
+      argumentsText: string;
+      outputText?: string;
+      status: 'running' | 'done' | 'failed' | 'aborted';
+    };
+
 /** 子代理状态（渲染层状态行与 snapshot 共用） */
 export interface SubagentInfo {
   id: string;
@@ -197,6 +224,10 @@ export interface SubagentInfo {
   currentActivity: string;
   /** 活动历史（工具调用与阶段性文本,capped） */
   activityLog?: string[];
+  /** 有界的可见正文与工具执行详情，不含 thinking */
+  activities?: SubagentActivity[];
+  /** 较早的过程详情已按会话预算清理；最终报告仍保留 */
+  detailsPruned?: boolean;
   /** 完成后的最终产出（markdown） */
   resultText?: string;
   /** 使用的模型 */
@@ -531,11 +562,13 @@ export type AgentCommand =
       loadHarnessAssets?: boolean;
       /** 探后折叠工具 + context 折叠 */
       exploreFoldEnabled?: boolean;
-      /** 拦截 cat/grep/sed -i 等，强制走 read/grep/edit/write/find；缺省关 */
-      bashInterceptEnabled?: boolean;
-      /** Hashline 行锚点 read/edit；缺省关 */
+      /** 文件编辑工具模式；缺省 apply_patch */
+      editMode?: EditMode;
+      /** @deprecated 仅用于读取旧 Main 命令；新代码发送 editMode。 */
       hashlineEditEnabled?: boolean;
-      /** 父会话加载 Enso compact hook 作为 compact 摘要后端 */
+      /** 上下文压缩策略；缺省 standard。与旧 smartCompactEnabled 过渡兼容。 */
+      compactStrategy?: CompactStrategy;
+      /** @deprecated 仅用于读取旧 Main 命令；新代码发送 compactStrategy。 */
       smartCompactEnabled?: boolean;
       /** 独立摘要模型；缺省跟随当前会话模型 */
       smartCompactSummaryModel?: SpawnModelConfig;
@@ -556,6 +589,8 @@ export type AgentCommand =
       windowsLocalShell?: WindowsLocalShell;
       /** ssh 项目：工具执行切到远端。Main 从项目权威派生，不信任 renderer。 */
       remote?: AgentRemoteConfig;
+      /** 旁路会话：首条 prompt 前缀注入，消费一次 */
+      rolePrompt?: string;
     }
   | {
       type: 'spawn-child';
@@ -664,7 +699,7 @@ export type AgentCommand =
       candidates: SpawnModelConfig[];
     }
   | {
-      /** 通用一次性文本补全（记忆蒸馏用）：同 summarize-title 的候选链语义，结果经 text-completed / text-failed 按 requestId 回流 */
+      /** 通用一次性文本补全（记忆蒸馏 / btw）：同 summarize-title 的候选链语义，结果经 text-completed / text-failed 按 requestId 回流 */
       type: 'complete-text';
       requestId: string;
       systemPrompt: string;
@@ -672,6 +707,15 @@ export type AgentCommand =
       candidates: SpawnModelConfig[];
       timeoutMs: number;
       maxTokens?: number;
+      /** 为 true 时额外推 text-delta；记忆蒸馏不设 */
+      stream?: true;
+      /** 透传 streamSimple/completeSimple 的思考档；off 表示关闭 */
+      reasoning?: ThinkingLevel | 'off';
+    }
+  | {
+      /** 中止一次性文本补全（btw / 记忆蒸馏）；无会话身份，按 requestId 对准 */
+      type: 'abort-complete-text';
+      requestId: string;
     }
   | { type: 'abort-retry'; identity: SessionIdentity }
   | { type: 'retry'; identity: SessionIdentity }
@@ -773,10 +817,16 @@ export interface ProjectedMessage {
   subagentMeta?: { modelId?: string; outputTokens?: number; steps?: number };
   /** Hashline edit 成功结果：补丁前后全文（不含 patch） */
   editDiff?: { oldText: string; newText: string };
+  /** apply_patch toolResult 中已确实落盘的物理文件操作 */
+  fileChanges?: ProjectedFileChange[];
+  /** apply_patch 完整终态清单，不依赖普通 content 截断预算 */
+  applyPatchOutcome?: ProjectedApplyPatchOutcome;
   /** compactionSummary 消息：压缩前的上下文 token 数 */
   tokensBefore?: number;
   /** 摘要来自 Enso compact hook，不是原生 summarizer */
   verified?: boolean;
+  /** 摘要由持续记忆 ledger 渲染（非智能压缩兜底） */
+  memory?: boolean;
 }
 
 export interface SessionSnapshot {
@@ -974,6 +1024,7 @@ export type AgentWorkerEvent =
       identity: SessionIdentity;
       seq: number;
       editorText?: string;
+      editorImages?: AttachedImage[];
       filesRestored?: boolean;
     }
   | {
@@ -1074,6 +1125,7 @@ export type AgentWorkerEvent =
     }
   | { type: 'text-completed'; requestId: string; text: string }
   | { type: 'text-failed'; requestId: string; error: string }
+  | { type: 'text-delta'; requestId: string; text: string; thinking?: string }
   | {
       type: 'task-output';
       identity: SessionIdentity;
@@ -1135,6 +1187,103 @@ const hasExactKeys = (value: Record<string, unknown>, keys: readonly string[]): 
 
 const isSequence = (value: unknown): value is number =>
   Number.isInteger(value) && (value as number) >= 0;
+
+function parseProjectedFileChanges(value: unknown): ProjectedFileChange[] | null {
+  if (!Array.isArray(value) || value.length > PROJECTED_FILE_CHANGE_LIMIT) return null;
+  for (const item of value) {
+    if (
+      !isRecord(item) ||
+      !hasOnlyKeys(item, ['path', 'oldText', 'newText', 'type', 'truncated']) ||
+      !isNonEmptyString(item.path) ||
+      item.path.length > PROJECTED_APPLY_PATCH_PATH_TEXT_LIMIT ||
+      typeof item.oldText !== 'string' ||
+      typeof item.newText !== 'string' ||
+      (item.type !== 'add' && item.type !== 'update' && item.type !== 'delete') ||
+      (item.truncated !== undefined && item.truncated !== true) ||
+      item.oldText.length > PROJECTED_FILE_TEXT_LIMIT + (item.truncated === true ? 2 : 0) ||
+      item.newText.length > PROJECTED_FILE_TEXT_LIMIT + (item.truncated === true ? 2 : 0) ||
+      (item.truncated === true && !item.oldText.endsWith('\n…') && !item.newText.endsWith('\n…'))
+    ) {
+      return null;
+    }
+  }
+  return value as ProjectedFileChange[];
+}
+
+function parseProjectedApplyPatchOutcome(value: unknown): ProjectedApplyPatchOutcome | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      'status',
+      'applied',
+      'failed',
+      'unattempted',
+      'uncertain',
+      'error',
+      'errorTruncated',
+      'input',
+      'inputTruncated',
+    ]) ||
+    (value.status !== 'success' && value.status !== 'partial' && value.status !== 'failed')
+  ) {
+    return null;
+  }
+  const lists = [value.applied, value.failed, value.unattempted, value.uncertain];
+  if (
+    lists.some(
+      (list) =>
+        !Array.isArray(list) ||
+        list.some(
+          (path) => !isNonEmptyString(path) || path.length > PROJECTED_APPLY_PATCH_PATH_TEXT_LIMIT
+        )
+    )
+  ) {
+    return null;
+  }
+  const [applied, failed, unattempted, uncertain] = lists as string[][];
+  const allPaths = [...applied, ...failed, ...unattempted, ...uncertain];
+  const error = typeof value.error === 'string' && value.error.length > 0 ? value.error : null;
+  const input = typeof value.input === 'string' && value.input.length > 0 ? value.input : null;
+  if (
+    allPaths.length > PROJECTED_APPLY_PATCH_PATH_COUNT_LIMIT ||
+    new Set(allPaths).size !== allPaths.length ||
+    (value.error !== undefined && error === null) ||
+    (value.errorTruncated !== undefined && value.errorTruncated !== true) ||
+    (value.errorTruncated === true &&
+      (error === null || error.length > PROJECTED_FILE_TEXT_LIMIT + 2 || !error.endsWith('\n…'))) ||
+    (value.errorTruncated !== true && error !== null && error.length > PROJECTED_FILE_TEXT_LIMIT) ||
+    (value.input !== undefined && input === null) ||
+    (value.inputTruncated !== undefined && value.inputTruncated !== true) ||
+    (value.inputTruncated === true &&
+      (input === null || input.length > PROJECTED_FILE_TEXT_LIMIT + 2 || !input.endsWith('\n…'))) ||
+    (value.inputTruncated !== true && input !== null && input.length > PROJECTED_FILE_TEXT_LIMIT) ||
+    (value.status === 'success' &&
+      (error !== null ||
+        input !== null ||
+        failed.length > 0 ||
+        unattempted.length > 0 ||
+        uncertain.length > 0)) ||
+    (value.status === 'partial' && (applied.length === 0 || error === null)) ||
+    (value.status === 'failed' && (applied.length > 0 || error === null))
+  ) {
+    return null;
+  }
+  return value as unknown as ProjectedApplyPatchOutcome;
+}
+
+function hasValidProjectedFileChanges(value: Record<string, unknown>): boolean {
+  const fileChanges =
+    value.fileChanges === undefined ? undefined : parseProjectedFileChanges(value.fileChanges);
+  if (fileChanges === null) return false;
+  if (value.applyPatchOutcome === undefined) return true;
+  const outcome = parseProjectedApplyPatchOutcome(value.applyPatchOutcome);
+  return (
+    outcome !== null &&
+    fileChanges !== undefined &&
+    outcome.applied.length === fileChanges.length &&
+    outcome.applied.every((path, index) => path === fileChanges[index]?.path)
+  );
+}
 
 /**
  * worker 回传的 token：白名单外的字段（SDK 会保留 id_token）**裁掉而不是整条判负——
@@ -1832,7 +1981,9 @@ export function parseSessionSnapshot(value: unknown): SessionSnapshot | null {
     !parseAnySessionIdentity(value.identity) ||
     (value.status !== 'idle' && value.status !== 'running' && value.status !== 'failed') ||
     !Array.isArray(value.messages) ||
-    value.messages.some((message) => !isRecord(message)) ||
+    value.messages.some(
+      (message) => !isRecord(message) || !hasValidProjectedFileChanges(message)
+    ) ||
     !Array.isArray(value.commands) ||
     value.commands.some(
       (command) =>
@@ -1888,8 +2039,9 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
           'loadLocalSkills',
           'loadHarnessAssets',
           'exploreFoldEnabled',
-          'bashInterceptEnabled',
+          'editMode',
           'hashlineEditEnabled',
+          'compactStrategy',
           'smartCompactEnabled',
           'smartCompactSummaryModel',
           'smartCompactMode',
@@ -1904,6 +2056,7 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
           'disabledTools',
           'windowsLocalShell',
           'remote',
+          'rolePrompt',
         ]) ||
         !parseSessionIdentity(value.identity) ||
         typeof value.cwd !== 'string' ||
@@ -1915,10 +2068,11 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
             value.windowsLocalShell as string
           )) ||
         (value.exploreFoldEnabled !== undefined && typeof value.exploreFoldEnabled !== 'boolean') ||
-        (value.bashInterceptEnabled !== undefined &&
-          typeof value.bashInterceptEnabled !== 'boolean') ||
+        (value.editMode !== undefined && !isEditMode(value.editMode)) ||
         (value.hashlineEditEnabled !== undefined &&
           typeof value.hashlineEditEnabled !== 'boolean') ||
+        (value.compactStrategy !== undefined &&
+          parseCompactStrategy(value.compactStrategy) === null) ||
         (value.smartCompactEnabled !== undefined &&
           typeof value.smartCompactEnabled !== 'boolean') ||
         (value.smartCompactSummaryModel !== undefined &&
@@ -1931,7 +2085,8 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
           (!Array.isArray(value.subagentModels) ||
             value.subagentModels.some((entry) => parseSubagentModelOption(entry) === null))) ||
         (value.approvalReviewer !== undefined &&
-          parseSpawnModelConfig(value.approvalReviewer) === null)
+          parseSpawnModelConfig(value.approvalReviewer) === null) ||
+        (value.rolePrompt !== undefined && !isNonEmptyString(value.rolePrompt))
       ) {
         return null;
       }
@@ -1995,23 +2150,17 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
         : null;
     }
     case 'complete-text':
-      return (hasExactKeys(value, [
+      return hasOnlyKeys(value, [
         'type',
         'requestId',
         'systemPrompt',
         'userText',
         'candidates',
         'timeoutMs',
-      ]) ||
-        hasExactKeys(value, [
-          'type',
-          'requestId',
-          'systemPrompt',
-          'userText',
-          'candidates',
-          'timeoutMs',
-          'maxTokens',
-        ])) &&
+        'maxTokens',
+        'stream',
+        'reasoning',
+      ]) &&
         isNonEmptyString(value.requestId) &&
         typeof value.systemPrompt === 'string' &&
         typeof value.userText === 'string' &&
@@ -2022,10 +2171,18 @@ export function parseAgentCommand(value: unknown): AgentCommand | null {
           (typeof value.maxTokens === 'number' &&
             Number.isInteger(value.maxTokens) &&
             value.maxTokens > 0)) &&
+        (value.stream === undefined || value.stream === true) &&
+        (value.reasoning === undefined ||
+          value.reasoning === 'off' ||
+          THINKING_LEVELS.includes(value.reasoning as ThinkingLevel)) &&
         Array.isArray(value.candidates) &&
         value.candidates.length >= 1 &&
         value.candidates.length <= TITLE_SUMMARY_MAX_CANDIDATES &&
         value.candidates.every((candidate) => parseSpawnModelConfig(candidate))
+        ? (value as unknown as AgentCommand)
+        : null;
+    case 'abort-complete-text':
+      return hasExactKeys(value, ['type', 'requestId']) && isNonEmptyString(value.requestId)
         ? (value as unknown as AgentCommand)
         : null;
     case 'summarize-title':
@@ -2344,6 +2501,14 @@ export function parseAgentWorkerEvent(value: unknown): AgentWorkerEvent | null {
       ? (value as unknown as AgentWorkerEvent)
       : null;
   }
+  if (value.type === 'text-delta') {
+    return hasOnlyKeys(value, ['type', 'requestId', 'text', 'thinking']) &&
+      isNonEmptyString(value.requestId) &&
+      typeof value.text === 'string' &&
+      (value.thinking === undefined || typeof value.thinking === 'string')
+      ? (value as unknown as AgentWorkerEvent)
+      : null;
+  }
   if (value.type === 'text-completed') {
     return hasExactKeys(value, ['type', 'requestId', 'text']) &&
       isNonEmptyString(value.requestId) &&
@@ -2383,7 +2548,9 @@ export function parseAgentWorkerEvent(value: unknown): AgentWorkerEvent | null {
         ? (value as unknown as AgentWorkerEvent)
         : null;
     case 'message-upsert':
-      return isSequence(value.index) && isRecord(value.message)
+      return isSequence(value.index) &&
+        isRecord(value.message) &&
+        hasValidProjectedFileChanges(value.message)
         ? (value as unknown as AgentWorkerEvent)
         : null;
     case 'turn-completed':
@@ -2408,11 +2575,15 @@ export function parseAgentWorkerEvent(value: unknown): AgentWorkerEvent | null {
         : null;
     case 'messages-truncated':
       return isSequence(value.length) ? (value as unknown as AgentWorkerEvent) : null;
-    case 'rewind-done':
+    case 'rewind-done': {
+      const editorImages =
+        value.editorImages === undefined ? undefined : parseAttachedImages(value.editorImages);
       return (value.editorText === undefined || typeof value.editorText === 'string') &&
+        editorImages !== null &&
         (value.filesRestored === undefined || typeof value.filesRestored === 'boolean')
         ? (value as unknown as AgentWorkerEvent)
         : null;
+    }
     case 'fork-done':
       return isUuid(value.targetConversationId) &&
         (value.sessionFile === undefined || typeof value.sessionFile === 'string') &&

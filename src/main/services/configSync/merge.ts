@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { isReservedAgentTypeName } from '@shared/builtinAgents';
 import type { ConfigSyncSummary } from '@shared/types';
-import { DEFAULT_PRESET_ID } from '@shared/types';
+import { DEFAULT_PRESET_ID, resolveEditMode } from '@shared/types';
 
 import type { ConfigSyncBundle } from './types';
 
@@ -45,8 +45,7 @@ const SCALAR_SETTING_KEYS = [
   'loadLocalSkills',
   'loadHarnessAssets',
   'exploreFoldEnabled',
-  'bashInterceptEnabled',
-  'hashlineEditEnabled',
+  'editMode',
   'openChangesOnFileEdit',
   'compactReadOnlyTools',
   'expandLiveEdits',
@@ -69,6 +68,7 @@ const SCALAR_SETTING_KEYS = [
   'keybindings',
   'usageModelPricing',
   'defaultModel',
+  'defaultModelFollowLast',
   'titleSummaryModel',
   'memoryDistillModel',
   'memoryChatModel',
@@ -77,6 +77,7 @@ const SCALAR_SETTING_KEYS = [
   'approvalReviewer',
   'defaultPresetId',
   'titleSummaryEnabled',
+  'compactStrategy',
   'smartCompactEnabled',
   'smartCompactMode',
   'memoryEmbeddingModel',
@@ -619,6 +620,11 @@ export function planImport(
 } {
   if (mode !== 'merge' && mode !== 'replace') throw new Error('Unsupported config sync mode');
   const state = clone(current);
+  if ('editMode' in state || 'hashlineEditEnabled' in state) {
+    state.editMode = resolveEditMode(state.editMode, state.hashlineEditEnabled);
+    delete state.hashlineEditEnabled;
+  }
+  delete state.bashInterceptEnabled;
   const incoming = {
     providers: sourceRecords(bundle, 'providers'),
     skills: sourceRecords(bundle, 'skills'),
@@ -745,9 +751,9 @@ export function planImport(
     'loadLocalSkills',
     'loadHarnessAssets',
     'exploreFoldEnabled',
-    'bashInterceptEnabled',
-    'hashlineEditEnabled',
+    'editMode',
     'titleSummaryEnabled',
+    'compactStrategy',
     'smartCompactEnabled',
     'smartCompactMode',
     'memoryEmbeddingModel',
@@ -757,6 +763,7 @@ export function planImport(
     'defaultReasoningEnabled',
     'defaultThinkingLevel',
     'subagentModelsEnabled',
+    'defaultModelFollowLast',
     'disabledBuiltinAgentTypes',
     'disabledBuiltinTools',
     'openChangesOnFileEdit',

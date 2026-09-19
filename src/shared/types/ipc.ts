@@ -28,6 +28,8 @@ export const IPC_CHANNELS = {
   WINDOW_POPUP_MENU: 'window:popup-menu',
   APP_CLOSE_REQUEST: 'app:close-request',
   APP_CLOSE_RESPONSE: 'app:close-response',
+  APP_FLUSH_PERSIST_REQUEST: 'app:flush-persist-request',
+  APP_FLUSH_PERSIST_RESPONSE: 'app:flush-persist-response',
 
   // Local provider scan/import
   PROVIDERS_SCAN_LOCAL: 'providers:scan-local',
@@ -256,6 +258,7 @@ export const IPC_CHANNELS = {
   BROWSER_RESTORE_TABS: 'browser:restore-tabs',
   BROWSER_LIST_SEARCHABLE_TABS: 'browser:list-searchable-tabs',
   BROWSER_CLOSE_TAB: 'browser:close-tab',
+  BROWSER_CLOSE_SESSION: 'browser:close-session',
   /** renderer → main:开关面板内嵌 DevTools */
   BROWSER_SET_DEVTOOLS: 'browser:set-devtools',
   /** renderer → main:DevTools 洞矩形 */
@@ -272,6 +275,7 @@ export const IPC_CHANNELS = {
   UPDATER_DOWNLOAD_UPDATE: 'updater:downloadUpdate',
   UPDATER_QUIT_AND_INSTALL: 'updater:quitAndInstall',
   UPDATER_SET_AUTO_UPDATE_ENABLED: 'updater:setAutoUpdateEnabled',
+  UPDATER_SET_AUTO_RESTART_WHEN_IDLE: 'updater:setAutoRestartWhenIdle',
   UPDATER_STATUS: 'updater:status',
 
   // Network proxy
@@ -292,7 +296,7 @@ export const IPC_CHANNELS = {
   PAIR_SESSION_CREATED: 'pair:session-created',
   /** main → renderer：手机改了会话模型/推理档位，请求应用到会话 store（与桌面同一路径） */
   PAIR_SESSION_CONFIG: 'pair:session-config',
-  /** main → renderer：手机的排队消息操作（队列只存于 renderer store，不走 agent bridge） */
+  /** main → renderer：手机的排队消息 / 会话目标操作（只存于 renderer store，不走 agent bridge） */
   PAIR_QUEUE_ACTION: 'pair:queue-action',
 
   // Remote nodes: this desktop as guest connecting to another EnsoCode desktop
@@ -307,6 +311,11 @@ export const IPC_CHANNELS = {
   NODES_MESSAGE: 'nodes:message',
 
   WORKSPACE_SEARCH_QUERY: 'workspace-search:query',
+
+  BTW_PROMPT: 'btw:prompt',
+  BTW_ABORT: 'btw:abort',
+  BTW_SPAWN: 'btw:spawn',
+  BTW_DISPOSE: 'btw:dispose',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

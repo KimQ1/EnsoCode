@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
-
+import { getApplyPatchPaths } from './applyPatch';
 /** 极简 glob → RegExp：`**` 任意层级（含空）、`*` 段内任意、`?` 单字符；匹配整段 posix 相对路径 */
 export function globToRegExp(glob: string): RegExp {
   let out = '';
@@ -27,21 +27,19 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${out}$`);
 }
 
-const HASHLINE_HEADER = /^\[(.+)#([0-9A-Fa-f]{4})\]$/;
-
-/** replace 走 path；hashline 从 input 首个非空文件头抽 path */
+/** replace/write 走 path；带 input 的旧 Hashline 形状不再当写目标。 */
 export function extractEditTargetPath(params: unknown): string | undefined {
   if (!params || typeof params !== 'object' || Array.isArray(params)) return undefined;
   const record = params as Record<string, unknown>;
-  if (typeof record.path === 'string' && record.path.length > 0) return record.path;
-  if (typeof record.input !== 'string') return undefined;
-  for (const line of record.input.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const match = HASHLINE_HEADER.exec(trimmed);
-    return match?.[1];
-  }
-  return undefined;
+  if (typeof record.input === 'string' && record.input.length > 0) return undefined;
+  return typeof record.path === 'string' && record.path.length > 0 ? record.path : undefined;
+}
+
+/** 按工具协议提取全部真实写目标；apply_patch 必须优先走自身 parser。 */
+export function extractWriteTargetPaths(toolName: string, params: unknown): string[] {
+  if (toolName === 'apply_patch') return getApplyPatchPaths(params);
+  const target = extractEditTargetPath(params);
+  return target ? [target] : [];
 }
 
 /** filePath 绝对或相对 cwd；越出 cwd 恒 false */
@@ -59,6 +57,19 @@ export function isPathInWriteScope(
   return scope.some((glob) => globToRegExp(glob).test(rel));
 }
 
+export function withWritePreflight<T extends ToolDefinition>(
+  def: T,
+  preflight: (params: unknown, signal: AbortSignal | undefined) => Promise<unknown>
+): T {
+  return {
+    ...def,
+    execute: async (id, params, signal, ...rest) => {
+      await preflight(params, signal);
+      return def.execute(id, params, signal, ...rest);
+    },
+  } as T;
+}
+
 /** 包装 edit/write 类工具：参数 path 不在范围内即拒绝；scope 缺省/为空原样返回 */
 export function withWriteScope<T extends ToolDefinition>(
   def: T,
@@ -69,11 +80,16 @@ export function withWriteScope<T extends ToolDefinition>(
   return {
     ...def,
     execute: async (id, params, ...rest) => {
-      const target = extractEditTargetPath(params);
-      if (typeof target === 'string' && !isPathInWriteScope(target, cwd, scope)) {
-        throw new Error(
-          `write scope: "${target}" is outside [${scope.join(', ')}] — this agent type may only write files matching those globs`
-        );
+      const targets = extractWriteTargetPaths(def.name, params);
+      if (targets.length === 0) {
+        throw new Error('write scope: cannot determine a valid target path');
+      }
+      for (const target of targets) {
+        if (!isPathInWriteScope(target, cwd, scope)) {
+          throw new Error(
+            `write scope: "${target}" is outside [${scope.join(', ')}] — this agent type may only write files matching those globs`
+          );
+        }
       }
       return def.execute(id, params, ...rest);
     },

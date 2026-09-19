@@ -14,6 +14,7 @@ describe('访客端直连会话', () => {
         attempt: 0,
         capable: true,
         peerOnline: false,
+        preferRelay: false,
       },
       actions: [],
     });
@@ -26,6 +27,7 @@ describe('访客端直连会话', () => {
         attempt: 0,
         capable: true,
         peerOnline: true,
+        preferRelay: false,
       },
       actions: [
         { type: 'create-offer', gen: 1 },
@@ -202,6 +204,68 @@ describe('访客端直连会话', () => {
     expect(reduceDirect(state, { type: 'dc-open', gen: 5 })).toEqual({ state, actions: [] });
   });
 
+  it('协商中判定直连更慢：拆通道、不重试、钉在中继', () => {
+    const state = {
+      ...initialDirectState('guest'),
+      phase: 'negotiating' as const,
+      gen: 2,
+      capable: true,
+      peerOnline: true,
+    };
+
+    expect(reduceDirect(state, { type: 'prefer-relay' })).toEqual({
+      state: { ...state, phase: 'idle', preferRelay: true, attempt: 0 },
+      actions: [{ type: 'send-close', gen: 2 }, { type: 'destroy-peer' }],
+    });
+  });
+
+  it('已连接时判定直连更慢：切回中继并重同步，不安排重试', () => {
+    const state = {
+      ...initialDirectState('guest'),
+      phase: 'connected' as const,
+      gen: 3,
+      capable: true,
+      peerOnline: true,
+    };
+
+    expect(reduceDirect(state, { type: 'prefer-relay' })).toEqual({
+      state: { ...state, phase: 'idle', preferRelay: true, attempt: 0 },
+      actions: [
+        { type: 'send-close', gen: 3 },
+        { type: 'destroy-peer' },
+        { type: 'switch', transport: 'relay' },
+        { type: 'resync' },
+      ],
+    });
+  });
+
+  it('钉在中继后忽略能力/在线重报，网络变化才重新协商', () => {
+    const held = {
+      ...initialDirectState('guest'),
+      phase: 'idle' as const,
+      gen: 2,
+      preferRelay: true,
+      capable: true,
+      peerOnline: true,
+    };
+
+    expect(reduceDirect(held, { type: 'peer-capable', capable: true })).toEqual({
+      state: held,
+      actions: [],
+    });
+    expect(reduceDirect(held, { type: 'peer-online', online: true })).toEqual({
+      state: held,
+      actions: [],
+    });
+    expect(reduceDirect(held, { type: 'network-change' })).toEqual({
+      state: { ...held, phase: 'negotiating', gen: 3, attempt: 0, preferRelay: false },
+      actions: [
+        { type: 'create-offer', gen: 3 },
+        { type: 'start-timeout', gen: 3 },
+      ],
+    });
+  });
+
   it('计算带抖动的指数退避且上限为五分钟', () => {
     const midpoint = () => 0.5;
 
@@ -229,7 +293,65 @@ describe('主机端直连会话', () => {
     const state = { ...initialDirectState('host'), gen: 2 };
 
     expect(reduceDirect(state, { type: 'offer', gen: 2 })).toEqual({ state, actions: [] });
+    expect(reduceDirect(state, { type: 'offer', gen: 0 })).toEqual({ state, actions: [] });
+  });
+
+  it('协商中重复的 gen=1 提议仍忽略', () => {
+    const state = {
+      ...initialDirectState('host'),
+      phase: 'negotiating' as const,
+      gen: 1,
+    };
+
     expect(reduceDirect(state, { type: 'offer', gen: 1 })).toEqual({ state, actions: [] });
+  });
+
+  it('已连接的 gen=1 被访客重启的 gen=1 顶掉', () => {
+    const state = {
+      ...initialDirectState('host'),
+      phase: 'connected' as const,
+      gen: 1,
+      peerOnline: true,
+    };
+
+    expect(reduceDirect(state, { type: 'offer', gen: 1 })).toEqual({
+      state: { ...state, phase: 'negotiating', gen: 1 },
+      actions: [
+        { type: 'destroy-peer' },
+        { type: 'switch', transport: 'relay' },
+        { type: 'resync' },
+        { type: 'accept-offer', gen: 1 },
+        { type: 'start-timeout', gen: 1 },
+      ],
+    });
+  });
+
+  it('访客重启后的 gen=1 提议顶掉主机保留的更高代次', () => {
+    const connected = {
+      ...initialDirectState('host'),
+      phase: 'connected' as const,
+      gen: 2,
+      peerOnline: true,
+    };
+    expect(reduceDirect(connected, { type: 'offer', gen: 1 })).toEqual({
+      state: { ...connected, phase: 'negotiating', gen: 1 },
+      actions: [
+        { type: 'destroy-peer' },
+        { type: 'switch', transport: 'relay' },
+        { type: 'resync' },
+        { type: 'accept-offer', gen: 1 },
+        { type: 'start-timeout', gen: 1 },
+      ],
+    });
+
+    const idle = { ...initialDirectState('host'), phase: 'idle' as const, gen: 4 };
+    expect(reduceDirect(idle, { type: 'offer', gen: 1 })).toEqual({
+      state: { ...idle, phase: 'negotiating', gen: 1 },
+      actions: [
+        { type: 'accept-offer', gen: 1 },
+        { type: 'start-timeout', gen: 1 },
+      ],
+    });
   });
 
   it('收到较新代次提议时替换已连接对端', () => {
@@ -335,5 +457,6 @@ describe('主机端直连会话', () => {
     });
     expect(reduceDirect(state, { type: 'answer', gen: 5 })).toEqual({ state, actions: [] });
     expect(reduceDirect(state, { type: 'cooldown-elapsed' })).toEqual({ state, actions: [] });
+    expect(reduceDirect(state, { type: 'prefer-relay' })).toEqual({ state, actions: [] });
   });
 });

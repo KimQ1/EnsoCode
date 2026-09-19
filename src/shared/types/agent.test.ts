@@ -343,6 +343,16 @@ describe('parent/child commands', () => {
     ).toBeNull();
   });
 
+  it('spawn-parent 携 rolePrompt:非空字符串通过,脏值拒绝', () => {
+    const base = { type: 'spawn-parent', identity: parent, cwd: '/repo', model };
+    expect(parseAgentCommand({ ...base, rolePrompt: 'You are aside' })).toEqual({
+      ...base,
+      rolePrompt: 'You are aside',
+    });
+    expect(parseAgentCommand({ ...base, rolePrompt: '' })).toBeNull();
+    expect(parseAgentCommand({ ...base, rolePrompt: 1 })).toBeNull();
+  });
+
   it('subagent-stop 必须 exact identity + 非空 agentId', () => {
     const command = { type: 'subagent-stop', identity: parent, agentId: 'agent-1' };
     expect(parseAgentCommand(command)).toEqual(command);
@@ -368,21 +378,16 @@ describe('parent/child commands', () => {
     expect(parseAgentCommand({ type: 'set-max-active-coworkers' })).toBeNull();
   });
 
-  it('spawn-parent 携 bashInterceptEnabled:合法通过,脏值拒绝', () => {
+  it('spawn-parent 携 editMode:仅接受三个互斥模式', () => {
     const base = { type: 'spawn-parent', identity: parent, cwd: '/repo', model };
-    expect(parseAgentCommand({ ...base, bashInterceptEnabled: true })).toEqual({
-      ...base,
-      bashInterceptEnabled: true,
-    });
-    expect(parseAgentCommand({ ...base, bashInterceptEnabled: false })).toEqual({
-      ...base,
-      bashInterceptEnabled: false,
-    });
-    expect(parseAgentCommand({ ...base, bashInterceptEnabled: 'true' })).toBeNull();
-    expect(parseAgentCommand({ ...base, bashInterceptEnabled: 1 })).toBeNull();
+    for (const editMode of ['replace', 'apply_patch'] as const) {
+      expect(parseAgentCommand({ ...base, editMode })).toEqual({ ...base, editMode });
+    }
+    expect(parseAgentCommand({ ...base, editMode: 'patch' })).toBeNull();
+    expect(parseAgentCommand({ ...base, editMode: true })).toBeNull();
   });
 
-  it('spawn-parent 携 hashlineEditEnabled:合法通过,脏值拒绝,缺省当关', () => {
+  it('spawn-parent 继续兼容旧 hashlineEditEnabled，且严格拒绝脏值', () => {
     const base = { type: 'spawn-parent', identity: parent, cwd: '/repo', model };
     expect(parseAgentCommand(base)).toEqual(base);
     expect(parseAgentCommand({ ...base, hashlineEditEnabled: true })).toEqual({
@@ -395,6 +400,15 @@ describe('parent/child commands', () => {
     });
     expect(parseAgentCommand({ ...base, hashlineEditEnabled: 'true' })).toBeNull();
     expect(parseAgentCommand({ ...base, hashlineEditEnabled: 1 })).toBeNull();
+  });
+
+  it('spawn-parent 携 compactStrategy:仅接受三个互斥策略', () => {
+    const base = { type: 'spawn-parent', identity: parent, cwd: '/repo', model };
+    for (const compactStrategy of ['standard', 'smart', 'continuous-memory'] as const) {
+      expect(parseAgentCommand({ ...base, compactStrategy })).toEqual({ ...base, compactStrategy });
+    }
+    expect(parseAgentCommand({ ...base, compactStrategy: 'plugin' })).toBeNull();
+    expect(parseAgentCommand({ ...base, compactStrategy: true })).toBeNull();
   });
 
   it('spawn-parent 携 smartCompactEnabled:合法通过,脏值拒绝', () => {
@@ -696,6 +710,33 @@ describe('一次性文本补全命令', () => {
       expect(parseAgentCommand({ ...command, maxTokens })).toBeNull();
     }
   });
+
+  it('接受 abort-complete-text 并拒绝脏 requestId', () => {
+    const command = { type: 'abort-complete-text', requestId: 'completion-1' };
+    expect(parseAgentCommand(command)).toEqual(command);
+    expect(parseAgentCommand({ type: 'abort-complete-text', requestId: '' })).toBeNull();
+    expect(parseAgentCommand({ type: 'abort-complete-text' })).toBeNull();
+  });
+
+  it('接受 stream 与 reasoning，拒绝脏值', () => {
+    const command = {
+      type: 'complete-text',
+      requestId: 'completion-1',
+      systemPrompt: 'system',
+      userText: 'user',
+      candidates: [model],
+      timeoutMs: 1000,
+      stream: true as const,
+      reasoning: 'high' as const,
+    };
+    expect(parseAgentCommand(command)).toEqual(command);
+    expect(parseAgentCommand({ ...command, reasoning: 'off' })).toEqual({
+      ...command,
+      reasoning: 'off',
+    });
+    expect(parseAgentCommand({ ...command, stream: false })).toBeNull();
+    expect(parseAgentCommand({ ...command, reasoning: 'nope' })).toBeNull();
+  });
 });
 
 describe('标题总结命令与事件', () => {
@@ -903,6 +944,33 @@ describe('标题总结命令与事件', () => {
     expect(parseAgentWorkerEvent({ ...event, title: 42 })).toBeNull();
     expect(parseAgentWorkerEvent({ ...event, conversationId: undefined })).toBeNull();
     expect(parseAgentWorkerEvent({ ...event, extra: true })).toBeNull();
+  });
+
+  it('text-delta 允许空 text，thinking 可选，拒绝脏输入', () => {
+    const event = { type: 'text-delta', requestId: 'completion-1', text: 'hel' };
+    expect(parseAgentWorkerEvent(event)).toEqual(event);
+    expect(parseAgentWorkerEvent({ ...event, text: '' })).toEqual({ ...event, text: '' });
+    expect(parseAgentWorkerEvent({ ...event, thinking: 'hmm' })).toEqual({
+      ...event,
+      thinking: 'hmm',
+    });
+    expect(parseAgentWorkerEvent({ ...event, thinking: 1 })).toBeNull();
+    expect(parseAgentWorkerEvent({ ...event, requestId: '' })).toBeNull();
+    expect(parseAgentWorkerEvent({ ...event, extra: true })).toBeNull();
+  });
+
+  it('rewind-done 保留待回填图片并拒绝脏图片', () => {
+    const event = {
+      type: 'rewind-done',
+      identity: parent,
+      seq: 3,
+      editorText: '再试一次',
+      editorImages: [{ data: 'AAAA', mimeType: 'image/png' }],
+    };
+    expect(parseAgentWorkerEvent(event)).toEqual(event);
+    expect(
+      parseAgentWorkerEvent({ ...event, editorImages: [{ data: 7, mimeType: 'image/png' }] })
+    ).toBeNull();
   });
 
   it('snapshot 事件外壳保留 partial / sessionId：空 targeted 快照靠 sessionId 路由收回 started', () => {
@@ -1536,5 +1604,105 @@ describe('MCP 旁路事件收窄', () => {
       parseAgentWorkerEvent({ ...event, tokens: { access_token: 'a', expires_in: 'x' } })
     ).toBeNull();
     expect(parseAgentWorkerEvent({ ...event, extra: 1 })).toBeNull();
+  });
+});
+
+describe('apply_patch fileChanges 事件收窄', () => {
+  const event = {
+    type: 'message-upsert',
+    identity: parent,
+    seq: 1,
+    index: 0,
+    message: {
+      role: 'toolResult',
+      content: [],
+      toolName: 'apply_patch',
+      fileChanges: [{ path: 'a.ts', oldText: 'a', newText: 'b', type: 'update' }],
+      applyPatchOutcome: {
+        status: 'partial',
+        applied: ['a.ts'],
+        failed: ['b.ts'],
+        error: 'write failed',
+        unattempted: ['c.ts'],
+        uncertain: [],
+      },
+    },
+  } as const;
+
+  it('接受完整白名单形状与显式 truncated', () => {
+    expect(parseAgentWorkerEvent(event)).toEqual(event);
+    expect(
+      parseAgentWorkerEvent({
+        ...event,
+        message: {
+          ...event.message,
+          applyPatchOutcome: {
+            ...event.message.applyPatchOutcome,
+            input: '*** Begin Patch\n*** End Patch',
+          },
+        },
+      })
+    ).not.toBeNull();
+    expect(
+      parseAgentWorkerEvent({
+        ...event,
+        message: {
+          ...event.message,
+          fileChanges: [{ ...event.message.fileChanges[0], oldText: 'a\n…', truncated: true }],
+        },
+      })
+    ).not.toBeNull();
+  });
+
+  it('snapshot 同样收窄嵌套消息的 fileChanges', () => {
+    expect(
+      parseSessionSnapshot({
+        identity: parent,
+        status: 'idle',
+        messages: [event.message],
+        commands: [],
+      })
+    ).not.toBeNull();
+    expect(
+      parseSessionSnapshot({
+        identity: parent,
+        status: 'idle',
+        messages: [
+          { ...event.message, fileChanges: [{ ...event.message.fileChanges[0], extra: 1 }] },
+        ],
+        commands: [],
+      })
+    ).toBeNull();
+  });
+
+  it('拒绝 applyPatchOutcome 脏字段、超预算路径与不一致 applied', () => {
+    for (const applyPatchOutcome of [
+      { ...event.message.applyPatchOutcome, status: 'unknown' },
+      { ...event.message.applyPatchOutcome, failed: 'b.ts' },
+      { ...event.message.applyPatchOutcome, applied: ['other.ts'] },
+      { ...event.message.applyPatchOutcome, failed: ['x'.repeat(4_097)] },
+      { ...event.message.applyPatchOutcome, extra: true },
+      { ...event.message.applyPatchOutcome, errorTruncated: false },
+      { ...event.message.applyPatchOutcome, inputTruncated: false },
+      { ...event.message.applyPatchOutcome, input: '' },
+    ]) {
+      expect(
+        parseAgentWorkerEvent({ ...event, message: { ...event.message, applyPatchOutcome } })
+      ).toBeNull();
+    }
+  });
+
+  it('拒绝 fileChanges 脏字段、错误类型与不显式的 truncated=false', () => {
+    for (const fileChanges of [
+      [{ ...event.message.fileChanges[0], secret: 'x' }],
+      [{ ...event.message.fileChanges[0], oldText: 1 }],
+      [{ ...event.message.fileChanges[0], type: 'move' }],
+      [{ ...event.message.fileChanges[0], truncated: false }],
+      null,
+    ]) {
+      expect(
+        parseAgentWorkerEvent({ ...event, message: { ...event.message, fileChanges } })
+      ).toBeNull();
+    }
   });
 });

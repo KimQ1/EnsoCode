@@ -22,9 +22,17 @@ import {
 } from '@/components/ui/dialog';
 import { Field, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
-import { type Conversation, useSessionsStore } from '@/stores/sessions';
+import { Z_INDEX } from '@/lib/z-index';
+import { useSessionsStore } from '@/stores/sessions';
 import { selectCoworkerTabConversations } from '@/stores/sessions/sidebarDirectory';
 import { useSettingsStore } from '@/stores/settings';
 
@@ -33,17 +41,27 @@ import { useSettingsStore } from '@/stores/settings';
  * tab 只能切换,不能关闭;「解雇」是显式销毁动作(hover 出 X,带确认),避免幽灵态。
  */
 export function CoworkerTabs({
-  parent,
+  parentId,
   displayedId,
   trailing,
 }: {
-  parent: Conversation;
+  parentId: string;
   displayedId: string;
   trailing?: React.ReactNode;
 }) {
   const { t } = useI18n();
+  const parentTitle = useSessionsStore((state) => state.conversations[parentId]?.title ?? '');
+  const parentStarted = useSessionsStore(
+    (state) => state.conversations[parentId]?.started === true
+  );
+  const parentReloading = useSessionsStore(
+    (state) => state.conversations[parentId]?.reloading === true
+  );
+  const parentSpawning = useSessionsStore((state) =>
+    Boolean(state.conversations[parentId]?.spawning)
+  );
   const coworkers = useSessionsStore((state) =>
-    selectCoworkerTabConversations(state.conversations, parent.id)
+    selectCoworkerTabConversations(state.conversations, parentId)
   );
   const [hiring, setHiring] = React.useState(false);
 
@@ -57,12 +75,12 @@ export function CoworkerTabs({
     <div className="flex items-center gap-1 border-b px-2 py-1">
       <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
         <RenameableTab
-          id={parent.id}
-          label={parent.title || t('New conversation')}
-          className={tabClass(displayedId === parent.id)}
-          reloadDisabled={parent.reloading === true || parent.spawning}
-          reloading={parent.reloading === true}
-          onSelect={() => useSessionsStore.getState().selectTab(parent.id, undefined)}
+          id={parentId}
+          label={parentTitle || t('New conversation')}
+          className={tabClass(displayedId === parentId)}
+          reloadDisabled={parentReloading || parentSpawning}
+          reloading={parentReloading}
+          onSelect={() => useSessionsStore.getState().selectTab(parentId, undefined)}
         />
         {coworkers.map((coworker) => {
           const tone = coworkerTabTone({
@@ -94,7 +112,7 @@ export function CoworkerTabs({
                 }
                 reloadDisabled={coworker.reloading || coworker.spawning}
                 reloading={coworker.reloading}
-                onSelect={() => useSessionsStore.getState().selectTab(parent.id, coworker.id)}
+                onSelect={() => useSessionsStore.getState().selectTab(parentId, coworker.id)}
               />
               {/* 关闭覆在状态灯槽上，hover 替换而不拉宽 tab */}
               <button
@@ -103,7 +121,7 @@ export function CoworkerTabs({
                 className="absolute top-1/2 right-2 hidden h-3 w-3 -translate-y-1/2 items-center justify-center text-muted-foreground hover:text-destructive group-hover/tab:flex"
                 onClick={() => {
                   if (window.confirm(t('Dismiss this coworker? Its session will be closed.'))) {
-                    void useSessionsStore.getState().dismissCoworkerFromUI(parent.id, coworker.id);
+                    void useSessionsStore.getState().dismissCoworkerFromUI(parentId, coworker.id);
                   }
                 }}
               >
@@ -115,7 +133,7 @@ export function CoworkerTabs({
         <button
           type="button"
           title={t('Hire coworker')}
-          disabled={!parent.started}
+          disabled={!parentStarted}
           onClick={() => setHiring(true)}
           className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
         >
@@ -123,7 +141,7 @@ export function CoworkerTabs({
         </button>
       </div>
       {trailing}
-      {hiring && <HireCoworkerDialog parentId={parent.id} onClose={() => setHiring(false)} />}
+      {hiring && <HireCoworkerDialog parentId={parentId} onClose={() => setHiring(false)} />}
     </div>
   );
 }
@@ -216,6 +234,10 @@ function HireCoworkerDialog({ parentId, onClose }: { parentId: string; onClose: 
     ).map((type) => type.name),
     ...agentTypes.map((entry) => entry.name),
   ];
+  const typeItems = [
+    { value: '', label: 'general' },
+    ...typeNames.map((typeName) => ({ value: typeName, label: typeName })),
+  ];
 
   const hire = async () => {
     const failed = await useSessionsStore
@@ -243,18 +265,22 @@ function HireCoworkerDialog({ parentId, onClose }: { parentId: string; onClose: 
           </Field>
           <Field>
             <FieldLabel>{t('Agent type')}</FieldLabel>
-            <select
+            <Select
+              items={typeItems}
               value={agentType}
-              onChange={(e) => setAgentType(e.target.value)}
-              className="h-8 w-full rounded-md border bg-transparent px-2 text-sm outline-none"
+              onValueChange={(value) => setAgentType(value ?? '')}
             >
-              <option value="">general</option>
-              {typeNames.map((typeName) => (
-                <option key={typeName} value={typeName}>
-                  {typeName}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectPopup zIndex={Z_INDEX.DROPDOWN_IN_MODAL}>
+                {typeItems.map((item) => (
+                  <SelectItem key={item.value || 'general'} value={item.value}>
+                    {item.label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
           </Field>
           {error && <p className="text-destructive text-xs">{error}</p>}
           <div className="h-1" />

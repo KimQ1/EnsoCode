@@ -15,13 +15,24 @@ export function isMessageCacheHot(
   viewedId: string | null,
   lastViewedAt: Readonly<Record<string, number>>,
   now: number,
-  ttl = MESSAGE_CACHE_TTL_MS
+  ttl = MESSAGE_CACHE_TTL_MS,
+  extraHotIds?: ReadonlySet<string>
 ): boolean {
-  if (sessionId === viewedId) return true;
+  if (sessionId === viewedId || extraHotIds?.has(sessionId)) return true;
   const at = lastViewedAt[sessionId];
   return at !== undefined && now - at < ttl;
 }
 
+/** 旁路会话挂在主会话侧栏，不算冷缓存 */
+export function btwHotSessionIds(
+  conversations: Record<string, { btwParentId?: string } | undefined>
+): Set<string> {
+  const ids = new Set<string>();
+  for (const [id, conversation] of Object.entries(conversations)) {
+    if (conversation?.btwParentId) ids.add(id);
+  }
+  return ids;
+}
 /**
  * 正文是否已有权威（worker 确认过的）消息。乐观回显是本地先上屏的未确认尾巴，
  * 不算：冷缓存清空后用户先发一句，length 变 1 但历史与正在跑的工具卡都还没补回，
@@ -52,15 +63,21 @@ export function needsHistoryHydration(conversation: {
   );
 }
 
-/** 已启动或可 resume 且未 failed：切回应对齐 worker 全文，半截权威正文也要 */
+/**
+ * 切回应对齐 worker 全文。failed 且本地已有权威正文时不要再要 snapshot：
+ * 空回包会把历史抹掉、只剩红字。failed 空窗且 worker 仍持有（started）则要补回。
+ */
 export function needsWorkerSnapshot(conversation: {
   started: boolean;
   sessionFile?: string;
   status?: string;
+  messages?: readonly { optimistic?: boolean }[];
 }): boolean {
-  return (
-    conversation.status !== 'failed' && (conversation.started || Boolean(conversation.sessionFile))
-  );
+  if (conversation.status === 'failed') {
+    if (hasAuthoritativeMessages(conversation.messages ?? [])) return false;
+    return conversation.started;
+  }
+  return conversation.started || Boolean(conversation.sessionFile);
 }
 
 /** 离开会话时盖章；正在看的会话不写自己，由 isMessageCacheHot 的 viewedId 保热 */
@@ -119,12 +136,13 @@ export function evictColdMessages<T extends { messages: unknown[]; customEntries
   viewedId: string | null,
   lastViewedAt: Readonly<Record<string, number>>,
   now: number,
-  ttl = MESSAGE_CACHE_TTL_MS
+  ttl = MESSAGE_CACHE_TTL_MS,
+  extraHotIds?: ReadonlySet<string>
 ): Record<string, T> {
   let changed = false;
   const next: Record<string, T> = { ...conversations };
   for (const [id, conversation] of Object.entries(conversations)) {
-    if (isMessageCacheHot(id, viewedId, lastViewedAt, now, ttl)) continue;
+    if (isMessageCacheHot(id, viewedId, lastViewedAt, now, ttl, extraHotIds)) continue;
     if (conversation.messages.length === 0 && conversation.customEntries.length === 0) continue;
     next[id] = {
       ...conversation,

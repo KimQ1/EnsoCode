@@ -121,7 +121,7 @@ describe('subagent tool model 参数', () => {
     );
   });
 
-  it('promptGuidelines 写入主动委派规则，含内置类型选型；无类型时不提类型', () => {
+  it('promptGuidelines 写入条件式委派规则，含内置类型选型；无类型时不提类型', () => {
     const guidelines = createSubagentTool(
       makeDeps({
         agentTypes: [
@@ -131,7 +131,7 @@ describe('subagent tool model 参数', () => {
         ],
       })
     ).promptGuidelines;
-    expect(guidelines?.join('\n')).toMatch(/independent.*same message/i);
+    expect(guidelines?.join('\n')).toMatch(/clear benefit.*parallel/is);
     expect(guidelines?.join('\n')).toMatch(/scout.*worker.*reviewer/s);
     expect(createSubagentTool(makeDeps()).promptGuidelines?.join('\n')).not.toMatch(/scout/);
   });
@@ -179,10 +179,46 @@ describe('subagent tool model 参数', () => {
     expect(text).not.toMatch(/reviewer/);
   });
 
-  it('description/promptSnippet 不再用保守措辞抢话', () => {
+  it('先判断委派收益，短小且上下文已知时直接做，并一次性选择委派类型', () => {
     const tool = createSubagentTool(makeDeps());
-    expect(tool.description).not.toMatch(/parallelizable or context-heavy/);
-    expect(tool.promptSnippet).toMatch(/default/i);
+    const text = [tool.description, tool.promptSnippet, ...(tool.promptGuidelines ?? [])].join(
+      '\n'
+    );
+    expect(text).toMatch(/short tasks.*directly.*context.*known/is);
+    expect(text).toMatch(/user.*request/is);
+    expect(text).toMatch(/parallel/is);
+    expect(text).toMatch(/isolated context/is);
+    expect(text).toMatch(/independent review/is);
+    expect(text).not.toMatch(/hand any independent subtask|Delegate by default|anti-pattern/i);
+  });
+
+  it('交叉推荐 coworker 带可用性条件，且仅持续协作与上下文复用时选择', () => {
+    const tool = createSubagentTool(makeDeps());
+    const text = `${tool.description}\n${tool.promptSnippet}`;
+    expect(text).toMatch(/coworker.*if available/is);
+    expect(text).toMatch(/sustained collaboration.*context reuse/is);
+    expect(text).toMatch(/availability.*does not.*delegat|do not delegate.*availability/is);
+  });
+
+  it('单次评审用 subagent；同一角色多轮复评交给 coworker，不要每轮新开', () => {
+    const tool = createSubagentTool(makeDeps());
+    const text = `${tool.description}\n${tool.promptSnippet}`;
+    expect(text).toMatch(/single review/is);
+    expect(text).toMatch(/same role across/is);
+    expect(text).toMatch(/do not start a new subagent each round/is);
+  });
+
+  it('判断型并行派 N 个 subagent；同类 grep 汇总走 exec，且 exec 互斥不写进 description', () => {
+    const tool = createSubagentTool(makeDeps());
+    const alwaysOn = `${tool.promptSnippet}\n${(tool.promptGuidelines ?? []).join('\n')}`;
+    expect(tool.description).toMatch(/isolated judgment/i);
+    expect(tool.description).toMatch(/same message/i);
+    expect(alwaysOn).toMatch(/isolated judgment/i);
+    expect(alwaysOn).toMatch(/do not serial-search/i);
+    expect(alwaysOn).toMatch(/3\+ similar read\/grep\/find/i);
+    expect(alwaysOn).toMatch(/reduced result/i);
+    expect(alwaysOn).toMatch(/use exec/i);
+    expect(tool.description).not.toMatch(/use exec/i);
   });
 
   it('当 agent_type 锁定模型（allowModelOverride === false）时，主 agent 传 model 报错拒绝', async () => {
@@ -399,6 +435,110 @@ describe('subagent 启动失败收尾', () => {
       });
     }
   );
+});
+
+describe('subagent 可见活动详情', () => {
+  it('归并 assistant 流式正文与工具参数、输出和结果', async () => {
+    let listener: ((event: Record<string, unknown>) => void) | undefined;
+    const session = {
+      ...fakeSession('final report'),
+      subscribe: (next: (event: Record<string, unknown>) => void) => {
+        listener = next;
+        return () => {};
+      },
+      prompt: vi.fn(async () => {
+        listener?.({ type: 'message_start', message: { role: 'assistant', content: [] } });
+        listener?.({
+          type: 'message_update',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'hidden' },
+              { type: 'text', text: 'checking' },
+            ],
+          },
+        });
+        listener?.({
+          type: 'message_end',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'checking files' }] },
+        });
+        listener?.({
+          type: 'tool_execution_start',
+          toolCallId: 'read-1',
+          toolName: 'read',
+          args: { path: 'src/a.ts', offset: 10 },
+        });
+        listener?.({
+          type: 'tool_execution_update',
+          toolCallId: 'read-1',
+          partialResult: { content: [{ type: 'text', text: 'partial' }] },
+        });
+        listener?.({
+          type: 'tool_execution_end',
+          toolCallId: 'read-1',
+          result: { content: [{ type: 'text', text: 'file body' }] },
+          isError: false,
+        });
+      }),
+    } as unknown as AgentSession;
+    const deps = makeDeps({ createSubSession: vi.fn(async () => session) });
+    const tool = createSubagentTool(deps);
+    await tool.execute('t1', { description: 'x', prompt: 'do' }, undefined, undefined, {} as never);
+
+    const final = (deps.emitUpdate as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(final.activities).toEqual([
+      {
+        id: 'assistant-1',
+        type: 'assistant',
+        text: 'checking files',
+        streaming: false,
+      },
+      {
+        id: 'read-1',
+        type: 'tool',
+        toolName: 'read',
+        argumentsText: expect.stringContaining('"offset": 10'),
+        outputText: 'file body',
+        status: 'done',
+      },
+    ]);
+    expect(JSON.stringify(final.activities)).not.toContain('hidden');
+  });
+
+  it('失败时保留此前采集的可见过程', async () => {
+    let listener: ((event: Record<string, unknown>) => void) | undefined;
+    const session = {
+      ...fakeSession('partial'),
+      subscribe: (next: (event: Record<string, unknown>) => void) => {
+        listener = next;
+        return () => {};
+      },
+      prompt: vi.fn(async () => {
+        listener?.({ type: 'message_start', message: { role: 'assistant', content: [] } });
+        listener?.({
+          type: 'message_update',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'work before failure' }] },
+        });
+        throw new Error('provider failed');
+      }),
+    } as unknown as AgentSession;
+    const deps = makeDeps({ createSubSession: vi.fn(async () => session) });
+    const tool = createSubagentTool(deps);
+    await expect(
+      tool.execute('t1', { description: 'x', prompt: 'do' }, undefined, undefined, {} as never)
+    ).rejects.toThrow('provider failed');
+
+    const final = (deps.emitUpdate as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+    expect(final).toMatchObject({ status: 'failed', resultText: 'provider failed' });
+    expect(final.activities).toEqual([
+      {
+        id: 'assistant-1',
+        type: 'assistant',
+        text: 'work before failure',
+        streaming: false,
+      },
+    ]);
+  });
 });
 
 describe('subagent 手动中止', () => {

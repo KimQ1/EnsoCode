@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ChildSessionIdentity, SessionIdentity } from '@shared/builtinAgents';
 import { normalizeMemoryModelIdleMinutes } from '@shared/memory/modelIdle';
+import { effectiveDisabledBuiltinTools } from '@shared/types';
 import type { MemoryOp } from '@shared/types/agent';
 import { hasProviderCredentials, type ModelProvider } from '@shared/types/llm';
 import type Database from 'better-sqlite3';
@@ -30,7 +31,14 @@ import {
 } from './memory/embedding/registry';
 import type { RemoteEmbeddingOptions } from './memory/embedding/remote';
 import type { EmbeddingModelSpec, EmbeddingProvider } from './memory/embedding/types';
-import { ensureKgJob, type KgJob, listKgJobs, listResumableKgJobs, runKgJob } from './memory/kg';
+import {
+  ensureKgJob,
+  ensurePendingKgJobs,
+  type KgJob,
+  listKgJobs,
+  listResumableKgJobs,
+  runKgJob,
+} from './memory/kg';
 import { getReembedJob, type ReembedJob, runReembedJob } from './memory/reembed';
 import { type Embedder, GLOBAL_SPACE, type Memory, projectSpaceId } from './memory/types';
 
@@ -196,7 +204,10 @@ export function configureMemoryDistill(next: Partial<MemoryDistillConfig>): void
 
 export function syncMemoryDistillFromSettings(state: Record<string, unknown>): void {
   configureMemoryDistill({
-    enabled: state.memoryDistillEnabled === true,
+    // 内置工具关掉后记忆分页会隐藏，自动蒸馏必须一起停，否则会话结束仍会写库。
+    enabled:
+      state.memoryDistillEnabled === true &&
+      !effectiveDisabledBuiltinTools(state.disabledBuiltinTools).includes('memory'),
     language: typeof state.memoryLanguage === 'string' ? state.memoryLanguage : 'en',
   });
 }
@@ -362,7 +373,10 @@ export function configureMemoryKg(next: Partial<MemoryKgConfig>): void {
 }
 
 export function syncMemoryKgFromSettings(state: Record<string, unknown>): void {
-  configureMemoryKg({ enabled: state.memoryKgEnabled === true });
+  const enabled = state.memoryKgEnabled === true;
+  const turningOn = enabled && !kgConfig.enabled;
+  configureMemoryKg({ enabled });
+  if (turningOn && db) resumeMemoryKg();
 }
 
 /**
@@ -416,6 +430,7 @@ async function runOneKg(job: KgJob): Promise<void> {
 /** 开库时把上次没跑完的抽取接上；内容已变 / 已删除的由 runKgJob 标 cancelled */
 function resumeMemoryKg(): void {
   if (!kgConfig.enabled || !db) return;
+  ensurePendingKgJobs(db);
   const jobs = listResumableKgJobs(db);
   if (jobs.length === 0) return;
   void enqueueLlmJob(async () => {

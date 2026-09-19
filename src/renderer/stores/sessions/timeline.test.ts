@@ -2,10 +2,15 @@ import type { ProjectedMessage } from '@shared/types/agent';
 import { describe, expect, it } from 'vitest';
 import {
   buildTimeline,
+  completedEditWriteFingerprint,
   foldTimeline,
   historyPageChrome,
   isReadOnlyCommand,
   parseSandboxOutput,
+  patchStreamingTimeline,
+  shouldAutoExpandAppliedFileChanges,
+  shouldPrefetchOlderHistory,
+  shouldShowToolOutputAfterFileChanges,
   type TimelineItem,
   terminalErrorText,
 } from './timeline';
@@ -29,6 +34,22 @@ describe('historyPageChrome', () => {
     expect(historyPageChrome(true, false, false, true)).toBe('start');
     expect(historyPageChrome(true, false, true)).toBe('none');
     expect(historyPageChrome(true, false, undefined)).toBe('none');
+  });
+});
+
+describe('shouldPrefetchOlderHistory', () => {
+  it('工具组收拢后撑不满视口时给出加载入口，不在进会话时自动拉一页', () => {
+    expect(shouldPrefetchOlderHistory(true, false, 400, 700)).toBe(true);
+    expect(shouldPrefetchOlderHistory(true, false, 700, 700)).toBe(true);
+    expect(shouldPrefetchOlderHistory(true, false, 780, 700)).toBe(true);
+    expect(historyPageChrome(true, false, true, false, true)).toBe('more');
+    expect(historyPageChrome(true, false, true)).toBe('none');
+  });
+
+  it('内容已经超出视口、正在加载、或没有更早历史时不预取', () => {
+    expect(shouldPrefetchOlderHistory(true, false, 1200, 700)).toBe(false);
+    expect(shouldPrefetchOlderHistory(true, true, 400, 700)).toBe(false);
+    expect(shouldPrefetchOlderHistory(false, false, 400, 700)).toBe(false);
   });
 });
 
@@ -925,6 +946,171 @@ describe('isReadOnlyCommand', () => {
 });
 
 describe('foldTimeline', () => {
+  it.each([false, true])('compact=%s：同一回复的连续思考合并，耗时只计一次', (compact) => {
+    const messages: ProjectedMessage[] = [
+      user('检查布局'),
+      {
+        role: 'assistant',
+        stopReason: 'stop',
+        timing: { stepStartMs: 1000, thinkingEndMs: 114000, completedMs: 115000 },
+        content: [
+          { type: 'thinking', text: '**Preparing focus measurement**' },
+          { type: 'text', text: '  \n' },
+          { type: 'thinking', text: '**Preparing editor geometry baseline**' },
+          { type: 'thinking', text: '**Preparing delayed geometry check**' },
+          { type: 'text', text: '完成' },
+        ],
+      },
+    ];
+    const items = buildTimeline(messages, false, [], undefined, { historyBaseIndex: 40 });
+    const before = structuredClone(items);
+    const folded = foldTimeline(items, false, new Set(), { compact });
+    expect(folded).toMatchObject([
+      { kind: 'user' },
+      {
+        kind: 'thinking',
+        key: '41-0',
+        text: '**Preparing focus measurement**\n\n**Preparing editor geometry baseline**\n\n**Preparing delayed geometry check**',
+        streaming: false,
+        durationMs: 113000,
+        startedAt: 1000,
+      },
+      { kind: 'text', text: '完成' },
+    ]);
+    expect(items).toEqual(before);
+    expect(folded[0]).toBe(items[0]);
+    expect(folded[2]).toBe(items.at(-1));
+  });
+
+  it('连续的标签思考与原生思考合并，并保留已知计时', () => {
+    const items = buildTimeline(
+      [
+        {
+          role: 'assistant',
+          timing: { stepStartMs: 1000, completedMs: 5000 },
+          content: [
+            { type: 'text', text: '<thinking>先检查</thinking><thinking>再测量</thinking>' },
+            { type: 'thinking', text: '原生思考' },
+            { type: 'text', text: '<thinking>最后核对</thinking>' },
+          ],
+        },
+      ],
+      false
+    );
+    expect(foldTimeline(items, false, new Set())).toEqual([
+      {
+        kind: 'thinking',
+        key: '0-0-0',
+        text: '先检查\n\n再测量\n\n原生思考\n\n最后核对',
+        streaming: false,
+        durationMs: 4000,
+        startedAt: 1000,
+      },
+    ]);
+  });
+
+  it('流式新增思考片段和后续补丁沿用首段 key，结束后整块停止流式', () => {
+    const snapshot = (texts: string[], settled = false): ProjectedMessage[] => [
+      user('检查'),
+      {
+        role: 'assistant',
+        stopReason: settled ? 'stop' : 'pending',
+        content: [
+          ...texts.map((text) => ({ type: 'thinking' as const, text })),
+          { type: 'text', text: '' },
+        ],
+      },
+    ];
+    const first = foldTimeline(buildTimeline(snapshot(['第一段']), true), true, new Set());
+    const raw = buildTimeline(snapshot(['第一段', '第二']), true);
+    const nextMessages = snapshot(['第一段', '第二段']);
+    const patched = patchStreamingTimeline(raw, nextMessages, true);
+    expect(patched).not.toBeNull();
+    const folded = foldTimeline(patched!, true, new Set());
+    expect(foldTimeline(raw, true, new Set())).toMatchObject([
+      { kind: 'user' },
+      { kind: 'thinking', key: first[1].key, text: '第一段\n\n第二', streaming: true },
+    ]);
+    expect(folded).toMatchObject([
+      { kind: 'user' },
+      {
+        kind: 'thinking',
+        key: first[1].key,
+        text: '第一段\n\n第二段',
+        streaming: true,
+        durationMs: null,
+      },
+    ]);
+    expect(folded).toEqual(foldTimeline(buildTimeline(nextMessages, true), true, new Set()));
+    expect(
+      foldTimeline(buildTimeline(snapshot(['第一段', '第二段'], true), false), false, new Set())
+    ).toMatchObject([
+      { kind: 'user' },
+      { kind: 'thinking', key: first[1].key, text: '第一段\n\n第二段', streaming: false },
+    ]);
+  });
+
+  it('正文、工具和不同回复之间的思考不合并', () => {
+    const items = buildTimeline(
+      [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', text: '一' },
+            { type: 'text', text: '说明' },
+            { type: 'thinking', text: '二' },
+            { type: 'toolCall', id: 'r1', name: 'read', arguments: { path: 'a.ts' } },
+            { type: 'thinking', text: '三' },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'thinking', text: '四' }] },
+        user('继续'),
+        { role: 'assistant', content: [{ type: 'thinking', text: '五' }] },
+      ],
+      false
+    );
+    expect(foldTimeline(items, false, new Set())).toEqual(items);
+  });
+
+  it('工具组展开后也只展示一个连续思考块，不改变工具顺序和计数', () => {
+    const items = buildTimeline(
+      [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'toolCall', id: 'r1', name: 'read' },
+            { type: 'thinking', text: '一' },
+            { type: 'thinking', text: '二' },
+            { type: 'toolCall', id: 'r2', name: 'read' },
+            { type: 'toolCall', id: 'r3', name: 'read' },
+          ],
+        },
+      ],
+      false
+    );
+    const collapsed = foldTimeline(items, false, new Set());
+    const expanded = foldTimeline(items, false, new Set([collapsed[0].key]));
+    expect(collapsed).toMatchObject([
+      {
+        kind: 'tool-group',
+        count: 3,
+        children: [
+          { kind: 'tool', key: '0-0' },
+          { kind: 'thinking', key: '0-1', text: '一\n\n二' },
+          { kind: 'tool', key: '0-3' },
+          { kind: 'tool', key: '0-4' },
+        ],
+      },
+    ]);
+    expect(expanded.map((item) => item.key)).toEqual([
+      collapsed[0].key,
+      '0-0',
+      '0-1',
+      '0-3',
+      '0-4',
+    ]);
+  });
+
   it('compact：只读 bash 进探索组，cat 记作 read、rg 记作 search', () => {
     const items = [
       { ...toolItem('a1', 'bash'), summary: 'cat README.md' },
@@ -1232,6 +1418,30 @@ describe('compaction 摘要行', () => {
     expect(timeline[0]).toMatchObject({ kind: 'compaction', verified: true });
   });
 
+  it('memory 摘要行带 memory，且 compaction-notice 也带', () => {
+    const timeline = buildTimeline(
+      [
+        {
+          role: 'compactionSummary',
+          content: [{ type: 'text', text: 'S' }],
+          tokensBefore: 1,
+          verified: true,
+          memory: true,
+        },
+        user('kept'),
+        user('after'),
+      ],
+      false,
+      [],
+      undefined,
+      { compactionNoticeAt: 2 }
+    );
+    expect(timeline[0]).toMatchObject({ kind: 'compaction', memory: true });
+    expect(timeline.find((item) => item.kind === 'compaction-notice')).toMatchObject({
+      memory: true,
+    });
+  });
+
   it('compaction 行不打断 tool-group 折叠之外的顺序，且不被 foldTimeline 吞掉', () => {
     const timeline = buildTimeline(
       [
@@ -1417,5 +1627,223 @@ describe('buildTimeline 运行中工具的增量输出', () => {
       { toolOutputs: { t1: 'PASS a' } }
     );
     expect(timeline[1]).toMatchObject({ kind: 'tool', state: 'ok', output: 'final output' });
+  });
+});
+
+describe('patchStreamingTimeline', () => {
+  const pending = (text: string): ProjectedMessage => ({
+    role: 'assistant',
+    stopReason: 'pending',
+    content: [{ type: 'thinking', text }],
+  });
+
+  it('思考变长时复用前缀行对象，只换末条 thinking', () => {
+    const prefix = user('问');
+    const first = [prefix, pending('abc')];
+    const previous = buildTimeline(first, true);
+    const next = patchStreamingTimeline(previous, [prefix, pending('abcdef')], true);
+    expect(next).not.toBeNull();
+    expect(next).toHaveLength(previous.length);
+    expect(next![0]).toBe(previous[0]);
+    expect(next![1]).not.toBe(previous[1]);
+    expect(next![1]).toMatchObject({ kind: 'thinking', text: 'abcdef', streaming: true });
+  });
+
+  it('思考文本没变时返回原数组', () => {
+    const messages = [user('问'), pending('abc')];
+    const previous = buildTimeline(messages, true);
+    expect(patchStreamingTimeline(previous, messages, true)).toBe(previous);
+  });
+
+  it('非 running、工具结果、新 part 出现时不走补丁', () => {
+    const prefix = user('问');
+    const thinking = pending('abc');
+    const previous = buildTimeline([prefix, thinking], true);
+    expect(patchStreamingTimeline(previous, [prefix, thinking], false)).toBeNull();
+    expect(
+      patchStreamingTimeline(
+        previous,
+        [
+          prefix,
+          thinking,
+          {
+            role: 'toolResult',
+            toolCallId: 't1',
+            content: [{ type: 'text', text: 'ok' }],
+          },
+        ],
+        true
+      )
+    ).toBeNull();
+    expect(
+      patchStreamingTimeline(
+        previous,
+        [
+          prefix,
+          {
+            role: 'assistant',
+            stopReason: 'pending',
+            content: [
+              { type: 'thinking', text: 'abc' },
+              { type: 'text', text: '答案' },
+            ],
+          },
+        ],
+        true
+      )
+    ).toBeNull();
+  });
+});
+
+describe('apply_patch timeline', () => {
+  const call: ProjectedMessage = {
+    role: 'assistant',
+    content: [
+      { type: 'toolCall', id: 'patch-1', name: 'apply_patch', arguments: { patch: '***' } },
+    ],
+  };
+
+  it('partial error 仍携带所有实际落盘文件，不把参数意图当 diff', () => {
+    const changes = [
+      { path: 'src/a.ts', oldText: 'a', newText: 'aa', type: 'update' as const },
+      { path: 'old.ts', oldText: 'old', newText: '', type: 'delete' as const },
+      { path: 'new.ts', oldText: '', newText: 'new', type: 'add' as const },
+    ];
+    const timeline = buildTimeline(
+      [
+        call,
+        {
+          role: 'toolResult',
+          toolCallId: 'patch-1',
+          toolName: 'apply_patch',
+          isError: true,
+          content: [{ type: 'text', text: 'partially applied' }],
+          fileChanges: changes,
+          applyPatchOutcome: {
+            status: 'partial',
+            applied: changes.map((change) => change.path),
+            failed: ['failed.ts'],
+            error: 'source delete failed',
+            input: '*** Begin Patch\n*** Update File: src/a.ts\n*** End Patch',
+            unattempted: ['later.ts'],
+            uncertain: ['unknown.ts'],
+          },
+        },
+      ],
+      false
+    );
+    expect(timeline[0]).toMatchObject({
+      kind: 'tool',
+      name: 'apply_patch',
+      state: 'error',
+      fileChanges: changes,
+      edits: null,
+    });
+    expect(shouldShowToolOutputAfterFileChanges(timeline[0])).toBe(true);
+    expect(timeline[0]).toMatchObject({
+      output: expect.stringContaining('Failed paths:\n- failed.ts'),
+    });
+    expect(timeline[0]).toMatchObject({
+      output: expect.stringContaining('Uncertain:\n- unknown.ts'),
+    });
+    expect(timeline[0]).toMatchObject({
+      output: expect.stringContaining('Input:\n*** Begin Patch'),
+    });
+  });
+
+  it('apply_patch 结果从无到有时才自动展开，历史挂载时不展开', () => {
+    const timeline = buildTimeline(
+      [
+        call,
+        {
+          role: 'toolResult',
+          toolCallId: 'patch-1',
+          toolName: 'apply_patch',
+          content: [],
+          fileChanges: [{ path: 'a.ts', oldText: 'a', newText: 'b', type: 'update' }],
+        },
+      ],
+      true
+    );
+    expect(timeline[0]).toMatchObject({ name: 'apply_patch', state: 'ok' });
+    expect(shouldAutoExpandAppliedFileChanges(timeline[0], false)).toBe(true);
+    expect(shouldAutoExpandAppliedFileChanges(timeline[0], true)).toBe(false);
+  });
+
+  it('全量预检失败没有 fileChanges，不从 patch 参数造 diff', () => {
+    const timeline = buildTimeline(
+      [
+        call,
+        {
+          role: 'toolResult',
+          toolCallId: 'patch-1',
+          toolName: 'apply_patch',
+          isError: true,
+          content: [{ type: 'text', text: 'preflight failed' }],
+          fileChanges: [],
+        },
+      ],
+      false
+    );
+    expect(timeline[0]).toMatchObject({ fileChanges: [], edits: null, writeContent: null });
+  });
+
+  it('有实际修改的 partial result 会改变 Changes 指纹', () => {
+    const withResult: ProjectedMessage[] = [
+      call,
+      {
+        role: 'toolResult',
+        toolCallId: 'patch-1',
+        toolName: 'apply_patch',
+        isError: true,
+        content: [],
+        fileChanges: [{ path: 'a.ts', oldText: 'a', newText: 'b', type: 'update' }],
+      },
+    ];
+    expect(completedEditWriteFingerprint(withResult)).not.toBe(
+      completedEditWriteFingerprint([call])
+    );
+  });
+});
+
+describe('completedEditWriteFingerprint', () => {
+  it('思考变长不改变指纹，完成的 edit 才会变', () => {
+    const readCall: ProjectedMessage = {
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: 'r1', name: 'read', arguments: { path: 'a.ts' } }],
+    };
+    const thinking: ProjectedMessage = {
+      role: 'assistant',
+      stopReason: 'pending',
+      content: [{ type: 'thinking', text: 'a' }],
+    };
+    const before = [user('改'), readCall, thinking];
+    const afterThink: ProjectedMessage[] = [
+      user('改'),
+      readCall,
+      { ...thinking, content: [{ type: 'thinking', text: 'ab' }] },
+    ];
+    expect(completedEditWriteFingerprint(afterThink)).toBe(completedEditWriteFingerprint(before));
+
+    const editCall: ProjectedMessage = {
+      role: 'assistant',
+      content: [
+        {
+          type: 'toolCall',
+          id: 'e1',
+          name: 'edit',
+          arguments: { path: 'a.ts', oldText: 'x', newText: 'y' },
+        },
+      ],
+    };
+    const editResult: ProjectedMessage = {
+      role: 'toolResult',
+      toolCallId: 'e1',
+      isError: false,
+      content: [{ type: 'text', text: 'ok' }],
+    };
+    expect(completedEditWriteFingerprint([...before, editCall, editResult])).not.toBe(
+      completedEditWriteFingerprint(before)
+    );
   });
 });

@@ -13,6 +13,13 @@ import {
 } from './childReasoning';
 import { runFooter } from './runFooter';
 import { collectStructuredYield, type JsonSchema } from './structuredYield';
+import {
+  finishToolActivity,
+  settleSubagentActivities,
+  startToolActivity,
+  updateAssistantActivity,
+  updateToolActivity,
+} from './subagentActivity';
 
 /** 进度事件节流 */
 const UPDATE_INTERVAL_MS = 500;
@@ -68,14 +75,6 @@ function asJsonSchema(value: unknown): JsonSchema | undefined {
 }
 
 let counter = 0;
-
-/** 活动历史追加,capped 防内存/IPC 膨胀 */
-function pushLog(info: SubagentInfo, line: string): void {
-  if (!info.activityLog) info.activityLog = [];
-  const log = info.activityLog;
-  log.push(line);
-  if (log.length > 200) log.splice(0, log.length - 200);
-}
 
 const ABORTED = 'Subagent aborted';
 
@@ -202,19 +201,25 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
     name: 'subagent',
     label: 'Subagent',
     description:
-      'Delegate a self-contained task to a subagent that runs in an isolated context with its own tools ' +
-      '(read/bash/edit/write/MCP). Returns the subagent final report as the tool result. ' +
-      'Default choice for ONE-SHOT independent work (recon a module, implement an isolated change); ' +
-      'multiple subagent calls in one message run in parallel. ' +
-      'If the result will be acted on and re-checked (review → fix → re-review, test → fix → retest), ' +
-      'use coworker instead — a subagent is disposed after its report and cannot see your fix. ' +
+      'Dispatch self-contained one-shot work (including a single review) in an isolated context with its own tools ' +
+      '(read/bash/edit/write/MCP); returns the final report as the tool result. ' +
+      'Multiple subagent calls in one message run in parallel — when the user names N independent repos, directories, or questions that each need isolated judgment, dispatch N subagents in the same message instead of searching them yourself. ' +
+      'Handle short tasks directly when their context is already known. ' +
+      'Delegate only when the user explicitly requests it, or when parallel execution, isolated context, or independent review offers a clear benefit. ' +
+      'Use coworker if available only for sustained collaboration and context reuse: the same role across rounds. Spawn once, then send. Do not start a new subagent each round to re-paste background. ' +
+      'Tool availability does not itself justify delegation. ' +
       'The subagent cannot ask you questions — include all needed context in the prompt. ' +
       'Pass wait:false for long tasks to keep working — the final report is delivered to you ' +
       'automatically when it finishes (and the parent abort no longer kills it). ' +
       (deps.agentTypes.length > 0 ? ` Available agent types: ${typeList}.` : ''),
     promptSnippet:
-      'subagent: delegate one-shot subtasks by default — hand any independent subtask to a subagent (isolated context) ' +
-      'with a complete prompt and get a final report back; anything that may loop (review/verify → fix → re-check) goes to coworker; ' +
+      'subagent: self-contained one-shot work including a single review. ' +
+      'N independent repos/dirs/questions that each need isolated judgment → N subagent calls in the same message (do not serial-search them yourself). ' +
+      'Do not spawn subagents for 3+ similar read/grep/find that only need a reduced result — use exec. ' +
+      'Handle short tasks directly when their context is already known. ' +
+      'Delegate only on user request or a clear parallel, context-isolation, or independent-review benefit. ' +
+      'Use coworker if available only for sustained collaboration and context reuse (same role across rounds: spawn once, then send). Do not start a new subagent each round to re-paste background. ' +
+      'Tool availability does not itself justify delegation. Give the subagent a complete prompt and get a final report back; ' +
       'multiple subagent calls in one message run in parallel' +
       (deps.agentTypes.length > 0
         ? `; agent_type options: ${deps.agentTypes
@@ -225,9 +230,12 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
         ? '; a model parameter lets you pick a cheaper/stronger model per subtask — required for [custom model required] types, otherwise omit to inherit'
         : ''),
     promptGuidelines: [
-      'Delegate by default: when a request has 2+ independent lines of work (explore module A / change B / verify C), ' +
-        'dispatch them as parallel subagent calls in the same message instead of doing them serially yourself. ' +
-        'Searching the whole repo yourself before acting is an anti-pattern when a subagent could do the recon',
+      'When the user names independent repos, directories, or questions that each need isolated judgment, dispatch one subagent per item in the same message; do not serial-search them in the parent. ' +
+        'Do not spawn subagents for 3+ similar read/grep/find that only need a reduced result — use exec. ' +
+        'Handle short tasks directly when their context is already known. ' +
+        'Delegate only when the user requests delegation or parallel execution, isolated context, or independent review offers a clear benefit. ' +
+        'Select subagent for one-shot work including a single review and coworker, if available, only for sustained collaboration and context reuse. ' +
+        'Independent one-shot judgment tasks go as parallel subagent calls in the same message.',
       ...(roleHints.length > 0 ? [`Pick agent_type by role: ${roleHints.join('; ')}`] : []),
       ...(requiredPickTypes.length > 0 && modelNames.length > 0
         ? [
@@ -329,7 +337,7 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
         status: 'running',
         steps: 0,
         currentActivity: 'starting…',
-        activityLog: [],
+        activities: [],
         modelId: modelOption?.config.modelId ?? agentType?.model?.modelId ?? deps.modelId,
         ...(agentType ? { agentType: agentType.name } : {}),
         startedAt: Date.now(),
@@ -364,13 +372,31 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
         dirty = false;
         deps.emitUpdate({ ...info });
       }, UPDATE_INTERVAL_MS);
+      let assistantSequence = 0;
+      let activeAssistantId: string | null = null;
       const unsubscribe = session.subscribe((event) => {
         if (event.type === 'message_start') {
           const role = (event.message as { role?: string }).role;
           if (role === 'assistant') {
             info.steps += 1;
-            info.currentActivity = 'thinking…';
+            activeAssistantId = `assistant-${++assistantSequence}`;
+            info.currentActivity = 'responding…';
             dirty = true;
+          }
+        } else if (event.type === 'message_update') {
+          const role = (event.message as { role?: string }).role;
+          if (role === 'assistant') {
+            activeAssistantId ??= `assistant-${++assistantSequence}`;
+            const next = updateAssistantActivity(
+              info.activities ?? [],
+              activeAssistantId,
+              event.message
+            );
+            if (next !== info.activities) {
+              info.activities = next;
+              info.currentActivity = 'writing…';
+              dirty = true;
+            }
           }
         } else if (event.type === 'message_end') {
           const message = event.message as {
@@ -382,17 +408,19 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
             info.outputTokens = (info.outputTokens ?? 0) + message.usage.output;
             dirty = true;
           }
-          // 子代理阶段性文本进历史（首行,截断）
-          if (message.role === 'assistant' && Array.isArray(message.content)) {
-            const text = message.content
-              .map((part) =>
-                (part as { type?: string; text?: string }).type === 'text'
-                  ? ((part as { text?: string }).text ?? '')
-                  : ''
-              )
-              .join('')
-              .trim();
-            if (text) pushLog(info, text.slice(0, 200));
+          if (message.role === 'assistant') {
+            activeAssistantId ??= `assistant-${++assistantSequence}`;
+            const next = updateAssistantActivity(
+              info.activities ?? [],
+              activeAssistantId,
+              message,
+              false
+            );
+            if (next !== info.activities) {
+              info.activities = next;
+              dirty = true;
+            }
+            activeAssistantId = null;
           }
         } else if (event.type === 'tool_execution_start') {
           const args = event.args as Record<string, unknown> | undefined;
@@ -403,7 +431,31 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
                 ? args.path
                 : '';
           info.currentActivity = `${event.toolName} ${summary}`.trim().slice(0, 80);
-          pushLog(info, `→ ${event.toolName} ${summary}`.trim().slice(0, 160));
+          info.activities = startToolActivity(
+            info.activities ?? [],
+            event.toolCallId,
+            event.toolName,
+            event.args
+          );
+          dirty = true;
+        } else if (event.type === 'tool_execution_update') {
+          const next = updateToolActivity(
+            info.activities ?? [],
+            event.toolCallId,
+            event.partialResult
+          );
+          if (next !== info.activities) {
+            info.activities = next;
+            dirty = true;
+          }
+        } else if (event.type === 'tool_execution_end') {
+          info.activities = finishToolActivity(
+            info.activities ?? [],
+            event.toolCallId,
+            event.result,
+            event.isError
+          );
+          info.currentActivity = 'working…';
           dirty = true;
         }
       });
@@ -447,6 +499,10 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
           }
           const aborted = controller.signal.aborted;
           info.status = aborted ? 'failed' : 'done';
+          info.activities = settleSubagentActivities(
+            info.activities ?? [],
+            aborted ? 'aborted' : 'done'
+          );
           info.resultText = result;
           info.currentActivity = '';
           deps.emitUpdate({ ...info });
@@ -454,6 +510,10 @@ export function createSubagentTool(deps: SubagentDeps): ToolDefinition {
           return result;
         } catch (error) {
           info.status = 'failed';
+          info.activities = settleSubagentActivities(
+            info.activities ?? [],
+            controller.signal.aborted ? 'aborted' : 'failed'
+          );
           info.currentActivity = '';
           info.resultText ??= error instanceof Error ? error.message : String(error);
           deps.emitUpdate({ ...info });

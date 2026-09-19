@@ -121,6 +121,8 @@ const hireCoworker = vi.fn(async (): Promise<{ ok: boolean; error?: string }> =>
 const summarizeTitle = vi.fn(async (): Promise<{ ok: boolean; error?: string }> => ({ ok: true }));
 const agentAbort = vi.fn(async (_id: string) => ({ ok: true }));
 const agentRelease = vi.fn(async (_id: string) => ({ ok: true }));
+const btwSpawn = vi.fn(async () => ({ ok: true }));
+const btwDispose = vi.fn(async () => ({ ok: true }));
 const agentRewind = vi.fn(async () => ({ ok: true }));
 const requestSnapshot = vi.fn(async () => ({ ok: true }));
 
@@ -167,6 +169,12 @@ vi.stubGlobal('window', {
       release: agentRelease,
       rewind: agentRewind,
       steer: vi.fn(async () => ({ ok: true })),
+    },
+    btw: {
+      spawn: btwSpawn,
+      dispose: btwDispose,
+      prompt: vi.fn(),
+      abort: vi.fn(),
     },
     agentDispatch: {
       bindSource,
@@ -599,6 +607,37 @@ describe('typed Agent child projection', () => {
       sessionsModule.useSessionsStore.getState().conversations.parent.coworkerIds
     ).toBeUndefined();
     expect(agentPrompt).not.toHaveBeenCalled();
+  });
+
+  it('persists the draft model before dispatching an Agent from a new conversation', async () => {
+    dispatch.mockResolvedValue({
+      accepted: true,
+      requestId: '123e4567-e89b-42d3-a456-426614174080',
+      dispatchId: '123e4567-e89b-42d3-a456-426614174081',
+      child: childIdentity(1),
+    });
+    const task = { text: 'inspect from a new chat', images: [], fileMentions: [] };
+    const result = await sessionsModule.useSessionsStore
+      .getState()
+      .dispatchAgent('builtin:scout', task, {
+        providerId: 'project-provider',
+        modelId: 'project-model',
+      });
+    expect(result.accepted).toBe(true);
+    expect(updateConversationSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 'parent',
+        selection: { providerId: 'project-provider', modelId: 'project-model' },
+      })
+    );
+    expect(registerModelSelection).toHaveBeenCalledWith({
+      parentBindingId: 'parent-binding-1',
+      selection: { providerId: 'project-provider', modelId: 'project-model' },
+    });
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent).toMatchObject({
+      lastProviderId: 'project-provider',
+      lastModelId: 'project-model',
+    });
   });
 
   it('keeps the settings provider id after parent-ready exposes a different runtime provider', async () => {
@@ -1873,6 +1912,96 @@ describe('typed Agent child projection', () => {
     expect(agentPrompt).not.toHaveBeenCalled();
   });
 
+  it('编辑排队消息保留图片', () => {
+    const images = [{ data: 'AAAA', mimeType: 'image/png' }];
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          queuedMessages: [{ id: 'q1', text: 'before', images }],
+        },
+      },
+    }));
+
+    sessionsModule.useSessionsStore.getState().updateQueuedMessage('parent', 'q1', 'after');
+
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages).toEqual([
+      { id: 'q1', text: 'after', images },
+    ]);
+  });
+
+  it('编辑后的排队消息发送时仍携带图片', async () => {
+    const images = [{ data: 'AAAA', mimeType: 'image/png' }];
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: true,
+          status: 'idle' as const,
+          queuedMessages: [{ id: 'q1', text: 'before', images }],
+        },
+      },
+    }));
+    agentPrompt.mockClear();
+
+    const store = sessionsModule.useSessionsStore.getState();
+    store.updateQueuedMessage('parent', 'q1', 'after');
+    store.sendQueuedNow('parent', 'q1');
+
+    await vi.waitFor(() => expect(agentPrompt).toHaveBeenCalledWith('parent', 'after', images));
+  });
+
+  it('仅图片回退事件也把图片交给输入框', () => {
+    onAgentEvent?.({
+      type: 'rewind-done',
+      identity: { sessionId: 'parent', generation: 'pg1' },
+      seq: 1,
+      editorImages: [{ data: 'AAAA', mimeType: 'image/png' }],
+    });
+
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent).toMatchObject({
+      draftImages: [{ data: 'AAAA', mimeType: 'image/png' }],
+    });
+  });
+
+  it('连续回退用本次内容成对替换草稿，避免文本和图片串台', () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          generation: 'pg1',
+          draftText: 'stale text',
+          draftImages: [{ data: 'OLD', mimeType: 'image/png' }],
+        },
+      },
+    }));
+
+    onAgentEvent?.({
+      type: 'rewind-done',
+      identity: { sessionId: 'parent', generation: 'pg1' },
+      seq: 1,
+      editorText: 'fresh text',
+    });
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent).toMatchObject({
+      draftText: 'fresh text',
+      draftImages: undefined,
+    });
+
+    onAgentEvent?.({
+      type: 'rewind-done',
+      identity: { sessionId: 'parent', generation: 'pg1' },
+      seq: 2,
+      editorImages: [{ data: 'NEW', mimeType: 'image/jpeg' }],
+    });
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent).toMatchObject({
+      draftText: undefined,
+      draftImages: [{ data: 'NEW', mimeType: 'image/jpeg' }],
+    });
+  });
+
   it('压缩进行中发送消息入队，不立刻 prompt', async () => {
     sessionsModule.useSessionsStore.setState((state) => ({
       conversations: {
@@ -1973,6 +2102,127 @@ describe('typed Agent child projection', () => {
     await vi.waitFor(() =>
       expect(agentPrompt).toHaveBeenCalledWith('parent', 'wait for compact', undefined)
     );
+  });
+
+  it('partial snapshot 恢复后先泵排队消息；用户中断收束前不泵', async () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: true,
+          status: 'idle' as const,
+          generation: 'pg1',
+          queuedMessages: [{ id: 'q1', text: 'after reload' }],
+          abortRequested: true,
+        },
+      },
+    }));
+    agentPrompt.mockClear();
+    const snapshot: RendererAgentEvent = {
+      type: 'snapshot',
+      partial: true,
+      sessionId: 'parent',
+      sessions: [
+        {
+          identity: { sessionId: 'parent', generation: 'pg1' },
+          status: 'idle',
+          messages: [],
+          commands: [],
+        },
+      ],
+    };
+
+    onAgentEvent?.(snapshot);
+    expect(agentPrompt).not.toHaveBeenCalled();
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.abortRequested).toBe(
+      true
+    );
+
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: { ...state.conversations.parent, abortRequested: false },
+      },
+    }));
+    onAgentEvent?.(snapshot);
+    await vi.waitFor(() =>
+      expect(agentPrompt).toHaveBeenCalledWith('parent', 'after reload', undefined)
+    );
+    expect(
+      sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages
+    ).toHaveLength(0);
+  });
+
+  describe('goal 续跑的无进展判定', () => {
+    function seedGoal() {
+      sessionsModule.useSessionsStore.setState((state) => ({
+        conversations: {
+          ...state.conversations,
+          parent: {
+            ...state.conversations.parent,
+            started: true,
+            status: 'idle' as const,
+            generation: 'pg1',
+            messages: [],
+            lastTurnDigest: undefined,
+            // digest 会顺带触发滚动标题总结并留下在飞基准，污染后续标题用例
+            titleLocked: true,
+            goal: {
+              text: 'ship it',
+              status: 'active' as const,
+              autoTurns: 0,
+              noProgressRuns: 2,
+              lastOutput: 'old',
+            },
+          },
+        },
+      }));
+      agentPrompt.mockClear();
+    }
+
+    it('正文被冷清空时回退到本轮 digest，不误判无进展', async () => {
+      seedGoal();
+      onAgentEvent?.({
+        type: 'turn-completed',
+        identity: { sessionId: 'parent', generation: 'pg1' },
+        seq: 2,
+        turnId: 't1',
+        digest: {
+          firstUserText: 'ship it',
+          userText: 'ship it',
+          assistantText: 'Refactored  the parser',
+        },
+      });
+      await vi.waitFor(() =>
+        expect(agentPrompt).toHaveBeenCalledWith(
+          'parent',
+          expect.stringContaining('<goal-continuation>'),
+          undefined
+        )
+      );
+      expect(sessionsModule.useSessionsStore.getState().conversations.parent.goal).toMatchObject({
+        status: 'active',
+        autoTurns: 1,
+        noProgressRuns: 0,
+        lastOutput: 'refactored the parser',
+      });
+    });
+
+    it('正文与 digest 都为空才计无进展，第三次暂停', () => {
+      seedGoal();
+      onAgentEvent?.({
+        type: 'turn-completed',
+        identity: { sessionId: 'parent', generation: 'pg1' },
+        seq: 2,
+        turnId: 't1',
+      });
+      expect(agentPrompt).not.toHaveBeenCalled();
+      expect(sessionsModule.useSessionsStore.getState().conversations.parent.goal).toMatchObject({
+        status: 'paused',
+        noProgressRuns: 3,
+      });
+    });
   });
 
   describe('放弃排队压缩：清进度但不重钉锚点', () => {
@@ -2371,6 +2621,34 @@ describe('parent history tail hydrate', () => {
     expect(readParentHistoryTail).toHaveBeenCalledWith('empty');
   });
 
+  it('切到失败且空窗的已启动 coworker 仍要 snapshot，不能只剩红字', () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: { ...state.conversations.parent, started: true, activeTabId: undefined },
+        child: {
+          ...state.conversations.parent,
+          id: 'child',
+          parentId: 'parent',
+          started: true,
+          spawning: false,
+          status: 'failed' as const,
+          error: 'Codex error: The usage limit has been reached',
+          sessionFile: '/tmp/child.jsonl',
+          messages: [],
+        },
+      },
+      activeId: 'parent',
+    }));
+    requestSnapshot.mockClear();
+    readParentHistoryTail.mockClear();
+    readChildHistory.mockClear();
+    sessionsModule.useSessionsStore.getState().selectTab('parent', 'child');
+    expect(requestSnapshot).toHaveBeenCalledWith('child');
+    expect(readParentHistoryTail).not.toHaveBeenCalled();
+    expect(readChildHistory).not.toHaveBeenCalled();
+  });
+
   function seedReleasable(id: string) {
     sessionsModule.useSessionsStore.setState((state) => ({
       conversations: {
@@ -2569,6 +2847,65 @@ describe('parent history tail hydrate', () => {
     });
     const message = sessionsModule.useSessionsStore.getState().conversations.leave.messages[0];
     expect((message.content[0] as { text: string }).text).toBe('后半');
+  });
+
+  it('冷会话的可见输出仍续 lastOutputAt（节流），正文不落地，用户消息不算', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const template = sessionsModule.useSessionsStore.getState().conversations.parent;
+    sessionsModule.useSessionsStore.setState({
+      conversations: {
+        stay: {
+          ...template,
+          id: 'stay',
+          started: false,
+          sessionFile: undefined,
+          activeTabId: undefined,
+          parentId: undefined,
+          messages: [],
+        },
+        bgRun: {
+          ...template,
+          id: 'bgRun',
+          started: true,
+          sessionFile: '/tmp/bgRun.jsonl',
+          status: 'running',
+          generation: 'g1',
+          lastSeq: 0,
+          lastOutputAt: 1_000,
+          historyBaseIndex: undefined,
+          activeTabId: undefined,
+          parentId: undefined,
+          messages: [],
+        },
+      },
+      order: ['stay', 'bgRun'],
+      activeId: 'stay',
+    });
+    const upsert = (
+      seq: number,
+      message: Extract<RendererAgentEvent, { type: 'message-upsert' }>['message']
+    ) =>
+      onAgentEvent?.({
+        type: 'message-upsert',
+        identity: { sessionId: 'bgRun', generation: 'g1' },
+        seq,
+        index: seq - 1,
+        message,
+      });
+    const bgRun = () => sessionsModule.useSessionsStore.getState().conversations.bgRun;
+
+    vi.setSystemTime(60_000);
+    upsert(1, { role: 'user', content: [{ type: 'text', text: 'hi' }] });
+    expect(bgRun().lastOutputAt).toBe(1_000);
+
+    upsert(2, { role: 'assistant', content: [{ type: 'text', text: 'working' }] });
+    expect(bgRun().messages).toEqual([]);
+    expect(bgRun().lastOutputAt).toBe(60_000);
+
+    vi.setSystemTime(62_000);
+    upsert(3, { role: 'assistant', content: [{ type: 'text', text: 'working more' }] });
+    expect(bgRun().lastOutputAt).toBe(60_000);
   });
 });
 
@@ -3064,5 +3401,148 @@ describe('rewind 在 failed 状态放行、running 仍拦截', () => {
     sessionsModule.useSessionsStore.getState().rewind('coworker', 0, false);
     expect(agentSpawn).not.toHaveBeenCalled();
     expect(agentRewind).not.toHaveBeenCalled();
+  });
+});
+
+describe('btw session send', () => {
+  beforeAll(async () => {
+    settingsModule ??= await import('../settings');
+    sessionsModule ??= await import('./index');
+  });
+
+  beforeEach(async () => {
+    agentPrompt.mockClear();
+    agentSpawn.mockClear();
+    btwSpawn.mockReset().mockResolvedValue({ ok: true });
+    btwDispose.mockReset().mockResolvedValue({ ok: true });
+    nextConversationId = 'parent';
+    sourceProjection = {
+      projects: [
+        {
+          projectId: 'project',
+          canonicalPath: '/workspace',
+          state: 'active',
+          version: 1,
+        },
+      ],
+      conversations: [],
+    };
+    sessionsModule.useSessionsStore.setState({
+      conversations: {},
+      order: [],
+      activeId: null,
+      pendingAgentPrefill: undefined,
+    });
+    settingsModule.useSettingsStore.setState({
+      projects: [{ id: 'project', name: 'Project', path: '/workspace' }],
+    });
+    await seedParent();
+  });
+
+  it('send(conversationId) 旁路会话走 btw.spawn 且不切走主会话', async () => {
+    const parentId = sessionsModule.useSessionsStore.getState().activeId!;
+    settingsModule.useSettingsStore.setState({ loadLocalSkills: false });
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        [parentId]: {
+          ...state.conversations[parentId],
+          presetId: 'coding',
+          approvalMode: 'supervised',
+        },
+      },
+    }));
+    sessionsModule.useSessionsStore.getState().ensureBtwConversation({
+      id: 'btw-1',
+      projectId: 'project',
+      btwParentId: parentId,
+      rolePrompt: 'You are aside',
+    });
+    await sessionsModule.useSessionsStore
+      .getState()
+      .send(
+        'hello aside',
+        { providerId: 'provider-1', modelId: 'model-1', cwd: '/workspace' },
+        undefined,
+        'btw-1'
+      );
+    expect(btwSpawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'btw-1',
+        parentConversationId: parentId,
+        rolePrompt: 'You are aside',
+        presetId: 'coding',
+        approvalMode: 'supervised',
+        loadLocalSkills: false,
+      })
+    );
+    expect(agentSpawn).not.toHaveBeenCalled();
+    expect(agentPrompt).toHaveBeenCalled();
+    expect(sessionsModule.useSessionsStore.getState().activeId).toBe(parentId);
+    expect(sessionsModule.useSessionsStore.getState().order).not.toContain('btw-1');
+  });
+
+  it('主会话前台时旁路仍应用 message-upsert，不因冷缓存丢正文', async () => {
+    const parentId = sessionsModule.useSessionsStore.getState().activeId!;
+    sessionsModule.useSessionsStore.getState().ensureBtwConversation({
+      id: 'btw-1',
+      projectId: 'project',
+      btwParentId: parentId,
+      rolePrompt: 'You are aside',
+    });
+    onAgentEvent?.({
+      type: 'message-upsert',
+      identity: { sessionId: 'btw-1', generation: 'g1' },
+      seq: 1,
+      index: 0,
+      message: { role: 'assistant', content: [{ type: 'text', text: '旁路答完了' }] },
+    });
+    const messages = sessionsModule.useSessionsStore.getState().conversations['btw-1']?.messages;
+    expect(messages?.some((message) => message.role === 'assistant')).toBe(true);
+    expect(JSON.stringify(messages)).toContain('旁路答完了');
+  });
+
+  it('旁路首条 role 前缀 user upsert 消费乐观回显并上屏助手', async () => {
+    const parentId = sessionsModule.useSessionsStore.getState().activeId!;
+    sessionsModule.useSessionsStore.getState().ensureBtwConversation({
+      id: 'btw-1',
+      projectId: 'project',
+      btwParentId: parentId,
+      rolePrompt: 'You are aside',
+    });
+    await sessionsModule.useSessionsStore
+      .getState()
+      .send(
+        '刚刚聊到什么工具',
+        { providerId: 'provider-1', modelId: 'model-1', cwd: '/workspace' },
+        undefined,
+        'btw-1'
+      );
+    expect(
+      sessionsModule.useSessionsStore
+        .getState()
+        .conversations['btw-1']?.messages.some((message) => message.optimistic)
+    ).toBe(true);
+    onAgentEvent?.({
+      type: 'message-upsert',
+      identity: { sessionId: 'btw-1', generation: 'g1' },
+      seq: 1,
+      index: 0,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: '<role>\nYou are aside\n</role>\n\n刚刚聊到什么工具' }],
+      },
+    });
+    onAgentEvent?.({
+      type: 'message-upsert',
+      identity: { sessionId: 'btw-1', generation: 'g1' },
+      seq: 2,
+      index: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: '用的是 bash' }] },
+    });
+    const messages = sessionsModule.useSessionsStore.getState().conversations['btw-1']?.messages;
+    expect(messages?.some((message) => message.optimistic)).toBe(false);
+    expect(messages?.some((message) => message.role === 'assistant')).toBe(true);
+    expect(JSON.stringify(messages)).toContain('用的是 bash');
   });
 });

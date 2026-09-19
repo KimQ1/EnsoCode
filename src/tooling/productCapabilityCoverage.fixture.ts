@@ -48,12 +48,8 @@ export const SETTINGS_DATA_COVERAGE = {
   ),
   memoryDistillEnabled: excluded('Memory auto-distillation preference; not an Enso capability.'),
   memoryKgEnabled: excluded('Memory entity-graph extraction preference; not an Enso capability.'),
-  bashInterceptEnabled: excluded(
-    'Bash intercept is a desktop session preference, not an Enso capability.'
-  ),
-  hashlineEditEnabled: excluded(
-    'Hashline edit is a desktop session preference, not an Enso capability.'
-  ),
+  editMode: excluded('File edit mode is a desktop session preference, not an Enso capability.'),
+  compactStrategy: excluded('Context compaction is a desktop session preference.'),
   smartCompactEnabled: excluded(
     'Verified smart compaction is a desktop session preference, not an Enso capability.'
   ),
@@ -64,6 +60,7 @@ export const SETTINGS_DATA_COVERAGE = {
     'Verified smart compaction mode is a desktop session preference, not an Enso capability.'
   ),
   autoUpdate: surfaces('general.automatic-updates'),
+  autoRestartWhenIdle: excluded('Device idle-restart update policy; not an Enso capability.'),
   proxyMode: surfaces('general.proxy-mode'),
   customProxyUrl: surfaces('general.custom-proxy-url'),
   openChangesOnFileEdit: excluded('Renderer side-panel preference; not an Enso capability.'),
@@ -82,6 +79,7 @@ export const SETTINGS_DATA_COVERAGE = {
   autoDeleteArchivedDays: excluded('Renderer sidebar archive preference; not an Enso capability.'),
   providers: surfaces('providers.list'),
   defaultModel: surfaces('providers.default-model'),
+  defaultModelFollowLast: surfaces('providers.default-model'),
   defaultReasoningEnabled: surfaces('providers.default-model'),
   defaultThinkingLevel: surfaces('providers.default-model'),
   titleSummaryEnabled: excluded('Conversation title summary preference; not an Enso capability.'),
@@ -154,12 +152,8 @@ export const SETTINGS_ACTION_COVERAGE = {
   setMemoryKgEnabled: excluded(
     'Memory entity-graph extraction preference; not an Enso capability.'
   ),
-  setBashInterceptEnabled: excluded(
-    'Bash intercept is a desktop session preference, not an Enso capability.'
-  ),
-  setHashlineEditEnabled: excluded(
-    'Hashline edit is a desktop session preference, not an Enso capability.'
-  ),
+  setEditMode: excluded('File edit mode is a desktop session preference, not an Enso capability.'),
+  setCompactStrategy: excluded('Context compaction is a desktop session preference.'),
   setSmartCompactEnabled: excluded(
     'Verified smart compaction is a desktop session preference, not an Enso capability.'
   ),
@@ -170,6 +164,7 @@ export const SETTINGS_ACTION_COVERAGE = {
     'Verified smart compaction mode is a desktop session preference, not an Enso capability.'
   ),
   setAutoUpdate: surfaces('general.automatic-updates'),
+  setAutoRestartWhenIdle: excluded('Device idle-restart update policy; not an Enso capability.'),
   setProxyMode: surfaces('general.proxy-mode'),
   setCustomProxyUrl: surfaces('general.custom-proxy-url'),
   setOpenChangesOnFileEdit: excluded('Renderer side-panel preference; not an Enso capability.'),
@@ -195,6 +190,10 @@ export const SETTINGS_ACTION_COVERAGE = {
   setStatusLineSegments: surfaces('appearance.status-line-segments'),
   toggleStatusLineSegment: surfaces('appearance.status-line-segments'),
   setDefaultModel: surfaces('providers.default-model'),
+  setDefaultModelFollowLast: surfaces('providers.default-model'),
+  rememberDefaultModelFromSelection: excluded(
+    'Follow-last default model is updated from the chat picker.'
+  ),
   setDefaultReasoningEnabled: surfaces('providers.default-model'),
   setDefaultThinkingLevel: surfaces('providers.default-model'),
   setTitleSummaryEnabled: excluded(
@@ -251,6 +250,7 @@ export const SETTINGS_ACTION_COVERAGE = {
   setProjectGroupId: surfaces('projects.list'),
   setProjectAlias: surfaces('projects.list'),
   setProjectDefaultModel: surfaces('projects.list'),
+  setProjectDisabledBuiltinTools: surfaces('projects.list'),
   removeProject: surfaces('projects.remove'),
   setUsageModelPricing: excluded(
     'Local usage cost override for Settings → Usage; desktop-only estimate, not an Enso capability.'
@@ -318,6 +318,10 @@ export const IPC_PRODUCT_COVERAGE = {
   WINDOW_POPUP_MENU: excluded('Native application menu popup; renderer chrome only.'),
   APP_CLOSE_REQUEST: excluded('Main-to-renderer quit confirm handshake.'),
   APP_CLOSE_RESPONSE: excluded('Renderer-to-main quit confirm handshake.'),
+  APP_FLUSH_PERSIST_REQUEST: excluded(
+    'Main-to-renderer persist flush before destroying the window.'
+  ),
+  APP_FLUSH_PERSIST_RESPONSE: excluded('Renderer-to-main persist flush ack.'),
   PROVIDERS_SCAN_LOCAL: surfaces('providers.import-local'),
   PROVIDERS_COLLECT_IMPORT: excluded('Second phase of the reviewed provider import flow.'),
   PROVIDERS_LIST_MODELS: surfaces('providers.fetch-models'),
@@ -455,6 +459,9 @@ export const IPC_PRODUCT_COVERAGE = {
   UPDATER_DOWNLOAD_UPDATE: surfaces('updates.download'),
   UPDATER_QUIT_AND_INSTALL: surfaces('updates.install'),
   UPDATER_SET_AUTO_UPDATE_ENABLED: surfaces('general.automatic-updates'),
+  UPDATER_SET_AUTO_RESTART_WHEN_IDLE: excluded(
+    'Device idle-restart update policy; not an Enso capability.'
+  ),
   PROXY_APPLY: surfaces('general.proxy-mode', 'general.custom-proxy-url'),
   UPDATER_STATUS: surfaces('updates.status'),
   DIALOG_SELECT_FILE: excluded('Native file picker; user-driven OS dialog.'),
@@ -517,6 +524,7 @@ export const IPC_PRODUCT_COVERAGE = {
   BROWSER_RESTORE_TABS: excluded('Side panel browser session restore; renderer UI only.'),
   BROWSER_LIST_SEARCHABLE_TABS: excluded('Search Anything tab list; renderer UI only.'),
   BROWSER_CLOSE_TAB: excluded('Side panel browser tab close; renderer UI only.'),
+  BROWSER_CLOSE_SESSION: excluded('Close all browser tabs when a conversation is deleted.'),
   BROWSER_SET_DEVTOOLS: excluded('Side panel browser native DevTools toggle; renderer UI only.'),
   BROWSER_SET_DEVTOOLS_VIEWPORT: excluded(
     'Side panel browser DevTools overlay geometry; renderer UI only.'
@@ -581,6 +589,10 @@ export const IPC_PRODUCT_COVERAGE = {
   MEMORY_CRYSTALLIZE: excluded('Memory desktop UI; not an Enso capability.'),
   MEMORY_DISTILLABLE_SESSIONS: excluded('Memory desktop UI; not an Enso capability.'),
   MEMORY_DISTILL_SESSION: excluded('Memory desktop UI; not an Enso capability.'),
+  BTW_PROMPT: excluded('Desktop side-panel aside chat; not an Enso capability.'),
+  BTW_ABORT: excluded('Desktop side-panel aside chat abort; not an Enso capability.'),
+  BTW_SPAWN: excluded('Desktop side-panel aside chat spawn; not an Enso capability.'),
+  BTW_DISPOSE: excluded('Desktop side-panel aside chat dispose; not an Enso capability.'),
 } satisfies Record<keyof typeof IPC_CHANNELS, CoverageDisposition>;
 
 export const AUTHORITATIVE_COVERAGE_SOURCES = {
