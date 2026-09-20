@@ -40,6 +40,7 @@ export const SETTINGS_DATA_COVERAGE = {
   exploreFoldEnabled: excluded(
     'Explore-fold is a desktop session preference, not an Enso capability.'
   ),
+  rtkEnabled: excluded('RTK command compression is a desktop session preference.'),
   memoryEmbeddingModel: excluded('Memory embedding model choice is a desktop preference.'),
   memoryEmbeddingAutoDownload: excluded('Memory model download policy is a device preference.'),
   memoryModelIdleMinutes: excluded('Memory model idle unloading policy is a device preference.'),
@@ -66,6 +67,7 @@ export const SETTINGS_DATA_COVERAGE = {
   openChangesOnFileEdit: excluded('Renderer side-panel preference; not an Enso capability.'),
   compactReadOnlyTools: excluded('Renderer timeline density preference; not an Enso capability.'),
   expandLiveEdits: excluded('Renderer timeline expansion preference; not an Enso capability.'),
+  autoCollapseTurns: excluded('Renderer timeline collapse preference; not an Enso capability.'),
   chatWide: excluded('Renderer chat column width preference; not an Enso capability.'),
   notifyMainAgentOnly: excluded(
     'Desktop/phone completion notification preference; not an Enso capability.'
@@ -142,6 +144,7 @@ export const SETTINGS_ACTION_COVERAGE = {
   setExploreFoldEnabled: excluded(
     'Explore-fold is a desktop session preference, not an Enso capability.'
   ),
+  setRtkEnabled: excluded('RTK command compression is a desktop session preference.'),
   setMemoryEmbeddingModel: excluded('Memory embedding model choice is a desktop preference.'),
   setMemoryEmbeddingAutoDownload: excluded('Memory model download policy is a device preference.'),
   setMemoryModelIdleMinutes: excluded('Memory model idle unloading policy is a device preference.'),
@@ -172,6 +175,7 @@ export const SETTINGS_ACTION_COVERAGE = {
     'Renderer timeline density preference; not an Enso capability.'
   ),
   setExpandLiveEdits: excluded('Renderer timeline expansion preference; not an Enso capability.'),
+  setAutoCollapseTurns: excluded('Renderer timeline collapse preference; not an Enso capability.'),
   setChatWide: excluded('Renderer chat column width preference; not an Enso capability.'),
   setNotifyMainAgentOnly: excluded(
     'Desktop/phone completion notification preference; not an Enso capability.'
@@ -335,6 +339,9 @@ export const IPC_PRODUCT_COVERAGE = {
   OAUTH_LOGIN_CANCEL: surfaces('providers.oauth.cancel-login'),
   OAUTH_LOGIN_REOPEN: surfaces('providers.oauth.reopen-login'),
   OAUTH_LOGOUT: surfaces('providers.oauth.logout'),
+  OAUTH_IMPORT_CODEX: excluded(
+    'Copies the local Codex ChatGPT login into auth.json; only reachable from the provider wizard UI.'
+  ),
   OAUTH_LOGIN_EVENT: excluded('Protected OAuth flow progress transport.'),
   OAUTH_ACCOUNT_INFO: surfaces('providers.oauth.usage'),
   OAUTH_CREDENTIAL_KEYS_LIST: excluded(
@@ -358,6 +365,8 @@ export const IPC_PRODUCT_COVERAGE = {
   INSTRUCTIONS_WRITE: surfaces('instructions.edit-local-copy'),
   INSTRUCTIONS_WRITE_SOURCE: surfaces('instructions.overwrite-source'),
   INSTRUCTIONS_DELETE: surfaces('instructions.remove'),
+  PRESETS_SYSTEM_PROMPT_READ: excluded('Settings-only preset editor content read.'),
+  PRESETS_SYSTEM_PROMPT_WRITE: excluded('Settings-only preset editor content write.'),
   AGENT_SPAWN: excluded('Lazy worker lifecycle command behind conversation send.'),
   AGENT_PROMPT: surfaces('conversations.send'),
   AGENT_STEER: surfaces('conversations.queue.send-now'),
@@ -484,6 +493,9 @@ export const IPC_PRODUCT_COVERAGE = {
   FILES_COPY_PATH: excluded('Side panel Files copy path text to clipboard.'),
   FILES_COPY_FILE: excluded('Side panel Files copy local file to OS clipboard.'),
   FILES_REVEAL: excluded('Side panel Files reveal in system file manager.'),
+  FILES_SEARCH_WORKSPACE: excluded(
+    'Side panel Files name/content search scoped to conversation cwd.'
+  ),
   PAIR_CANCEL: excluded('Phone second-screen pairing transport; not an Enso capability.'),
   PAIR_CATALOG: excluded('Phone second-screen pairing transport; not an Enso capability.'),
   PAIR_RESUME_SESSION: excluded('Phone second-screen pairing transport; not an Enso capability.'),

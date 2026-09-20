@@ -66,6 +66,8 @@ import { createElectronPersistStorage, openPersistWriteGate } from '@/stores/set
 import { purgeConversationAuthority } from './authorityCleanup';
 import {
   canWakeConversationForRewind,
+  extractRewindDraft,
+  rewindKeepCount,
   rewindWorkerPhase,
   shouldSendRewindCommand,
 } from './conversationRewind';
@@ -92,9 +94,9 @@ import {
   applyHistoryPage,
   emptyProjection,
   isVisibleGenerationOutput,
+  rewindTruncatedNeedsSnapshotResync,
   type SessionProjection,
   type TimelineMessage,
-  truncatedNeedsSnapshotResync,
   upsertOutOfRange,
 } from './reducer';
 import { applyConversationReload } from './reload';
@@ -254,6 +256,10 @@ export interface Conversation extends SessionProjection {
   /** 回退后待预填输入框的内容(rewind-done 回流,Composer 消费一次) */
   draftText?: string;
   draftImages?: AttachedImage[];
+  /** 回退在飞：会话树尚未 navigateTree 完成。不持久化 */
+  rewinding?: boolean;
+  /** 工作树文件还原在飞。不持久化 */
+  restoringFiles?: boolean;
   /** 隔离会话的 worktree 绑定（main 权威的投影）；持久化，resume 时据此校验与定 cwd */
   worktree?: SessionWorktree;
   /** 工作区迁移/回退提醒，随下一条用户消息前置注入后清除；持久化 */
@@ -484,6 +490,60 @@ export const useSessionsStore = create<SessionsState>()(
        */
       const pendingTitleBaselines = new Map<string, string>();
       const rewindInFlight = new Set<string>();
+
+      const rewindDraftGuard = new Map<string, string>();
+      /** 回退目标的绝对保留长度；回退中快照超过这个长度视为未截断的旧会话 */
+      const rewindKeepAbsolute = new Map<string, number>();
+
+      function withWorkspaceRevision(
+        state: SessionsState,
+        conversationId: string,
+        conversationsPatch: Pick<SessionsState, 'conversations'>
+      ): Pick<SessionsState, 'conversations' | 'workspaceRevisionByConversation'> {
+        const revisions = state.workspaceRevisionByConversation ?? {};
+        return {
+          ...conversationsPatch,
+          workspaceRevisionByConversation: {
+            ...revisions,
+            [conversationId]: (revisions[conversationId] ?? 0) + 1,
+          },
+        };
+      }
+
+      function applyOptimisticRewind(
+        conversationId: string,
+        userIndexFromEnd: number,
+        restoreFiles?: boolean
+      ): void {
+        set((state) => {
+          const current = state.conversations[conversationId];
+          if (!current) return state;
+          const keep = rewindKeepCount(current.messages, userIndexFromEnd);
+          const draft = extractRewindDraft(current.messages, userIndexFromEnd);
+          rewindDraftGuard.set(conversationId, draft?.text ?? '');
+          if (keep !== null) {
+            rewindKeepAbsolute.set(conversationId, (current.historyBaseIndex ?? 0) + keep);
+          }
+          return withWorkspaceRevision(
+            state,
+            conversationId,
+            patch(state, conversationId, {
+              ...(keep !== null && keep < current.messages.length
+                ? { messages: current.messages.slice(0, keep) }
+                : {}),
+              rewinding: true,
+              historyLoadAttempted: true,
+              restoringFiles: restoreFiles ? true : undefined,
+              ...(draft?.text || draft?.images?.length
+                ? {
+                    draftText: draft.text,
+                    draftImages: draft.images?.length ? draft.images : undefined,
+                  }
+                : {}),
+            })
+          );
+        });
+      }
 
       /**
        * 标题总结在飞的开/关必须走这两个 helper：保证不变量
@@ -861,6 +921,15 @@ export const useSessionsStore = create<SessionsState>()(
                         historyBaseIndex: undefined,
                         historyLoading: undefined,
                       }),
+                  ...(conversation.rewinding &&
+                  (snapshot.baseIndex ?? 0) + snapshot.messages.length >
+                    (rewindKeepAbsolute.get(id) ?? conversation.messages.length)
+                    ? {
+                        messages: conversation.messages,
+                        historyBaseIndex: conversation.historyBaseIndex,
+                        customEntries: conversation.customEntries,
+                      }
+                    : {}),
                   ...(snapshot.child
                     ? {
                         parentId: snapshot.child.parentId,
@@ -1227,15 +1296,28 @@ export const useSessionsStore = create<SessionsState>()(
             if (!conversation) return state;
             const next = applyAgentEvent(conversation, id, event);
             if (next === conversation) return state;
-            return patch(state, id, {
+            const expected = rewindDraftGuard.get(id);
+            const hasDraft = Boolean(event.editorText || event.editorImages?.length);
+            const edited =
+              expected !== undefined &&
+              conversation.draftText !== undefined &&
+              conversation.draftText !== expected;
+            if (hasDraft) rewindDraftGuard.delete(id);
+            rewindKeepAbsolute.delete(id);
+            const patched = patch(state, id, {
               ...next,
-              ...(event.editorText || event.editorImages?.length
+              rewinding: undefined,
+              ...(event.filesRestored !== undefined ? { restoringFiles: undefined } : {}),
+              ...(hasDraft && !edited
                 ? {
                     draftText: event.editorText,
                     draftImages: event.editorImages?.length ? event.editorImages : undefined,
                   }
                 : {}),
             });
+            return event.filesRestored === undefined
+              ? patched
+              : withWorkspaceRevision(state, id, patched);
           });
           return;
         }
@@ -1315,7 +1397,11 @@ export const useSessionsStore = create<SessionsState>()(
           }
           if (
             event.type === 'messages-truncated' &&
-            truncatedNeedsSnapshotResync(conversation.historyBaseIndex, event.length)
+            rewindTruncatedNeedsSnapshotResync(
+              conversation.historyBaseIndex,
+              event.length,
+              conversation.rewinding
+            )
           ) {
             resyncSnapshot(id);
           }
@@ -2670,6 +2756,7 @@ export const useSessionsStore = create<SessionsState>()(
           const conversation = get().conversations[id];
           if (!conversation) return 'no conversation';
           if (conversation.workspaceMigrating) return 'workspace operation in progress';
+          if (conversation.rewinding || conversation.restoringFiles) return 'rewind in progress';
           // 只读回放的已结束实例：必须在乐观回显之前拦，否则会往只读历史里插一条
           // 根本没发出去的用户消息。
           if (conversation?.historyOnly) {
@@ -3305,8 +3392,10 @@ export const useSessionsStore = create<SessionsState>()(
           ) {
             return;
           }
+          if (conversation.rewinding || conversation.restoringFiles) return;
           if (rewindInFlight.has(conversationId)) return;
           if (shouldSendRewindCommand(conversation)) {
+            applyOptimisticRewind(conversationId, userIndexFromEnd, restoreFiles);
             void window.electronAPI.agent.rewind(conversationId, userIndexFromEnd, restoreFiles);
             return;
           }
@@ -3342,6 +3431,7 @@ export const useSessionsStore = create<SessionsState>()(
                 shouldSendRewindCommand(after) &&
                 after.sessionFile === sessionFile
               ) {
+                applyOptimisticRewind(conversationId, userIndexFromEnd, restoreFiles);
                 void window.electronAPI.agent.rewind(
                   conversationId,
                   userIndexFromEnd,

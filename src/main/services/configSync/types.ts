@@ -125,6 +125,7 @@ export interface ConfigSyncState {
   loadLocalSkills?: boolean;
   loadHarnessAssets?: boolean;
   exploreFoldEnabled?: boolean;
+  rtkEnabled?: boolean;
   bashInterceptEnabled?: boolean;
   editMode?: EditMode;
   /** @deprecated 仅用于读取旧配置包；校验后迁为 editMode。 */
@@ -132,6 +133,7 @@ export interface ConfigSyncState {
   openChangesOnFileEdit?: boolean;
   compactReadOnlyTools?: boolean;
   expandLiveEdits?: boolean;
+  autoCollapseTurns?: boolean;
   chatWide?: boolean;
   notifyMainAgentOnly?: boolean;
   maxActiveCoworkers?: number;
@@ -168,6 +170,11 @@ export interface ConfigSyncInstructionResource {
   content: string;
 }
 
+export interface ConfigSyncSystemPromptResource {
+  id: string;
+  content: string;
+}
+
 export interface ConfigSyncBundle {
   format: 'enso-config';
   version: 1;
@@ -176,6 +183,8 @@ export interface ConfigSyncBundle {
   resources: {
     skills: ConfigSyncSkillResource[];
     instructions: ConfigSyncInstructionResource[];
+    /** v1 向后兼容可选；旧包缺省为空 */
+    systemPrompts?: ConfigSyncSystemPromptResource[];
   };
   secretsIncluded: boolean;
 }

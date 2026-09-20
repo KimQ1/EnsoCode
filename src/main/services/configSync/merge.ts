@@ -45,10 +45,12 @@ const SCALAR_SETTING_KEYS = [
   'loadLocalSkills',
   'loadHarnessAssets',
   'exploreFoldEnabled',
+  'rtkEnabled',
   'editMode',
   'openChangesOnFileEdit',
   'compactReadOnlyTools',
   'expandLiveEdits',
+  'autoCollapseTurns',
   'chatWide',
   'notifyMainAgentOnly',
   'maxActiveCoworkers',
@@ -617,6 +619,7 @@ export function planImport(
   warnings: string[];
   skillIdMap: Record<string, string>;
   instructionIdMap: Record<string, string>;
+  presetIdMap: Record<string, string>;
 } {
   if (mode !== 'merge' && mode !== 'replace') throw new Error('Unsupported config sync mode');
   const state = clone(current);
@@ -677,6 +680,7 @@ export function planImport(
         'preset instruction'
       );
     }
+    if (entry.source.systemPromptId === undefined) delete next.systemPromptId;
     return next;
   });
 
@@ -751,6 +755,7 @@ export function planImport(
     'loadLocalSkills',
     'loadHarnessAssets',
     'exploreFoldEnabled',
+    'rtkEnabled',
     'editMode',
     'titleSummaryEnabled',
     'compactStrategy',
@@ -769,6 +774,7 @@ export function planImport(
     'openChangesOnFileEdit',
     'compactReadOnlyTools',
     'expandLiveEdits',
+    'autoCollapseTurns',
     'chatWide',
     'notifyMainAgentOnly',
     'maxActiveCoworkers',
@@ -865,5 +871,6 @@ export function planImport(
     ],
     skillIdMap: plans.skills.idMap,
     instructionIdMap: plans.instructions.idMap,
+    presetIdMap: plans.presets.idMap,
   };
 }

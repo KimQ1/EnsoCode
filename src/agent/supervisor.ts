@@ -35,6 +35,7 @@ import { ANTIGRAVITY_PROVIDER_ID, antigravityProviderConfig } from '@shared/prov
 import { DEVIN_PROVIDER_ID, devinProviderConfig } from '@shared/providers/devin';
 import type { SmartCompactMode } from '@shared/smartCompactMode';
 import { buildSshShellCommand, shellQuote } from '@shared/ssh';
+import { replacePersonaParagraph } from '@shared/systemPrompt';
 import type {
   AgentCommand,
   AgentRemoteConfig,
@@ -118,11 +119,11 @@ import { createMessageCoworkerTool } from './messageCoworker';
 import { createMessageMainTool } from './messageMain';
 import { ParentNotifier } from './notify';
 import { withOpenAIResponsesRouting } from './openaiResponsesRouting';
-import { osSandboxSpawnHook, wrapOsSandboxCommand } from './osSandbox';
 import { projectMessage } from './projection';
 import { applyWorkerProxyEnv } from './proxyEnv';
 import { withReadTruncationMeta } from './readTruncation';
 import { projectMessages, projectResumeTail } from './resumeSnapshots';
+import { withRtkOptimization } from './rtk';
 import { RunawayGuard } from './runawayGuard';
 import {
   EVICTION_SWEEP_INTERVAL_MS,
@@ -331,11 +332,14 @@ function createSessionResourceLoader(options: {
   compactStrategy?: CompactStrategy;
   smartCompactSummaryModel?: SpawnModelConfig;
   smartCompactMode?: SmartCompactMode;
+  /** 仅普通 parent：替换 pi 默认提示词开头的角色段落。 */
+  persona?: string;
 }): DefaultResourceLoader {
   const harness = options.loadHarnessAssets && !options.remoteAgentsFiles;
   const skillPaths = harness
     ? [...options.skillPaths, ...resolveHarnessSkillRoots(options.cwd)]
     : options.skillPaths;
+  const persona = options.persona;
   return new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -344,6 +348,19 @@ function createSessionResourceLoader(options: {
     ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
     // noExtensions 只挡磁盘上的项目/全局扩展；inline factory 不受影响，图片修剪对所有会话生效
     extensionFactories: [
+      ...(persona
+        ? [
+            {
+              name: 'custom-persona',
+              hidden: true,
+              factory: (pi) => {
+                pi.on('before_agent_start', (event) => ({
+                  systemPrompt: replacePersonaParagraph(event.systemPrompt, persona),
+                }));
+              },
+            } satisfies InlineExtension,
+          ]
+        : []),
       options.branchContext,
       applyPatchResultExtension,
       {
@@ -463,6 +480,12 @@ export function materializeSessionFile(session: AgentSession): void {
   } catch {
     // 落盘失败不能弄挂派发；内存中的通知仍然可用。
   }
+}
+
+/** pi 的 branch() 只改内存叶子；jsonl 重开以最后一行为准。回退后写一条不可见锚点，重启才停在回退处。 */
+export function persistRewindLeaf(session: AgentSession): void {
+  session.sessionManager.appendCustomEntry('enso-rewind-leaf', { at: Date.now() });
+  materializeSessionFile(session);
 }
 
 function requiredSessionFile(session: AgentSession): string {
@@ -932,7 +955,9 @@ export class SessionSupervisor {
           command.smartCompactMode,
           command.memoryLanguage,
           command.editMode,
-          command.rolePrompt
+          command.rolePrompt,
+          command.systemPrompt,
+          command.rtkEnabled
         );
         return;
       case 'spawn-child':
@@ -1253,24 +1278,24 @@ export class SessionSupervisor {
           });
           return;
         }
-        let filesRestored = false;
-        if (command.restoreFiles && managed.checkpoints) {
-          try {
-            filesRestored = await managed.checkpoints.restoreForEntry(
-              target.id,
-              new Date(target.timestamp).getTime()
-            );
-          } catch (error) {
-            console.error('[rewind] file restore failed:', toErrorMessage(error));
-            this.options.emit({
-              type: 'rewind-done',
-              identity: managed.identity,
-              seq: ++managed.seq,
-            });
-            return;
-          }
-        }
+        this.truncateProjectionForRewind(managed, command.userIndexFromEnd);
+        const restorePromise =
+          command.restoreFiles && managed.checkpoints
+            ? managed.checkpoints
+                .restoreForEntry(target.id, new Date(target.timestamp).getTime())
+                .catch((error) => {
+                  console.error('[rewind] file restore failed:', toErrorMessage(error));
+                  return false;
+                })
+            : null;
         const result = await managed.session.navigateTree(target.id);
+        if (!result.cancelled) persistRewindLeaf(managed.session);
+        const fallbackEditorText = Array.isArray(target.message.content)
+          ? target.message.content
+              .filter((part) => part.type === 'text' && part.text)
+              .map((part) => part.text)
+              .join('')
+          : '';
         const editorImages = Array.isArray(target.message.content)
           ? target.message.content.flatMap((part) =>
               part.type === 'image' && part.data && part.mimeType
@@ -1278,15 +1303,26 @@ export class SessionSupervisor {
                 : []
             )
           : [];
-        this.reconcileMessages(managed, this.transcript(managed));
+        this.replaceMessagesAfterRewind(managed);
         this.options.emit({
           type: 'rewind-done',
           identity: managed.identity,
           seq: ++managed.seq,
-          ...(!result.cancelled && result.editorText ? { editorText: result.editorText } : {}),
+          ...(!result.cancelled && (result.editorText || fallbackEditorText)
+            ? { editorText: result.editorText || fallbackEditorText }
+            : {}),
           ...(!result.cancelled && editorImages.length > 0 ? { editorImages } : {}),
-          ...(filesRestored ? { filesRestored } : {}),
         });
+        if (command.restoreFiles) {
+          void Promise.resolve(restorePromise ?? false).then((filesRestored) => {
+            this.options.emit({
+              type: 'rewind-done',
+              identity: managed.identity,
+              seq: ++managed.seq,
+              filesRestored: Boolean(filesRestored),
+            });
+          });
+        }
         return;
       }
       case 'abort': {
@@ -1338,7 +1374,9 @@ export class SessionSupervisor {
     smartCompactMode?: SmartCompactMode,
     memoryLanguage?: string,
     requestedEditMode?: EditMode,
-    rolePrompt?: string
+    rolePrompt?: string,
+    systemPrompt?: string,
+    rtkEnabled = true
   ): Promise<void> {
     const sessionId = identity.sessionId;
     const sessionEditMode = resolveEditMode(requestedEditMode, hashlineEditEnabled);
@@ -1399,6 +1437,7 @@ export class SessionSupervisor {
       ...(remote ? { remoteSsh: { host: remote.host } } : {}),
       loadHarnessAssets,
       exploreFold,
+      persona: systemPrompt,
       ...(compactStrategy !== 'standard'
         ? {
             compactStrategy,
@@ -1530,12 +1569,6 @@ export class SessionSupervisor {
           return { command: sshCommand, cwd: process.cwd() };
         }
       : undefined;
-    const commandTransform = remoteOps
-      ? backgroundTransform
-      : (command: string, commandCwd: string) => ({
-          command: wrapOsSandboxCommand(command, commandCwd),
-          cwd: commandCwd,
-        });
     const buildBaseTools = (
       toolGate: ApprovalGate,
       cp?: CheckpointManager,
@@ -1585,17 +1618,25 @@ export class SessionSupervisor {
           'command',
           guarded(
             withBackground(
-              createSessionCommandTool({
-                cwd,
-                remote: Boolean(remoteOps),
-                preference: windowsLocalShell,
-                operations: remoteOps?.bash,
-                ...(remoteOps ? {} : { spawnHook: osSandboxSpawnHook(cwd) }),
-              }) as unknown as Def,
+              withRtkOptimization(
+                createSessionCommandTool({
+                  cwd,
+                  remote: Boolean(remoteOps),
+                  preference: windowsLocalShell,
+                  operations: remoteOps?.bash,
+                }) as unknown as Def,
+                {
+                  binaryPath: process.env.ENSO_RTK_PATH,
+                  dataDir: path.join(this.options.agentDir, 'rtk'),
+                  cwd,
+                  remote: Boolean(remoteOps),
+                  enabled: rtkEnabled,
+                }
+              ),
               this.bgTasks,
               sessionId,
               cwd,
-              commandTransform
+              backgroundTransform
             )
           )
         ),
@@ -3041,6 +3082,40 @@ export class SessionSupervisor {
         length: projected.length,
       });
     }
+  }
+
+  /** 纯回退是严格前缀：先裁投影，UI 不必等 navigateTree / 文件还原。 */
+  private truncateProjectionForRewind(managed: ManagedSession, userIndexFromEnd: number): void {
+    if (!Number.isInteger(userIndexFromEnd) || userIndexFromEnd < 0) return;
+    const users: number[] = [];
+    for (let i = 0; i < managed.messages.length; i++) {
+      if (managed.messages[i]?.role === 'user') users.push(i);
+    }
+    const keep = users[users.length - 1 - userIndexFromEnd];
+    if (keep === undefined || keep >= managed.messages.length) return;
+    managed.messages.length = keep;
+    managed.timings.length = keep;
+    this.options.emit({
+      type: 'messages-truncated',
+      identity: managed.identity,
+      seq: ++managed.seq,
+      length: keep,
+    });
+  }
+
+  /** 回退后只对齐长度，不把前缀逐条 upsert 回去。 */
+  private replaceMessagesAfterRewind(managed: ManagedSession): void {
+    const projected = this.transcript(managed)
+      .map(projectMessage)
+      .filter((message): message is ProjectedMessage => message !== null)
+      .map((rawMessage, index) => this.withTiming(managed, index, rawMessage));
+    const previousLength = managed.messages.length;
+    if (projected.length < previousLength) {
+      // navigateTree 后的 LLM 上下文可能短于完整投影；再 truncated 会砍掉前缀。
+      return;
+    }
+    managed.messages = projected;
+    managed.timings.length = projected.length;
   }
 
   /** 重试倒计时中则打断并等待本轮收尾；返回是否发生了打断（用户输入接管重试） */

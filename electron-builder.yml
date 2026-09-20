@@ -71,6 +71,8 @@ asarUnpack:
   - node_modules/onnxruntime-node/bin/**
   # node-datachannel 平台预编译；asar 内 dlopen 失败
   - node_modules/@node-datachannel/**/*.node
+  # ripgrep 二进制不能从 asar 内执行
+  - node_modules/@vscode/ripgrep/bin/**
 mac:
   category: public.app-category.developer-tools
   target:
@@ -86,7 +88,8 @@ linux:
     - AppImage
     - deb
 npmRebuild: false
-afterPack: ./src/tooling/stripPackagedNatives.mjs
+# 聚合 hook 仍会先调用 src/tooling/stripPackagedNatives.mjs，再放入目标架构 RTK。
+afterPack: ./scripts/after-pack.mjs
 publish:
   provider: github
   owner: J3n5en

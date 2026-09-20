@@ -31,6 +31,9 @@ docs/plans/
 # zvec-grep 本地语义索引
 .zvec-grep/
 
+# 误配 store-dir 时落在仓库里的 pnpm 缓存
+.pnpm-store/
+
 # agent 与调查的 scratch 产物（约定：temp/<工作标识>/），不进版本库也不进门禁
 temp/
 .bce-tool/
@@ -38,3 +41,8 @@ temp/
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# 下载并校验的 RTK 官方二进制（manifest / 许可文件保留）
+resources/rtk/*/rtk
+resources/rtk/*/rtk.exe
+resources/rtk/*/rtk.tmp-*

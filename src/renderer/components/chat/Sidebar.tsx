@@ -70,6 +70,7 @@ import {
 import { GroupEditorDialog } from '@/components/chat/GroupEditorDialog';
 import { GroupSelector } from '@/components/chat/GroupSelector';
 import { ImportSessionDialog } from '@/components/chat/ImportSessionDialog';
+import { openDirectoryFromMenu, openDirectoryLabel } from '@/components/chat/openDirectoryAction';
 import { ProjectSettingsDialog } from '@/components/chat/ProjectSettingsDialog';
 import { reloadConversationFromMenu } from '@/components/chat/reloadConversationAction';
 import { NodeSwitcher } from '@/components/nodes/NodeSwitcher';
@@ -975,6 +976,17 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                     icon: <Settings />,
                     onSelect: () => setProjectSettingsId(project.id),
                   },
+                  ...(project.kind !== 'ssh'
+                    ? [
+                        {
+                          kind: 'item' as const,
+                          key: 'reveal',
+                          label: t(openDirectoryLabel(window.electronAPI.env.platform)),
+                          icon: <FolderOpen />,
+                          onSelect: () => openDirectoryFromMenu({ projectId: project.id }, t),
+                        },
+                      ]
+                    : []),
                   {
                     kind: 'item',
                     key: 'import',
@@ -2077,6 +2089,11 @@ function ConversationRow({
   onRemove,
 }: ConversationRowProps) {
   const { t } = useI18n();
+  const localProject = useSettingsStore((state) =>
+    state.projects.some(
+      (project) => project.id === conversation.projectId && project.kind !== 'ssh'
+    )
+  );
   const [renaming, setRenaming] = useState(false);
   const worktree = useSessionsStore((state) => state.conversations[id]?.worktree);
   const workspaceBusy = useSessionsStore((state) =>
@@ -2274,6 +2291,20 @@ function ConversationRow({
             <RefreshCw className={conversation.reloading ? 'animate-spin' : undefined} />
             {t('Reload conversation')}
           </ContextMenuItem>
+          {localProject && (
+            <ContextMenuItem
+              disabled={workspaceBusy || worktreeMissing || worktreeStatus?.exists === false}
+              onClick={() =>
+                void openDirectoryFromMenu(
+                  { projectId: conversation.projectId, conversationId: id },
+                  t
+                )
+              }
+            >
+              <FolderOpen />
+              {t(openDirectoryLabel(window.electronAPI.env.platform))}
+            </ContextMenuItem>
+          )}
           {!archived && (
             <ContextMenuItem onClick={() => onTogglePin(id)}>
               <PinIcon />

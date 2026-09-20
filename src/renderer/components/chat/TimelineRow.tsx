@@ -5,6 +5,7 @@ import {
   BoxSelect,
   Brain,
   Check,
+  ChevronDown,
   ChevronRight,
   Circle,
   CircleAlert,
@@ -61,6 +62,7 @@ import { Markdown } from './Markdown';
 import { mentionChipClass } from './MentionChip';
 import { splitInlineMentions, splitMentionRefs } from './mentionComposer';
 import { ReadFileView } from './ReadFileView';
+import { RtkToolStatsBar } from './RtkToolStatsBar';
 import { SlashChip, slashChipClass, splitSlashCommand } from './SlashChip';
 import { TerminalOutput } from './TerminalOutput';
 import { ZoomableImage } from './ZoomableImage';
@@ -78,6 +80,8 @@ interface TimelineRowProps {
   item: TimelineItem;
   /** tool-group 组头点击展开/收拢 */
   onToggleGroup?: (key: string) => void;
+  /** 轮次（Turn）折叠/展开：行自身知道目标状态，父级不必回查 */
+  onToggleTurn?: (key: string, collapsed: boolean) => void;
 }
 
 /**
@@ -93,7 +97,15 @@ function itemEqual(prev: TimelineRowProps, next: TimelineRowProps): boolean {
   switch (a.kind) {
     case 'user': {
       if (b.kind !== 'user') return false;
-      if (a.text !== b.text || a.images.length !== b.images.length) return false;
+      if (
+        a.text !== b.text ||
+        a.images.length !== b.images.length ||
+        a.timestamp !== b.timestamp ||
+        a.turnDurationMs !== b.turnDurationMs ||
+        a.collapsed !== b.collapsed ||
+        a.canCollapse !== b.canCollapse
+      )
+        return false;
       return a.images.every((image, i) => image === b.images[i]);
     }
     case 'text':
@@ -103,7 +115,10 @@ function itemEqual(prev: TimelineRowProps, next: TimelineRowProps): boolean {
         a.text === b.text &&
         a.streaming === b.streaming &&
         (a.kind !== 'text' ||
-          (b.kind === 'text' && perfEqual(a.perf, b.perf) && a.timestamp === b.timestamp)) &&
+          (b.kind === 'text' &&
+            perfEqual(a.perf, b.perf) &&
+            a.timestamp === b.timestamp &&
+            a.turnDurationMs === b.turnDurationMs)) &&
         (a.kind !== 'thinking' || (b.kind === 'thinking' && a.durationMs === b.durationMs))
       );
     case 'tool':
@@ -121,7 +136,8 @@ function itemEqual(prev: TimelineRowProps, next: TimelineRowProps): boolean {
         a.startedAt === b.startedAt &&
         a.agentMeta === b.agentMeta &&
         a.source === b.source &&
-        a.nestedPending === b.nestedPending
+        a.nestedPending === b.nestedPending &&
+        a.rtk === b.rtk
       );
     case 'tool-group':
       return (
@@ -460,13 +476,18 @@ export function isCompactRow(item: TimelineItem): boolean {
   );
 }
 
-export const TimelineRow = memo(function TimelineRow({ item, onToggleGroup }: TimelineRowProps) {
+export const TimelineRow = memo(function TimelineRow({
+  item,
+  onToggleGroup,
+  onToggleTurn,
+}: TimelineRowProps) {
   const search = useChatSearchHighlight();
   const searchQuery = search.query;
   const activeNth = search.activeKey === item.key ? search.activeNth : -1;
   switch (item.kind) {
     case 'user': {
       const fromMain = item.text ? isFromMainAgent(item.text) : false;
+      const isCollapsed = item.collapsed === true;
       return (
         <div
           className={cn('group/user flex flex-col gap-1.5', fromMain ? 'items-start' : 'items-end')}
@@ -482,7 +503,22 @@ export const TimelineRow = memo(function TimelineRow({ item, onToggleGroup }: Ti
           {item.text && (
             <UserText text={item.text} searchQuery={searchQuery} activeNth={activeNth} />
           )}
-          <RewindButton messageIndex={Number(item.key)} />
+          {isCollapsed ? (
+            <CollapsedTurnBar
+              turnKey={item.key}
+              timestamp={item.timestamp}
+              turnDurationMs={item.turnDurationMs}
+              onToggle={onToggleTurn}
+            />
+          ) : (
+            <UserMeta
+              turnKey={item.key}
+              messageIndex={Number(item.key)}
+              timestamp={item.timestamp}
+              canCollapse={item.canCollapse}
+              onToggleTurn={onToggleTurn}
+            />
+          )}
         </div>
       );
     }
@@ -825,6 +861,70 @@ function RewindButton({ messageIndex }: { messageIndex: number }) {
   );
 }
 
+function CollapsedTurnBar({
+  turnKey,
+  timestamp,
+  turnDurationMs,
+  onToggle,
+}: {
+  turnKey: string;
+  timestamp?: number;
+  turnDurationMs?: number;
+  onToggle?: (key: string, collapsed: boolean) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/80 select-none">
+      <button
+        type="button"
+        onClick={() => onToggle?.(turnKey, false)}
+        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground cursor-pointer border border-border/40"
+        title={t('Expand')}
+      >
+        <ChevronRight className="h-3 w-3 shrink-0" />
+        <span>{t('Expand')}</span>
+      </button>
+      {typeof timestamp === 'number' && <span>{formatClock(timestamp)}</span>}
+      {turnDurationMs !== undefined && (
+        <span>· {t('took {{duration}}', { duration: formatDuration(turnDurationMs) })}</span>
+      )}
+    </div>
+  );
+}
+
+function UserMeta({
+  turnKey,
+  messageIndex,
+  timestamp,
+  canCollapse,
+  onToggleTurn,
+}: {
+  turnKey: string;
+  messageIndex: number;
+  timestamp?: number;
+  canCollapse?: boolean;
+  onToggleTurn?: (key: string, collapsed: boolean) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-muted-foreground/75 select-none">
+      <RewindButton messageIndex={messageIndex} />
+      {canCollapse && onToggleTurn && (
+        <button
+          type="button"
+          onClick={() => onToggleTurn(turnKey, true)}
+          className={cn(userActionClass, 'cursor-pointer opacity-0 group-hover/user:opacity-100')}
+          title={t('Collapse')}
+        >
+          <ChevronDown className="h-3 w-3 shrink-0" />
+          <span>{t('Collapse')}</span>
+        </button>
+      )}
+      {typeof timestamp === 'number' && <span>{formatClock(timestamp)}</span>}
+    </div>
+  );
+}
+
 /** assistant 正文：markdown + hover 操作条（复制 / 时间 / 该轮耗时·TTFT·tok/s） */
 function TextRow({
   item,
@@ -836,6 +936,7 @@ function TextRow({
   activeNth?: number;
 }) {
   const { t } = useI18n();
+  const perfStr = item.perf ? formatPerf(item.perf, t, item.turnDurationMs !== undefined) : '';
   return (
     <div className="group text-sm">
       <Markdown
@@ -849,7 +950,12 @@ function TextRow({
           <CopyButton text={item.text} />
           {item.turnEnd && <ForkButton messageIndex={Number(item.key.split('-')[0])} />}
           {item.timestamp && <span>{formatClock(item.timestamp)}</span>}
-          {item.perf && <span>· {formatPerf(item.perf, t)}</span>}
+          {item.turnDurationMs !== undefined && (
+            <span>
+              · {t('took {{duration}}', { duration: formatDuration(item.turnDurationMs) })}
+            </span>
+          )}
+          {perfStr && <span>· {perfStr}</span>}
         </div>
       )}
     </div>
@@ -887,12 +993,17 @@ const secs = (ms: number): string => {
   return s < 10 ? String(Math.round(s * 10) / 10) : String(Math.round(s));
 };
 /** 末 step 读数：本 step 耗时 · TTFT · tok/s；多 step 轮次再附「总计 Xs」= 整轮活跃用时 */
-function formatPerf(perf: TurnPerf, t: TFunction): string {
-  const parts = [`${secs(perf.runMs)}s`];
+function formatPerf(perf: TurnPerf, t: TFunction, hasTurnDuration = false): string {
+  const parts: string[] = [];
+  // 单 step 的用时已由「took」展示；多 step 仍保留末 step 墙钟（turnMs 有值）
+  if (!hasTurnDuration || perf.turnMs !== undefined) {
+    parts.push(`${secs(perf.runMs)}s`);
+  }
   if (perf.ttftMs !== undefined) parts.push(`TTFT ${secs(perf.ttftMs)}s`);
   if (perf.tps !== undefined) parts.push(`${Math.round(perf.tps)} tok/s`);
-  if (perf.turnMs !== undefined)
+  if (!hasTurnDuration && perf.turnMs !== undefined) {
     parts.push(t('total {{duration}}', { duration: formatDuration(perf.turnMs) }));
+  }
   return parts.join(' · ');
 }
 
@@ -1303,7 +1414,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
   const { t } = useI18n();
   const compactReadOnly = useSettingsStore((s) => s.compactReadOnlyTools);
   const expandLiveEdits = useSettingsStore((s) => s.expandLiveEdits);
-  const compact = compactReadOnly && isReadOnlyTool(item);
+  const compact = compactReadOnly && item.name !== 'bash' && isReadOnlyTool(item);
   const hasDiff = Boolean(item.edits && item.edits.length > 0);
   const hasWrite = Boolean(item.writeContent);
   const hasFileChanges = Boolean(item.fileChanges && item.fileChanges.length > 0);
@@ -1478,6 +1589,7 @@ function ToolRow({ item }: { item: Extract<TimelineItem, { kind: 'tool' }> }) {
               {stripAnsi(item.output ?? '')}
             </pre>
           )}
+          <RtkToolStatsBar value={item.rtk} />
         </ToolContentScroller>
       )}
     </div>

@@ -76,6 +76,7 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
   };
 });
 
+import { CheckpointManager } from './checkpoint/manager';
 import { SessionSupervisor } from './supervisor';
 
 const parent = {
@@ -245,6 +246,227 @@ describe('SessionSupervisor compact failure', () => {
         error: 'compact unavailable',
       }),
     ]);
+    await supervisor.shutdown();
+  });
+
+  it('rewind 在 navigateTree 完成前先 truncated，且不逐条 upsert 前缀', async () => {
+    const events: AgentWorkerEvent[] = [];
+    const supervisor = new SessionSupervisor({
+      emit: (event) => events.push(event),
+      agentDir: '/tmp/agent',
+      sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-rewind-')),
+    });
+    supervisor.handleCommand({
+      type: 'spawn-parent',
+      identity: parent,
+      cwd: '/workspace',
+      model,
+    });
+    await waitFor(events, 'parent-ready');
+    const parentSession = mocks.sessions[0] as ReturnType<typeof session>;
+
+    const user = (text: string) => ({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    });
+    const assistant = (text: string) => ({
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+    });
+    parentSession.emit({ type: 'message_start', message: user('one') });
+    parentSession.emit({ type: 'message_start', message: assistant('a') });
+    parentSession.emit({ type: 'message_start', message: user('two') });
+    parentSession.emit({ type: 'message_start', message: assistant('b') });
+
+    (mocks.managers[0] as { getBranch: () => unknown[] }).getBranch().push(
+      {
+        type: 'message',
+        message: user('one'),
+        id: 'entry-user-1',
+        timestamp: 1,
+      },
+      {
+        type: 'message',
+        message: user('two'),
+        id: 'entry-user-2',
+        timestamp: 2,
+      }
+    );
+
+    let release!: (value: { cancelled: boolean; editorText: string }) => void;
+    const pending = new Promise<{ cancelled: boolean; editorText: string }>((resolve) => {
+      release = resolve;
+    });
+    parentSession.navigateTree = vi.fn(async () => {
+      parentSession.messages = [user('one'), assistant('a')];
+      return pending;
+    });
+
+    events.length = 0;
+    supervisor.handleCommand({
+      type: 'rewind',
+      identity: parent,
+      userIndexFromEnd: 0,
+    });
+    await settle();
+
+    expect(events.some((event) => event.type === 'messages-truncated')).toBe(true);
+    expect(events.find((event) => event.type === 'messages-truncated')).toMatchObject({
+      length: 2,
+    });
+    expect(events.some((event) => event.type === 'rewind-done')).toBe(false);
+
+    release({ cancelled: false, editorText: 'two' });
+    await settle();
+    await settle();
+
+    expect(parentSession.navigateTree).toHaveBeenCalledWith('entry-user-2');
+    expect(events.filter((event) => event.type === 'message-upsert')).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'rewind-done', editorText: 'two' })
+    );
+
+    await supervisor.shutdown();
+  });
+
+  it('rewind 后不把 LLM 短上下文再 truncated 掉前缀', async () => {
+    const events: AgentWorkerEvent[] = [];
+    const supervisor = new SessionSupervisor({
+      emit: (event) => events.push(event),
+      agentDir: '/tmp/agent',
+      sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-rewind-llm-')),
+    });
+    supervisor.handleCommand({
+      type: 'spawn-parent',
+      identity: parent,
+      cwd: '/workspace',
+      model,
+    });
+    await waitFor(events, 'parent-ready');
+    const parentSession = mocks.sessions[0] as ReturnType<typeof session>;
+    const user = (text: string) => ({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    });
+    const assistant = (text: string) => ({
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+    });
+    parentSession.emit({ type: 'message_start', message: user('keep') });
+    parentSession.emit({ type: 'message_start', message: assistant('computer-use') });
+    parentSession.emit({ type: 'message_start', message: user('commit') });
+    parentSession.emit({ type: 'message_start', message: assistant('ok') });
+    parentSession.emit({ type: 'message_start', message: user('edit-readme') });
+    parentSession.emit({ type: 'message_start', message: assistant('done') });
+    (mocks.managers[0] as { getBranch: () => unknown[] }).getBranch().push(
+      {
+        type: 'message',
+        message: user('keep'),
+        id: 'entry-user-1',
+        timestamp: 1,
+      },
+      {
+        type: 'message',
+        message: user('commit'),
+        id: 'entry-user-2',
+        timestamp: 2,
+      },
+      {
+        type: 'message',
+        message: user('edit-readme'),
+        id: 'entry-user-3',
+        timestamp: 3,
+      }
+    );
+    parentSession.navigateTree = vi.fn(async () => {
+      parentSession.messages = [user('commit'), assistant('ok')];
+      return { cancelled: false, editorText: 'edit-readme' };
+    });
+    events.length = 0;
+    supervisor.handleCommand({
+      type: 'rewind',
+      identity: parent,
+      userIndexFromEnd: 0,
+    });
+    await settle();
+    await settle();
+    const truncated = events.filter((event) => event.type === 'messages-truncated');
+    expect(truncated).toEqual([expect.objectContaining({ type: 'messages-truncated', length: 4 })]);
+    expect(events.filter((event) => event.type === 'message-upsert')).toEqual([]);
+    await supervisor.shutdown();
+  });
+
+  it('文件还原不阻塞 rewind-done 草稿', async () => {
+    const events: AgentWorkerEvent[] = [];
+    const supervisor = new SessionSupervisor({
+      emit: (event) => events.push(event),
+      agentDir: '/tmp/agent',
+      sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-rewind-files-')),
+    });
+    supervisor.handleCommand({
+      type: 'spawn-parent',
+      identity: parent,
+      cwd: '/workspace',
+      model,
+    });
+    await waitFor(events, 'parent-ready');
+    const parentSession = mocks.sessions[0] as ReturnType<typeof session>;
+    const user = (text: string) => ({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    });
+    parentSession.emit({ type: 'message_start', message: user('one') });
+    parentSession.emit({ type: 'message_start', message: user('two') });
+    (mocks.managers[0] as { getBranch: () => unknown[] }).getBranch().push(
+      {
+        type: 'message',
+        message: user('one'),
+        id: 'entry-user-1',
+        timestamp: 1,
+      },
+      {
+        type: 'message',
+        message: user('two'),
+        id: 'entry-user-2',
+        timestamp: 2,
+      }
+    );
+
+    let releaseRestore!: (value: boolean) => void;
+    const restorePending = new Promise<boolean>((resolve) => {
+      releaseRestore = resolve;
+    });
+    const restore = vi
+      .spyOn(CheckpointManager.prototype, 'restoreForEntry')
+      .mockReturnValue(restorePending);
+    parentSession.navigateTree = vi.fn(async () => {
+      parentSession.messages = [user('one')];
+      return { cancelled: false, editorText: 'two' };
+    });
+
+    events.length = 0;
+    supervisor.handleCommand({
+      type: 'rewind',
+      identity: parent,
+      userIndexFromEnd: 0,
+      restoreFiles: true,
+    });
+    await settle();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'rewind-done', editorText: 'two' })
+    );
+    expect(events.some((event) => event.type === 'rewind-done' && 'filesRestored' in event)).toBe(
+      false
+    );
+
+    releaseRestore(true);
+    await settle();
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'rewind-done', filesRestored: true })
+    );
+
+    restore.mockRestore();
     await supervisor.shutdown();
   });
 });

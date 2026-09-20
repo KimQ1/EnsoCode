@@ -119,6 +119,7 @@ const initialState = {
   loadHarnessAssets: false,
   windowsLocalShell: 'auto' as const,
   exploreFoldEnabled: false,
+  rtkEnabled: true,
   editMode: 'apply_patch' as import('@shared/types').EditMode,
   compactStrategy: 'standard' as import('@shared/compactStrategy').CompactStrategy,
   smartCompactEnabled: false,
@@ -137,6 +138,7 @@ const initialState = {
   openChangesOnFileEdit: false,
   compactReadOnlyTools: true,
   expandLiveEdits: true,
+  autoCollapseTurns: false,
   chatWide: false,
   notifyMainAgentOnly: true,
   maxActiveCoworkers: DEFAULT_MAX_ACTIVE_COWORKERS,
@@ -256,6 +258,7 @@ export const useSettingsStore = create<SettingsState>()(
       setWindowsLocalShell: (windowsLocalShell) =>
         set({ windowsLocalShell: parseWindowsLocalShell(windowsLocalShell) }),
       setExploreFoldEnabled: (exploreFoldEnabled) => set({ exploreFoldEnabled }),
+      setRtkEnabled: (rtkEnabled) => set({ rtkEnabled }),
       setMemoryEmbeddingModel: (memoryEmbeddingModel) => set({ memoryEmbeddingModel }),
       setMemoryEmbeddingAutoDownload: (memoryEmbeddingAutoDownload) =>
         set({ memoryEmbeddingAutoDownload }),
@@ -282,6 +285,7 @@ export const useSettingsStore = create<SettingsState>()(
       setOpenChangesOnFileEdit: (openChangesOnFileEdit) => set({ openChangesOnFileEdit }),
       setCompactReadOnlyTools: (compactReadOnlyTools) => set({ compactReadOnlyTools }),
       setExpandLiveEdits: (expandLiveEdits) => set({ expandLiveEdits }),
+      setAutoCollapseTurns: (autoCollapseTurns) => set({ autoCollapseTurns }),
       setChatWide: (chatWide) => {
         document.documentElement.classList.toggle('enso-chat-wide', chatWide);
         set({ chatWide });
@@ -547,17 +551,21 @@ export const useSettingsStore = create<SettingsState>()(
         return created;
       },
 
-      updatePreset: (id, updates) =>
+      updatePreset: (id, updates) => {
+        if (id === 'default') return;
         set((state) => ({
           presets: state.presets.map((p) => (p.id === id ? { ...p, ...updates } : p)),
-        })),
+        }));
+      },
 
-      removePreset: (id) =>
+      removePreset: (id) => {
+        if (id === 'default') return;
         set((state) => ({
           presets: state.presets.filter((p) => p.id !== id),
           // 默认预设被删除时回落内置全局预设
           ...(state.defaultPresetId === id ? { defaultPresetId: 'default' } : {}),
-        })),
+        }));
+      },
 
       setDefaultPresetId: (defaultPresetId) => set({ defaultPresetId }),
 

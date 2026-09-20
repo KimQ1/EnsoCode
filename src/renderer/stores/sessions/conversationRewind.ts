@@ -14,6 +14,8 @@ export interface ConversationRewindView {
   historyBaseIndex?: number;
   worktreeMissing?: boolean;
   workspaceMigrating?: boolean;
+  rewinding?: boolean;
+  restoringFiles?: boolean;
 }
 
 export interface RewindHost {
@@ -41,6 +43,7 @@ export function canShowConversationRewind(
   if (!conversation || conversation.historyOnly) return false;
   if (conversation.worktreeMissing || conversation.workspaceMigrating) return false;
   if (conversation.spawning || conversation.status === 'running') return false;
+  if (conversation.rewinding || conversation.restoringFiles) return false;
   if (conversation.started) return true;
   return canWakeConversationForRewind(conversation);
 }
@@ -52,7 +55,9 @@ export function shouldSendRewindCommand(conversation: ConversationRewindView | u
       conversation.status !== 'running' &&
       !conversation.historyOnly &&
       !conversation.worktreeMissing &&
-      !conversation.workspaceMigrating
+      !conversation.workspaceMigrating &&
+      !conversation.rewinding &&
+      !conversation.restoringFiles
   );
 }
 
@@ -103,4 +108,48 @@ export function userIndexFromEndForTimelineKey(
   if (localIndex < 0 || conversation.messages[localIndex]?.role !== 'user') return null;
   return conversation.messages.slice(localIndex + 1).filter((message) => message.role === 'user')
     .length;
+}
+
+/** 回退到倒数第 N+1 条 user：保留它之前的消息（不含该 user）。对不上返回 null。 */
+export function rewindKeepCount(
+  messages: readonly { role: string }[],
+  userIndexFromEnd: number
+): number | null {
+  if (!Number.isInteger(userIndexFromEnd) || userIndexFromEnd < 0) return null;
+  const users: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role === 'user') users.push(i);
+  }
+  const target = users[users.length - 1 - userIndexFromEnd];
+  if (target === undefined) return null;
+  return target;
+}
+
+type RewindDraftPart = {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+};
+
+/** 从即将裁掉的目标 user 消息抽出草稿，不必等 worker navigateTree。 */
+export function extractRewindDraft(
+  messages: readonly { role: string; content?: readonly RewindDraftPart[] }[],
+  userIndexFromEnd: number
+): { text?: string; images?: { data: string; mimeType: string }[] } | null {
+  const keep = rewindKeepCount(messages, userIndexFromEnd);
+  if (keep === null) return null;
+  const target = messages[keep];
+  if (target?.role !== 'user' || !Array.isArray(target.content)) return null;
+  const text = target.content
+    .filter((part) => part.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('');
+  const images = target.content.flatMap((part) =>
+    part.type === 'image' && part.data && part.mimeType
+      ? [{ data: part.data, mimeType: part.mimeType }]
+      : []
+  );
+  if (!text && images.length === 0) return {};
+  return { ...(text ? { text } : {}), ...(images.length > 0 ? { images } : {}) };
 }

@@ -110,6 +110,9 @@ export interface SettingsState {
   /** 探后折叠：模型可 explore_mark / explore_fold；缺省关 */
   exploreFoldEnabled: boolean;
 
+  /** RTK 命令压缩；缺省开，新建或冷恢复会话生效。 */
+  rtkEnabled: boolean;
+
   /** 文件编辑工具模式；缺省 apply_patch，新建或冷恢复会话生效。 */
   editMode: EditMode;
 
@@ -151,6 +154,8 @@ export interface SettingsState {
   compactReadOnlyTools: boolean;
   /** agent 运行中 edit/write 的行到位时自动展开 diff/内容；缺省 true */
   expandLiveEdits: boolean;
+  /** 发送新消息后自动折叠历史轮次，只留最后一轮展开；缺省 false */
+  autoCollapseTurns: boolean;
   /** 聊天列铺满：去掉两侧阶梯 max-w；缺省 false（居中阅读宽度） */
   chatWide: boolean;
   /** 仅主 agent 发送完成/失败通知；coworker 提问/审批仍提醒；缺省 true */
@@ -272,6 +277,7 @@ export interface SettingsState {
   setLoadHarnessAssets: (value: boolean) => void;
   setWindowsLocalShell: (value: WindowsLocalShell) => void;
   setExploreFoldEnabled: (value: boolean) => void;
+  setRtkEnabled: (value: boolean) => void;
   setMemoryEmbeddingModel: (value: string) => void;
   setMemoryEmbeddingAutoDownload: (value: boolean) => void;
   setMemoryModelIdleMinutes: (value: number) => void;
@@ -290,6 +296,7 @@ export interface SettingsState {
   setOpenChangesOnFileEdit: (value: boolean) => void;
   setCompactReadOnlyTools: (value: boolean) => void;
   setExpandLiveEdits: (value: boolean) => void;
+  setAutoCollapseTurns: (value: boolean) => void;
   setChatWide: (value: boolean) => void;
   setNotifyMainAgentOnly: (value: boolean) => void;
   setMaxActiveCoworkers: (value: number) => void;
