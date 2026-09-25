@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getTranslation, zhTranslations } from './i18n';
 import {
   type BrowserSearchTab,
   buildSettingsCatalog,
@@ -198,7 +199,10 @@ describe('buildSettingsCatalog', () => {
     'general.openChangesOnFileEdit',
     'general.compactReadOnlyTools',
     'general.expandLiveEdits',
+    'general.expandLiveReasoning',
     'general.autoCollapseTurns',
+    'general.collapseCompletedActivity',
+    'general.pinUnfinishedTodos',
     'general.notifyMainAgentOnly',
     'general.smartCompactEnabled',
     'general.generationStallTimeout',
@@ -218,6 +222,7 @@ describe('buildSettingsCatalog', () => {
     'instructions.root',
     'phone.root',
     'ssh.root',
+    'ssh.timeout',
   ];
 
   it('包含所有必需静态条目 id', () => {
@@ -284,5 +289,22 @@ describe('buildSettingsCatalog', () => {
     expect(searchSettingsEntries(catalog, 'proxy').map((e) => e.id)).toContain('general.proxy');
     expect(searchSettingsEntries(catalog, 'pairing').map((e) => e.id)).toContain('phone.root');
     expect(searchSettingsEntries(catalog, 'Custom').map((e) => e.id)).toContain('providers.p1');
+  });
+
+  it('目录里的标题和说明都有中文译文', () => {
+    const missing = buildSettingsCatalog()
+      .flatMap((entry) => [entry.title, entry.description ?? ''])
+      .filter((text) => text && !(text in zhTranslations));
+    expect(missing).toEqual([]);
+  });
+
+  it('传入译文函数后可用界面语言搜索，英文原文仍可命中', () => {
+    const catalog = buildSettingsCatalog();
+    const translate = (key: string) => getTranslation('zh', key);
+    const ids = (query: string) =>
+      searchSettingsEntries(catalog, query, { translate }).map((e) => e.id);
+    expect(ids('主题')).toContain('appearance.theme');
+    expect(ids('代理')).toContain('general.proxy');
+    expect(ids('proxy')).toContain('general.proxy');
   });
 });

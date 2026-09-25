@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { parseAccentColor } from '@shared/accentColor';
 import { isReservedAgentTypeName } from '@shared/builtinAgents';
 import {
   CAPABILITY_CATALOG,
@@ -24,6 +25,7 @@ import type {
 } from '@shared/capabilities/types';
 import { modelUsability } from '@shared/defaultModel';
 import { normalizeLocale, translate } from '@shared/i18n';
+import { DEFAULT_TRAY_TOGGLE_BINDING } from '@shared/keybindingAccelerator';
 import { TERMINAL_SHELLS } from '@shared/terminalShell';
 import {
   type AgentTypeEntry,
@@ -44,7 +46,6 @@ import type {
 import type { RecentProject } from '@shared/types/project';
 import type { ListModelsResult, TestProviderResult } from '@shared/types/providerApi';
 import { isAbsolutePathLike } from '@shared/worktreeRoot';
-import type { TeamExecutionGuard } from './agentDispatchService';
 import type { AgentSessionIndex } from './agentSessionIndex';
 import { createSecretSet, type SecretSet } from './secretRedactor';
 
@@ -110,37 +111,12 @@ export interface CapabilityDomainServices {
   checkForUpdates(): Promise<void>;
   downloadUpdate(): Promise<void>;
   sessionIndex: AgentSessionIndex;
-  hireCoworker(
-    parentConversationId: string,
-    name: string,
-    agentType?: string,
-    guard?: TeamExecutionGuard
-  ): Promise<CapabilityResult>;
-  dismissCoworker(
-    parentConversationId: string,
-    coworkerId: string,
-    guard?: TeamExecutionGuard
-  ): Promise<CapabilityResult>;
   /** SSH 连接档案：只暴露公开形态（无密码）；删除/探测在 main 侧完成凭证解析 */
   listSshConnections(): SshConnection[];
   deleteSshConnection(
     id: string
   ): Promise<{ ok: true; value: null } | { ok: false; error: string }>;
   testSshConnection(id: string): Promise<{ ok: true } | { ok: false; error: string }>;
-}
-
-/**
- * 把 handler 的取消上下文折成 dispatch service 认的 guard。
- *
- * hire/dismiss 是有外溢的不可逆动作，且跨 reserve/spawn/ready/handshake 多个异步边界。
- * 只在入口处检一次 assertExecutionCurrent 不够——用户批准后关窗/结束 parent/终止
- * generation 都发生在那之后，而外部动作可能已经跑了。
- */
-function teamGuardOf(context: CapabilityHandlerContext): TeamExecutionGuard {
-  return {
-    signal: context.signal,
-    assertExecutionCurrent: () => context.assertExecutionCurrent() === null,
-  };
 }
 
 interface CapabilityHandlerContext extends CapabilityInvocationContext {
@@ -194,6 +170,7 @@ function resultSettingField(capabilityId: string): string | null {
     'general.keybindings.set': 'keybindings',
     'general.keybindings.reset': 'keybindings',
     'appearance.theme': 'theme',
+    'appearance.accent': 'accentColor',
     'appearance.terminal-theme': 'terminalTheme',
     'appearance.terminal-font-size': 'terminalFontSize',
     'appearance.terminal-font-family': 'terminalFontFamily',
@@ -639,6 +616,7 @@ const DEFAULT_KEYBINDINGS: Record<string, string> = {
   'new-side-tab': 'mod+t',
   'new-btw-tab': 'mod+shift+b',
   'close-side-tab': 'mod+w',
+  'toggle-minimize-to-tray': DEFAULT_TRAY_TOGGLE_BINDING,
 };
 
 export function createCapabilityHandlers(
@@ -702,6 +680,11 @@ export function createCapabilityHandlers(
       );
     },
     'appearance.theme': settingValueHandler(services, 'theme', stringValue),
+    'appearance.accent': settingValueHandler(
+      services,
+      'accentColor',
+      (value) => parseAccentColor(value) !== null
+    ),
     'appearance.terminal-theme': settingValueHandler(services, 'terminalTheme', stringValue),
     'appearance.terminal-font-size': settingValueHandler(
       services,
@@ -1312,34 +1295,19 @@ export function createCapabilityHandlers(
       );
       return result.ok ? success(result.data) : result;
     },
-    'team.hire-coworker': async (context, params) => {
+    'team.hire-coworker': async (_context, params) => {
       const name = requiredString(params, 'name');
       if (!name) return invalid('name is required');
       const allowed = new Set(['name', 'agentType']);
       if (Object.keys(params).some((key) => !allowed.has(key))) {
         return invalid('Unknown hire field');
       }
-      const stale = context.assertExecutionCurrent();
-      if (stale) return stale;
-      // 入口处检一次不够：hire 要跨 reserve → spawn → ready 好几个异步边界。
-      // 把 guard 一并交给 dispatch service，让它在每个不可逆边界前重验。
-      return services.hireCoworker(
-        context.parentBinding.parentConversationId,
-        name,
-        typeof params.agentType === 'string' ? params.agentType : undefined,
-        teamGuardOf(context)
-      );
+      return invalid('Legacy team.hire-coworker was removed; use subagent operation=spawn.');
     },
-    'team.dismiss-coworker': async (context, params) => {
+    'team.dismiss-coworker': async (_context, params) => {
       const coworkerId = requiredString(params, 'coworkerId');
       if (!coworkerId) return invalid('coworkerId is required');
-      const stale = context.assertExecutionCurrent();
-      if (stale) return stale;
-      return services.dismissCoworker(
-        context.parentBinding.parentConversationId,
-        coworkerId,
-        teamGuardOf(context)
-      );
+      return invalid('Legacy team.dismiss-coworker was removed; use subagent operation=dismiss.');
     },
     'updates.check': async () => {
       await services.checkForUpdates();

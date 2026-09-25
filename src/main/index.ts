@@ -8,6 +8,8 @@ import { startAgentWorker } from './services/agentHost';
 import { attachAppQuitDrain } from './services/appQuitDrain';
 import {
   ensureTray,
+  enterServerMode,
+  isServerMode,
   leaveServerMode,
   restoreFromSecondInstance,
   scheduleReenterServerMode,
@@ -32,9 +34,14 @@ import { startPairHost, stopPairHost } from './services/pairHost';
 import { getProxyConfig } from './services/proxyConfig';
 import { hydrateShellPath, seedProcessPath } from './services/shellPath';
 import { disposeAllTerminals, hasPendingPtys, waitPtyQuitIdle } from './services/terminalService';
+import {
+  setTrayToggleHandler,
+  stopTrayToggleShortcut,
+  syncTrayToggleShortcut,
+} from './services/trayToggleShortcut';
 import { createMainWindow, getMainWindow } from './windows/MainWindow';
-import { resolveWindowsAppUserModelId } from './windows/windowIcon';
 import { applyWindowsChromiumSwitches } from './windows/win32Restore';
+import { resolveWindowsAppUserModelId } from './windows/windowIcon';
 
 // 仅开发环境开放 CDP 端口，便于调试；打包后不开，避免暴露远程调试。
 // 同机跑两以上实例（如验证节点互连）时可用 ENSO_CDP_PORT 错开。
@@ -99,6 +106,10 @@ if (!gotTheLock) {
     });
 
     registerIpcHandlers();
+    setTrayToggleHandler(() => {
+      if (isServerMode()) leaveServerMode();
+      else void enterServerMode();
+    });
     // 协议处理器要赶在窗口加载内容之前注册（local-image:// 资源依赖它）。
     registerLocalImageProtocolHandler();
     const persisted = readSettings()?.['enso-settings'] as
@@ -108,6 +119,7 @@ if (!gotTheLock) {
     const persistedState = (
       persisted?.state && typeof persisted.state === 'object' ? persisted.state : {}
     ) as Record<string, unknown>;
+    syncTrayToggleShortcut(persistedState.keybindings);
     syncMemoryEmbeddingFromSettings(persistedState);
     syncMemoryDistillFromSettings(persistedState);
     syncMemoryKgFromSettings(persistedState);
@@ -145,6 +157,7 @@ if (!gotTheLock) {
 
   // Electron 退出即断开中继，手机侧收到 host-offline
   app.on('before-quit', () => {
+    stopTrayToggleShortcut();
     stopPairHost();
     stopPairGuest();
     // 内嵌浏览器 Cookie / storage 落盘后再关 guest 页

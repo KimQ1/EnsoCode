@@ -38,6 +38,7 @@ import { requestOpenChatModelPicker } from './ModelPicker';
 import type { ComposerPayload, MentionSegment } from './mentionComposer';
 import { createEditorPayload, mentionPopupLayout, resolvePopupKeyAction } from './mentionComposer';
 import { SlashChip, splitSlashCommand } from './SlashChip';
+import { filterComposerCommands } from './skillCompletion';
 
 interface ComposerProps {
   cwd?: string;
@@ -66,6 +67,9 @@ interface ComposerProps {
   onActivate?: () => void;
   onSend: (payload: ComposerPayload) => boolean | undefined;
   onAbort: () => void;
+  /** 排队消息数；运行中且输入为空时，发送快捷键改为 steer 队首一条 */
+  queuedCount?: number;
+  onSteerQueued?: () => void;
   /**
    * 侧栏旁路等第二输入框：不抢主 Composer 的 insert/focus 桥，也不吃侧栏拖放。
    * 主会话必须保持默认 false。
@@ -73,6 +77,8 @@ interface ComposerProps {
   isolated?: boolean;
   /** 覆盖默认「Type @ …」占位；slash / locked / agent 文案仍优先 */
   placeholder?: string;
+  /** Plan 模式：边框提示当前只读规划 */
+  planMode?: boolean;
 }
 
 interface ComposerDraft {
@@ -103,8 +109,11 @@ export function Composer({
   onActivate,
   onSend,
   onAbort,
+  queuedCount = 0,
+  onSteerQueued,
   isolated = false,
   placeholder: placeholderText,
+  planMode = false,
 }: ComposerProps) {
   const { t } = useI18n();
   const keybindings = useSettingsStore((s) => s.keybindings);
@@ -171,6 +180,7 @@ export function Composer({
     [mentionGroups, mentionQuery]
   );
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
+  const [skillQuery, setSkillQuery] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [openFolderId, setOpenFolderId] = useState<'agents' | 'chats' | null>(null);
   const [folderIndex, setFolderIndex] = useState(0);
@@ -202,6 +212,7 @@ export function Composer({
         return state.mentionQuery;
       });
       setSlashQuery(state.slashQuery);
+      setSkillQuery(state.skillQuery);
     },
     [onActivate]
   );
@@ -231,6 +242,7 @@ export function Composer({
       prevFocusKeyRef.current = focusKey;
       setMentionQuery(null);
       setSlashQuery(null);
+      setSkillQuery(null);
       setActiveIndex(0);
       setOpenFolderId(null);
       setFolderIndex(0);
@@ -256,19 +268,16 @@ export function Composer({
   }, [injectedDraft, injectedImages]);
 
   const subQuery = slashSubcommandQuery(slash, editorPlain.replaceAll('\uFFFC', ''));
-  const slashResults =
-    slashQuery === null
-      ? []
-      : commands
-          .filter((command) => command.name.toLowerCase().includes(slashQuery.toLowerCase()))
-          .slice(0, 10);
+  const slashResults = filterComposerCommands(commands, slashQuery, skillQuery);
   const subResults =
-    slashQuery === null && subQuery !== null ? filterSlashSubcommands(slash, subQuery) : [];
+    slashQuery === null && skillQuery === null && subQuery !== null
+      ? filterSlashSubcommands(slash, subQuery)
+      : [];
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset highlight when the filter token changes
   useEffect(() => {
     setActiveIndex(0);
-  }, [slashQuery, subQuery]);
+  }, [slashQuery, skillQuery, subQuery]);
 
   useEffect(() => {
     const item = slashListRef.current?.children[activeIndex] as HTMLElement | undefined;
@@ -290,7 +299,7 @@ export function Composer({
   const popupKind =
     mentionQuery !== null && mentionItems.length > 0
       ? 'mention'
-      : slashQuery !== null && slashResults.length > 0
+      : slashResults.length > 0
         ? 'slash'
         : subResults.length > 0
           ? 'slash-sub'
@@ -347,6 +356,7 @@ export function Composer({
       setRecipient(undefined);
       setMentionQuery(null);
       setSlashQuery(null);
+      setSkillQuery(null);
     },
     [images, onSend, recipient, slash]
   );
@@ -364,8 +374,9 @@ export function Composer({
       } else if (popupKind === 'slash') {
         const item = slashResults[activeIndex];
         if (!item) return;
-        editorRef.current?.consumeToken('/');
+        editorRef.current?.consumeToken(skillQuery !== null ? '$' : '/');
         setSlashQuery(null);
+        setSkillQuery(null);
         setSlash(item.name);
       } else if (popupKind === 'slash-sub') {
         const item = subResults[activeIndex];
@@ -382,6 +393,7 @@ export function Composer({
       pickMention,
       popupKind,
       slashResults,
+      skillQuery,
       subResults,
       applySlashSubcommand,
     ]
@@ -391,6 +403,10 @@ export function Composer({
   const hasContent = Boolean(content || slash || images.length > 0 || editorHasMentions);
   const agentRecipient = recipient !== undefined;
   const effectiveBusy = busy && !agentRecipient;
+  // 仅快捷键触发，无绑定时不提示
+  const steerAvailable =
+    running && queuedCount > 0 && onSteerQueued !== undefined && enterToSend && !!sendBinding;
+  const steerable = steerAvailable && !hasContent && !agentRecipient && !locked;
 
   const handleSend = () => {
     if (!hasContent) return;
@@ -407,6 +423,7 @@ export function Composer({
     setRecipient(undefined);
     setMentionQuery(null);
     setSlashQuery(null);
+    setSkillQuery(null);
   };
 
   const ingestFiles = useCallback((files: File[]) => {
@@ -474,6 +491,7 @@ export function Composer({
         event.preventDefault();
         setMentionQuery(null);
         setSlashQuery(null);
+        setSkillQuery(null);
         setOpenFolderId(null);
         return;
       }
@@ -505,7 +523,8 @@ export function Composer({
       const pressedSend = eventToBinding(event, { allowBare: true });
       if (pressedSend === sendBinding) {
         event.preventDefault();
-        handleSend();
+        if (steerable) onSteerQueued?.();
+        else handleSend();
       }
     }
   };
@@ -544,8 +563,9 @@ export function Composer({
               onClick={() => {
                 setActiveIndex(index);
                 if (popupKind === 'slash') {
-                  editorRef.current?.consumeToken('/');
+                  editorRef.current?.consumeToken(skillQuery !== null ? '$' : '/');
                   setSlashQuery(null);
+                  setSkillQuery(null);
                   setSlash(item.name);
                 } else {
                   applySlashSubcommand(item.name, false);
@@ -559,7 +579,9 @@ export function Composer({
               )}
             >
               <SlashSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span className="shrink-0 font-mono font-medium">{item.name}</span>
+              <span className="shrink-0 font-mono font-medium">
+                {skillQuery !== null ? `$${item.name.slice('/skill:'.length)}` : item.name}
+              </span>
               <span className="min-w-0 flex-1 truncate text-muted-foreground">
                 {t(item.description)}
               </span>
@@ -572,9 +594,9 @@ export function Composer({
         ref={setDropRef}
         data-slot="composer"
         className={cn(
-          'rounded-xl border bg-background shadow-sm transition-colors focus-within:border-ring',
-          (dragging || dndOver) && 'border-ring bg-muted/30',
-          agentRecipient && 'border-primary/35 shadow-primary/5'
+          'rounded-2xl border bg-background shadow-float transition-[border-color,box-shadow] duration-200 focus-within:border-brand/45 focus-within:ring-3 focus-within:ring-brand/12',
+          (dragging || dndOver) && 'border-brand/50 bg-brand/5',
+          (agentRecipient || planMode) && 'border-primary/35 shadow-primary/5'
         )}
         onDragOver={(event) => {
           if (event.dataTransfer.types.includes('Files')) {
@@ -626,7 +648,7 @@ export function Composer({
           </div>
         )}
         <div
-          className={cn('flex items-start gap-1.5 px-3.5', images.length > 0 ? 'pt-1.5' : 'pt-3')}
+          className={cn('flex items-start gap-1.5 px-4', images.length > 0 ? 'pt-1.5' : 'pt-3.5')}
         >
           {recipient && (
             <MentionChip recipient={recipient} onRemove={() => setRecipient(undefined)} />
@@ -656,11 +678,15 @@ export function Composer({
                   ? t('Resolve the pending approval to continue')
                   : agentRecipient
                     ? t('Message the selected Agent…')
-                    : placeholderText
-                      ? placeholderText
-                      : running
-                        ? t('Message will queue until this round finishes…')
-                        : t('Type @ to choose a file or Agent')
+                    : steerAvailable
+                      ? t('Press {{key}} to steer the next queued message into this round…', {
+                          key: formatBinding(sendBinding),
+                        })
+                      : placeholderText
+                        ? placeholderText
+                        : running
+                          ? t('Message will queue until this round finishes…')
+                          : t('Type @ to choose a file or Agent')
             }
             disabled={locked}
             onStateChange={handleEditorState}
@@ -704,7 +730,7 @@ export function Composer({
           />
         </div>
         {agentRecipient && <p className="sr-only">{t('Send only to the selected Agent')}</p>}
-        <div className="flex items-center justify-between gap-1.5 px-1.5 pb-1">
+        <div className="flex items-center justify-between gap-1.5 px-2 pt-0.5 pb-2">
           <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
             <input
               ref={imageInputRef}
@@ -734,7 +760,7 @@ export function Composer({
             <Button
               variant="outline"
               size="icon"
-              className="h-7 w-7 shrink-0 rounded-lg"
+              className="size-8 shrink-0 rounded-[10px]"
               onClick={onAbort}
               aria-label={t('Stop')}
             >
@@ -743,7 +769,7 @@ export function Composer({
           ) : (
             <Button
               size="icon"
-              className="h-7 w-7 shrink-0 rounded-lg"
+              className="size-8 shrink-0 rounded-[10px] border-brand bg-brand text-brand-foreground shadow-brand/24 hover:bg-brand/90 disabled:opacity-35"
               onClick={handleSend}
               disabled={!hasContent || locked}
               aria-label={agentRecipient ? t('Send only to the selected Agent') : t('Send')}
@@ -751,7 +777,9 @@ export function Composer({
                 agentRecipient
                   ? t('Send only to the selected Agent')
                   : enterToSend
-                    ? `${t('Send')} ${formatBinding(sendBinding)}`
+                    ? sendBinding
+                      ? `${t('Send')} ${formatBinding(sendBinding)}`
+                      : t('Send')
                     : t('Send')
               }
             >

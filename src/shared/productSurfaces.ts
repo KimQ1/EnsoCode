@@ -62,6 +62,7 @@ export const PRODUCT_SURFACE_INVENTORY = {
   'general.keybindings.reset': { domain: 'general', kind: 'setting', label: 'Reset keybinding' },
 
   'appearance.theme': { domain: 'appearance', kind: 'setting', label: 'Application theme' },
+  'appearance.accent': { domain: 'appearance', kind: 'setting', label: 'Accent color' },
   'appearance.terminal-theme': {
     domain: 'appearance',
     kind: 'setting',
@@ -469,6 +470,11 @@ export const PRODUCT_SURFACE_INVENTORY = {
   },
   'coding-tools.mcp': { domain: 'coding-tools', kind: 'action', label: 'Call MCP tool' },
   'coding-tools.subagent': { domain: 'coding-tools', kind: 'action', label: 'Run subagent' },
+  'coding-tools.workflow': {
+    domain: 'coding-tools',
+    kind: 'action',
+    label: 'Run workflow',
+  },
   'coding-tools.coworker': { domain: 'coding-tools', kind: 'action', label: 'Use coworker tool' },
   'coding-tools.todo': { domain: 'coding-tools', kind: 'action', label: 'Manage coding todo list' },
   'coding-tools.ask-user': { domain: 'coding-tools', kind: 'action', label: 'Ask coding question' },

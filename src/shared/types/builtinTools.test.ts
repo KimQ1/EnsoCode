@@ -3,9 +3,20 @@ import {
   BUILTIN_TOOLS,
   DEFAULT_DISABLED_BUILTIN_TOOLS,
   effectiveDisabledBuiltinTools,
+  effectiveSubagentAllowedModes,
+  isWorkflowAvailable,
   projectDisabledBuiltinTools,
   resolveDisabledBuiltinTools,
 } from './builtinTools';
+
+describe('isWorkflowAvailable', () => {
+  it('workflow 靠 subagent 派发子代理，两者任一关闭都不可用', () => {
+    expect(isWorkflowAvailable([])).toBe(true);
+    expect(isWorkflowAvailable(['memory'])).toBe(true);
+    expect(isWorkflowAvailable(['workflow'])).toBe(false);
+    expect(isWorkflowAvailable(['subagent'])).toBe(false);
+  });
+});
 
 describe('effectiveDisabledBuiltinTools', () => {
   it('缺字段时用默认关闭列表：memory 默认关，其余全开', () => {
@@ -27,6 +38,23 @@ describe('effectiveDisabledBuiltinTools', () => {
       'browser',
       'isolated_sandbox',
     ]);
+  });
+});
+
+describe('effectiveSubagentAllowedModes', () => {
+  it('新配置按 mode 掩码收窄并去重，脏值不扩权', () => {
+    expect(effectiveSubagentAllowedModes(['coworker', 'task', 'coworker'], [])).toEqual([
+      'task',
+      'coworker',
+    ]);
+    expect(effectiveSubagentAllowedModes(['invalid'], [])).toEqual([]);
+  });
+
+  it('未迁移配置按旧两个开关保守推导 mode', () => {
+    expect(effectiveSubagentAllowedModes(undefined, [])).toEqual(['task', 'coworker']);
+    expect(effectiveSubagentAllowedModes(undefined, ['coworker'])).toEqual(['task']);
+    expect(effectiveSubagentAllowedModes(undefined, ['subagent'])).toEqual(['coworker']);
+    expect(effectiveSubagentAllowedModes(undefined, ['subagent', 'coworker'])).toEqual([]);
   });
 });
 

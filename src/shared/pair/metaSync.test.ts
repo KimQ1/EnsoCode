@@ -8,6 +8,8 @@ import {
   mergeStableMeta,
   PAIR_META_CHANNELS,
   pairJsonFingerprint,
+  planProviderEmit,
+  providerChannelsToSend,
   providersSyncFingerprint,
   rememberStableMeta,
   shouldEmitProviders,
@@ -136,6 +138,36 @@ describe('shouldEmitProviders', () => {
   });
 });
 
+describe('planProviderEmit', () => {
+  it('相同指纹视为已经同步', () => {
+    expect(planProviderEmit('a', 0, 'a', 1000)).toEqual({ kind: 'unchanged' });
+  });
+
+  it('窗口内指纹变了要延后补发，不能当成已发出', () => {
+    expect(planProviderEmit('empty', 1000, 'full', 1400, 1500)).toEqual({
+      kind: 'defer',
+      delayMs: 1100,
+    });
+  });
+
+  it('窗口外指纹变了立即发', () => {
+    expect(planProviderEmit('empty', 1000, 'full', 3000, 1500)).toEqual({ kind: 'send' });
+  });
+
+  it('从未发过则立即发', () => {
+    expect(planProviderEmit(undefined, undefined, 'full', 1)).toEqual({ kind: 'send' });
+  });
+
+  it('延后的模型表不锁进 stable，避免空列表把后续真列表吞掉', () => {
+    const plan = planProviderEmit('empty', 0, 'full', 400, 1500);
+    const gated = providerChannelsToSend(['catalog', 'providers'], plan);
+    expect(gated).toEqual({ channels: ['catalog'], deferMs: 1100 });
+    expect(
+      rememberStableMeta(undefined, gated.channels, { catalog: 'c', providers: 'full' })
+    ).toBeUndefined();
+  });
+});
+
 describe('slimCatalogForPhone', () => {
   const fat = {
     id: 's1',
@@ -151,9 +183,10 @@ describe('slimCatalogForPhone', () => {
     thinkingLevel: 'high' as const,
     goal: { text: 'ship checkout', status: 'active' as const, autoTurns: 2 },
     slashCommands: [{ name: '/skill:foo', description: 'do foo' }],
+    stats: { inputTokens: 100, outputTokens: 20, contextUsed: 50 },
   };
 
-  it('未订阅时剥掉 cwd/排队/模型/目标，只留抽屉字段', () => {
+  it('未订阅时剥掉 cwd/排队/模型/目标/统计，只留抽屉字段', () => {
     expect(slimCatalogForPhone([fat], null)).toEqual([
       { id: 's1', title: 't', projectId: 'p', status: 'idle' },
     ]);

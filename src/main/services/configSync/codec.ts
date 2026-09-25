@@ -4,6 +4,7 @@ import {
   randomBytes,
   scrypt as scryptCallback,
 } from 'node:crypto';
+import { parseAccentColor } from '@shared/accentColor';
 import { isReservedAgentTypeName } from '@shared/builtinAgents';
 import { parseCompactStrategy } from '@shared/compactStrategy';
 import { parseSmartCompactMode } from '@shared/smartCompactMode';
@@ -77,7 +78,9 @@ const STATE_KEYS = [
   'subagentModelsEnabled',
   'disabledBuiltinAgentTypes',
   'disabledBuiltinTools',
+  'subagentAllowedModes',
   'theme',
+  'accentColor',
   'language',
   'terminalTheme',
   'terminalFontSize',
@@ -96,7 +99,10 @@ const STATE_KEYS = [
   'openChangesOnFileEdit',
   'compactReadOnlyTools',
   'expandLiveEdits',
+  'expandLiveReasoning',
   'autoCollapseTurns',
+  'collapseCompletedActivity',
+  'pinUnfinishedTodos',
   'chatWide',
   'notifyMainAgentOnly',
   'maxActiveCoworkers',
@@ -211,6 +217,7 @@ const KEYBINDING_ACTIONS = [
   'new-side-tab',
   'new-btw-tab',
   'close-side-tab',
+  'toggle-minimize-to-tray',
 ] as const;
 const PRICING_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
 
@@ -909,6 +916,8 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     !['light', 'dark', 'system', 'sync-terminal'].includes(String(state.theme))
   )
     throw new Error('Invalid state.theme');
+  if (state.accentColor !== undefined && parseAccentColor(state.accentColor) === null)
+    throw new Error('Invalid state.accentColor');
   if (state.language !== undefined && !['en', 'zh'].includes(String(state.language)))
     throw new Error('Invalid state.language');
   for (const key of [
@@ -945,7 +954,10 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
     'openChangesOnFileEdit',
     'compactReadOnlyTools',
     'expandLiveEdits',
+    'expandLiveReasoning',
     'autoCollapseTurns',
+    'collapseCompletedActivity',
+    'pinUnfinishedTodos',
     'chatWide',
     'notifyMainAgentOnly',
     'autoArchiveMergedWorktrees',
@@ -975,6 +987,12 @@ export function validateBundle(value: unknown): ConfigSyncBundle {
       state.disabledBuiltinTools,
       BUILTIN_TOOLS.map((tool) => tool.id),
       'state.disabledBuiltinTools'
+    );
+  if (state.subagentAllowedModes !== undefined)
+    uniqueStringArray(
+      state.subagentAllowedModes,
+      ['task', 'coworker'],
+      'state.subagentAllowedModes'
     );
   if (state.keybindings !== undefined)
     validateStringMap(state.keybindings, KEYBINDING_ACTIONS, 'state.keybindings');

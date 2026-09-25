@@ -11,6 +11,7 @@ let projectionListener: ((projection: SourceAuthorityProjection) => void) | null
 vi.stubGlobal('navigator', { language: 'en-US' });
 vi.stubGlobal('document', {
   documentElement: {
+    dataset: {},
     lang: 'en',
     classList: { toggle: vi.fn() },
     style: { setProperty: vi.fn(), removeProperty: vi.fn() },
@@ -122,12 +123,13 @@ describe('project authority projection write guard', () => {
     expect(alpha).toEqual(local);
   });
 
-  it('keeps project-level builtin tool override across a projection refresh', () => {
+  it('keeps project-level tool and subagent mode overrides across a projection refresh', () => {
     const local = {
       id: 'p0',
       name: 'alpha',
       path: '/tmp/alpha',
       disabledBuiltinTools: ['browser', 'memory'],
+      subagentAllowedModes: ['task' as const],
     };
     settingsModule.useSettingsStore.setState({ projects: [local] });
 

@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   btwHotSessionIds,
   chatSurfaceBusy,
-  chatTimelineBusy,
+  chatTimelineActivity,
   evictColdMessages,
+  evictStampedColdMessages,
   isBulkyAgentEvent,
   isMessageCacheHot,
   MESSAGE_CACHE_TTL_MS,
   needsHistoryHydration,
+  nextColdEvictDelay,
   pruneSessionClocks,
   viewedConversationId,
 } from './messageCache';
@@ -49,18 +51,48 @@ describe('messageCache', () => {
   it('evicts stale message bodies, leaves hot and empty conversations', () => {
     const conversations = {
       hot: { messages: [1], customEntries: [2] },
-      stale: { messages: [3], customEntries: [4], historyLoading: true },
-      empty: { messages: [], customEntries: [] },
+      stale: {
+        messages: [3],
+        customEntries: [4],
+        historyLoading: true,
+        historyLoadAttempted: true,
+      },
+      empty: { messages: [], customEntries: [], historyLoadAttempted: true },
     };
     const next = evictColdMessages(conversations, 'hot', { stale: 0 }, MESSAGE_CACHE_TTL_MS);
     expect(next.hot).toBe(conversations.hot);
+    expect(next.empty).toBe(conversations.empty);
     expect(next.stale).toEqual({
       messages: [],
       customEntries: [],
       historyBaseIndex: undefined,
       historyLoading: undefined,
+      historyLoadAttempted: undefined,
     });
-    expect(next.empty).toBe(conversations.empty);
+  });
+
+  it('requireStamp 不碰从未离开过、因而没有盖章的正文', () => {
+    const conversations = {
+      fresh: { messages: [1], customEntries: [] },
+      expired: { messages: [2], customEntries: [3] },
+    };
+    const next = evictStampedColdMessages(
+      conversations,
+      'hot',
+      { expired: 0 },
+      MESSAGE_CACHE_TTL_MS
+    );
+    expect(next.fresh).toBe(conversations.fresh);
+    expect(next.expired.messages).toEqual([]);
+  });
+
+  it('下次回收看最早离开的会话，不从最近一次切换重计满 TTL', () => {
+    const ttl = 5_000;
+    expect(nextColdEvictDelay({ old: 1_000, recent: 4_000 }, 'current', 4_500, ttl)).toBe(1_500);
+    expect(nextColdEvictDelay({ old: 1_000 }, 'current', 6_000, ttl)).toBe(0);
+    expect(nextColdEvictDelay({ current: 1_000 }, 'current', 9_000, ttl)).toBeNull();
+    expect(nextColdEvictDelay({}, null, 9_000, ttl)).toBeNull();
+    expect(nextColdEvictDelay({ btw: 1_000 }, 'current', 9_000, ttl, new Set(['btw']))).toBeNull();
   });
 
   it('drops clocks for deleted conversations', () => {
@@ -182,7 +214,7 @@ describe('needsWorkerSnapshot', () => {
         started: true,
         sessionFile: '/tmp/s.jsonl',
         status: 'failed',
-        messages: [{ role: 'assistant' }],
+        messages: [{ optimistic: false }],
       })
     ).toBe(false);
   });
@@ -249,45 +281,34 @@ describe('chatSurfaceBusy', () => {
     ).toBe(true);
   });
 
-  it('尾巴上屏后 spawn 仍要在时间线出 loading', () => {
+  it('时间线脚点：running 与乐观未确认的发送算生成中', () => {
+    expect(chatTimelineActivity({ messages: [{}], spawning: false, status: 'running' })).toBe(
+      'working'
+    );
     expect(
-      chatTimelineBusy({
-        messages: [{}],
-        spawning: true,
-        status: 'idle',
-      })
-    ).toBe(true);
+      chatTimelineActivity({ messages: [{ optimistic: true }], spawning: false, status: 'idle' })
+    ).toBe('working');
     expect(
-      chatTimelineBusy({
-        messages: [{ optimistic: true }],
-        spawning: false,
-        status: 'idle',
-      })
-    ).toBe(true);
-    expect(
-      chatTimelineBusy({
-        messages: [{}],
-        spawning: false,
-        status: 'idle',
-      })
-    ).toBe(false);
+      chatTimelineActivity({ messages: [{ optimistic: true }], spawning: true, status: 'idle' })
+    ).toBe('working');
   });
 
-  it('空窗等尾巴时时间线 busy，避免露出空聊天态', () => {
+  it('时间线脚点：冷会话恢复（spawn / 读历史）是加载中，不是生成中', () => {
+    expect(chatTimelineActivity({ messages: [{}], spawning: true, status: 'idle' })).toBe(
+      'loading'
+    );
     expect(
-      chatTimelineBusy({
+      chatTimelineActivity({
         started: false,
         sessionFile: '/tmp/s.jsonl',
         messages: [],
         spawning: false,
       })
-    ).toBe(true);
-    expect(
-      chatTimelineBusy({
-        started: false,
-        messages: [],
-        spawning: false,
-      })
-    ).toBe(false);
+    ).toBe('loading');
+  });
+
+  it('时间线脚点：空闲与空草稿无脚点', () => {
+    expect(chatTimelineActivity({ messages: [{}], spawning: false, status: 'idle' })).toBeNull();
+    expect(chatTimelineActivity({ started: false, messages: [], spawning: false })).toBeNull();
   });
 });

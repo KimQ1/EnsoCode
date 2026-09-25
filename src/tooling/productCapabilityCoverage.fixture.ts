@@ -12,7 +12,6 @@ const surfaces = (
 ): CoverageDisposition => ({ kind: 'surface', surfaceIds });
 
 const excluded = (reason: string): CoverageDisposition => ({ kind: 'excluded', reason });
-
 type SettingsActionKey = {
   [Key in keyof SettingsState]-?: SettingsState[Key] extends (...args: never[]) => unknown
     ? Key
@@ -24,6 +23,7 @@ type SettingsDataKey = Exclude<keyof SettingsState, SettingsActionKey>;
 /** SettingsState 新增持久字段时，此 Record 会在编译期要求说明对应产品面。 */
 export const SETTINGS_DATA_COVERAGE = {
   theme: surfaces('appearance.theme'),
+  accentColor: surfaces('appearance.accent'),
   language: surfaces('general.language'),
   terminalTheme: surfaces('appearance.terminal-theme'),
   terminalFontSize: surfaces('appearance.terminal-font-size'),
@@ -67,12 +67,20 @@ export const SETTINGS_DATA_COVERAGE = {
   openChangesOnFileEdit: excluded('Renderer side-panel preference; not an Enso capability.'),
   compactReadOnlyTools: excluded('Renderer timeline density preference; not an Enso capability.'),
   expandLiveEdits: excluded('Renderer timeline expansion preference; not an Enso capability.'),
+  expandLiveReasoning: excluded(
+    'Renderer timeline reasoning expansion preference; not an Enso capability.'
+  ),
   autoCollapseTurns: excluded('Renderer timeline collapse preference; not an Enso capability.'),
+  collapseCompletedActivity: excluded(
+    'Renderer timeline collapse preference; not an Enso capability.'
+  ),
+  pinUnfinishedTodos: excluded('Renderer pinned todo bar preference; not an Enso capability.'),
   chatWide: excluded('Renderer chat column width preference; not an Enso capability.'),
   notifyMainAgentOnly: excluded(
     'Desktop/phone completion notification preference; not an Enso capability.'
   ),
   maxActiveCoworkers: excluded('Desktop coworker capacity preference; not an Enso capability.'),
+  sshTimeoutSeconds: excluded('Device SSH network preference; not an Enso capability.'),
   generationStallTimeoutMin: excluded('Renderer stall-abort preference; not an Enso capability.'),
   autoArchiveIdleDays: excluded('Renderer sidebar archive preference; not an Enso capability.'),
   autoArchiveMergedWorktrees: excluded(
@@ -101,6 +109,8 @@ export const SETTINGS_DATA_COVERAGE = {
   subagentModels: surfaces('providers.subagent-models'),
   disabledBuiltinAgentTypes: surfaces('agent-types.toggle-builtin'),
   disabledBuiltinTools: surfaces('tools.toggle-builtin'),
+  disabledWorkflowPresets: excluded('Built-in workflow preset toggles in the settings page.'),
+  subagentAllowedModes: surfaces('tools.toggle-builtin'),
   onboarded: surfaces('onboarding.complete'),
   keybindings: surfaces('general.keybindings.list'),
   projects: surfaces('projects.list'),
@@ -129,6 +139,7 @@ export const SETTINGS_DATA_COVERAGE = {
 /** SettingsState 新增 action 时，此 Record 会在编译期要求登记或明确排除。 */
 export const SETTINGS_ACTION_COVERAGE = {
   setTheme: surfaces('appearance.theme'),
+  setAccentColor: surfaces('appearance.accent'),
   setLanguage: surfaces('general.language'),
   setTerminalTheme: surfaces('appearance.terminal-theme'),
   setTerminalFontSize: surfaces('appearance.terminal-font-size'),
@@ -175,12 +186,20 @@ export const SETTINGS_ACTION_COVERAGE = {
     'Renderer timeline density preference; not an Enso capability.'
   ),
   setExpandLiveEdits: excluded('Renderer timeline expansion preference; not an Enso capability.'),
+  setExpandLiveReasoning: excluded(
+    'Renderer timeline reasoning expansion preference; not an Enso capability.'
+  ),
   setAutoCollapseTurns: excluded('Renderer timeline collapse preference; not an Enso capability.'),
+  setCollapseCompletedActivity: excluded(
+    'Renderer timeline collapse preference; not an Enso capability.'
+  ),
+  setPinUnfinishedTodos: excluded('Renderer pinned todo bar preference; not an Enso capability.'),
   setChatWide: excluded('Renderer chat column width preference; not an Enso capability.'),
   setNotifyMainAgentOnly: excluded(
     'Desktop/phone completion notification preference; not an Enso capability.'
   ),
   setMaxActiveCoworkers: excluded('Desktop coworker capacity preference; not an Enso capability.'),
+  setSshTimeoutSeconds: excluded('Device SSH network preference; not an Enso capability.'),
   setGenerationStallTimeoutMin: excluded(
     'Renderer stall-abort preference; not an Enso capability.'
   ),
@@ -243,6 +262,8 @@ export const SETTINGS_ACTION_COVERAGE = {
   removeAgentType: surfaces('agent-types.delete'),
   toggleBuiltinAgentType: surfaces('agent-types.toggle-builtin'),
   toggleBuiltinTool: surfaces('tools.toggle-builtin'),
+  toggleWorkflowPreset: excluded('Built-in workflow preset toggles in the settings page.'),
+  setSubagentAllowedModes: surfaces('tools.toggle-builtin'),
   setOnboarded: surfaces('onboarding.complete'),
   setKeybinding: surfaces('general.keybindings.set'),
   resetKeybinding: surfaces('general.keybindings.reset'),
@@ -255,6 +276,7 @@ export const SETTINGS_ACTION_COVERAGE = {
   setProjectAlias: surfaces('projects.list'),
   setProjectDefaultModel: surfaces('projects.list'),
   setProjectDisabledBuiltinTools: surfaces('projects.list'),
+  setProjectSubagentAllowedModes: surfaces('projects.list'),
   removeProject: surfaces('projects.remove'),
   setUsageModelPricing: excluded(
     'Local usage cost override for Settings → Usage; desktop-only estimate, not an Enso capability.'
@@ -281,7 +303,7 @@ export const SETTINGS_ACTION_COVERAGE = {
 
 export const BUILTIN_TOOL_COVERAGE: Readonly<Record<string, CoverageDisposition>> = {
   subagent: surfaces('coding-tools.subagent'),
-  coworker: surfaces('coding-tools.coworker', 'team.list-coworkers'),
+  workflow: surfaces('coding-tools.workflow'),
   todo: surfaces('coding-tools.todo'),
   ask_user: surfaces('coding-tools.ask-user'),
   background_tasks: surfaces('coding-tools.background-task'),
@@ -357,6 +379,9 @@ export const IPC_PRODUCT_COVERAGE = {
   ),
   ASSETS_COLLECT_IMPORT: excluded('Second phase of the reviewed asset import flow.'),
   ASSETS_LIST_PROJECT_SKILLS: surfaces('skills.list'),
+  ASSETS_LIST_WORKFLOW_PRESETS: excluded(
+    'Side panel workflow preset list; runs go through conversations.send.'
+  ),
   ASSETS_SKILL_OCCUPANCY: excluded('Settings occupancy estimate from local skill files.'),
   ASSETS_INSTRUCTION_OCCUPANCY: excluded('Settings occupancy estimate from instruction files.'),
   ASSETS_MCP_OCCUPANCY: excluded('Settings occupancy estimate from MCP listTools.'),
@@ -365,6 +390,10 @@ export const IPC_PRODUCT_COVERAGE = {
   INSTRUCTIONS_WRITE: surfaces('instructions.edit-local-copy'),
   INSTRUCTIONS_WRITE_SOURCE: surfaces('instructions.overwrite-source'),
   INSTRUCTIONS_DELETE: surfaces('instructions.remove'),
+  WORKFLOW_PRESETS_LIST: excluded('Settings workflow preset editor list.'),
+  WORKFLOW_PRESETS_READ: excluded('Settings workflow preset editor load.'),
+  WORKFLOW_PRESETS_SAVE: excluded('Settings workflow preset editor save.'),
+  WORKFLOW_PRESETS_DELETE: excluded('Settings workflow preset editor delete.'),
   PRESETS_SYSTEM_PROMPT_READ: excluded('Settings-only preset editor content read.'),
   PRESETS_SYSTEM_PROMPT_WRITE: excluded('Settings-only preset editor content write.'),
   AGENT_SPAWN: excluded('Lazy worker lifecycle command behind conversation send.'),
@@ -392,11 +421,18 @@ export const IPC_PRODUCT_COVERAGE = {
   AGENT_SET_REASONING: surfaces('conversations.set-reasoning'),
   AGENT_APPROVAL_RESPOND: surfaces('conversations.approval.respond'),
   AGENT_SET_APPROVAL_MODE: surfaces('conversations.set-approval-mode'),
+  AGENT_SET_PLAN_MODE: excluded(
+    'Desktop composer Plan toggle; only restricts tools further, never grants execution rights.'
+  ),
+  AGENT_PLAN_RESPOND: excluded(
+    'Desktop plan review bar decision (approve/revise/discard/finish) for the pending plan of this conversation.'
+  ),
   NOTIFICATION_FOCUS_SESSION: surfaces('window.focus-conversation-notification'),
   NOTIFICATION_ACTIVE_SESSION: excluded(
     'Renderer reports the currently viewed conversation id so Main can suppress redundant system notifications; no execution rights.'
   ),
   AGENT_TASK_STOP: surfaces('conversations.background-task.stop'),
+  AGENT_WORKFLOW_STOP: excluded('Side panel control to stop a running workflow run.'),
   AGENT_SUBAGENT_STOP: excluded(
     'Desktop TaskBar control to abort a stuck or running subagent; renderer-only, not an Enso capability.'
   ),
@@ -452,6 +488,7 @@ export const IPC_PRODUCT_COVERAGE = {
   DIALOG_SELECT_DIRECTORY: surfaces('projects.add'),
   PROJECTS_GET_RECENT: surfaces('projects.recent'),
   PROJECTS_REVEAL: surfaces('projects.list'),
+  PROJECTS_OPEN_IN_APPS: surfaces('projects.list'),
   FILES_SEARCH: surfaces('conversations.file-mention.attach'),
   FILES_READ: excluded('Internal bounded file reader used by reviewed UI flows.'),
   GIT_DIFF_HEAD: excluded('Internal git working-tree reader for the Changes panel.'),

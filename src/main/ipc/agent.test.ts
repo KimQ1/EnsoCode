@@ -2,6 +2,7 @@ import { IPC_CHANNELS } from '@shared/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+  dispatchHost: { resolveSubagentModel: undefined as unknown },
   handlers: new Map<string, (...args: unknown[]) => unknown>(),
   spawnSession: vi.fn(),
   summarizeConversationTitle: vi.fn(() => ({ ok: true })),
@@ -74,6 +75,7 @@ vi.mock('../services/agentHost', () => ({
   requestSnapshot: vi.fn(),
   resolveAgentTypeSpawnConfig: vi.fn(),
   resolveModelSelection: mocks.resolveModelSelection,
+  resolveSubagentModelSelection: vi.fn(),
   respondApproval: vi.fn(),
   respondAsk: vi.fn(),
   rewindSession: vi.fn(),
@@ -89,6 +91,20 @@ vi.mock('../services/agentHost', () => ({
   stopBackgroundTask: vi.fn(),
   summarizeConversationTitle: mocks.summarizeConversationTitle,
 }));
+vi.mock('../services/agentDispatchService', async () => {
+  const actual = await vi.importActual<typeof import('../services/agentDispatchService')>(
+    '../services/agentDispatchService'
+  );
+  return {
+    ...actual,
+    AgentDispatchService: class extends actual.AgentDispatchService {
+      constructor(options: ConstructorParameters<typeof actual.AgentDispatchService>[0]) {
+        mocks.dispatchHost.resolveSubagentModel = options.host.resolveSubagentModel;
+        super(options);
+      }
+    },
+  };
+});
 vi.mock('../services/notifications', () => ({ maybeNotify: vi.fn() }));
 vi.mock('../services/pairHost', () => ({
   forwardAgentEvent: vi.fn(),
@@ -138,6 +154,7 @@ vi.mock('./worktree', () => ({
   removeRegisteredWorktree: mocks.removeRegisteredWorktree,
 }));
 
+import { resolveSubagentModelSelection } from '../services/agentHost';
 import { getSourceAuthorityRegistry, registerAgentHandlers } from './agent';
 
 const sender = {
@@ -148,6 +165,7 @@ const event = { sender };
 
 describe('agent IPC Main identity boundary', () => {
   beforeEach(() => {
+    mocks.dispatchHost.resolveSubagentModel = undefined;
     mocks.handlers.clear();
     mocks.spawnSession.mockReset();
     mocks.restoreJournal.mockClear();
@@ -166,6 +184,10 @@ describe('agent IPC Main identity boundary', () => {
     mocks.sessionWorktree.mockReset();
     mocks.sessionWorktreeBusy.mockReset().mockReturnValue(false);
     registerAgentHandlers();
+  });
+
+  it('派发 host 接上子代理模型解析，模型覆盖才不会被当成档案禁止', () => {
+    expect(mocks.dispatchHost.resolveSubagentModel).toBe(resolveSubagentModelSelection);
   });
 
   it.each(['busy', 'ended', 'rebound'])(
@@ -474,6 +496,29 @@ describe('agent IPC Main identity boundary', () => {
       });
       bridge().prompt('conv-1::cw-1', 'hello');
       expect(mocks.promptSession).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.each([
+    [IPC_CHANNELS.AGENT_PROMPT, mocks.promptSession],
+    [IPC_CHANNELS.AGENT_STEER, mocks.steerSession],
+  ])('%s 透传乐观回显 deliveryId', (channel, send) => {
+    const parent = { sessionId: 'conv-1', generation: 'gen-1' };
+    const invoke = (...args: unknown[]) => mocks.handlers.get(channel)?.(event, ...args);
+
+    it('合法 deliveryId 原样下发，缺省时不带', async () => {
+      mocks.currentIdentity.mockReturnValue(parent);
+      send.mockReturnValue({ ok: true });
+      await invoke('conv-1', 'hi', undefined, 'd-1');
+      expect(send).toHaveBeenLastCalledWith(parent, 'hi', undefined, 'd-1');
+      await invoke('conv-1', 'hi');
+      expect(send).toHaveBeenLastCalledWith(parent, 'hi', undefined, undefined);
+    });
+
+    it.each(['', 7, 'x'.repeat(129)])('非法 deliveryId %# 拒绝且不下发', async (deliveryId) => {
+      mocks.currentIdentity.mockReturnValue(parent);
+      expect(await invoke('conv-1', 'hi', undefined, deliveryId)).toMatchObject({ ok: false });
+      expect(send).not.toHaveBeenCalled();
     });
   });
 

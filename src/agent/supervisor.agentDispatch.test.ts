@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
+import { childProfileShell, childProfileToolIds } from '@shared/childProfileTools';
 import { DEFAULT_PERSONA_PROMPT } from '@shared/systemPrompt';
 import type { AgentCommand, AgentWorkerEvent } from '@shared/types/agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -66,6 +67,7 @@ vi.mock('@earendil-works/pi-coding-agent', async (importOriginal) => {
     getModels() {
       return [...this.models.values()];
     },
+    getProvider: () => undefined,
     refresh: vi.fn(async () => ({ aborted: false, errors: new Map() })),
     completeSimple: vi.fn(async () => ({ content: [] })),
   };
@@ -125,6 +127,7 @@ function session(options: Record<string, unknown>) {
     navigateTree: vi.fn(async () => ({ cancelled: false })),
     isStreaming: false,
     isRetrying: false,
+    isCompacting: false,
   };
   mocks.sessions.push(value);
   return value;
@@ -481,7 +484,7 @@ describe('SessionSupervisor deterministic child lifecycle', () => {
     expect(snapshot).not.toHaveProperty('sessionId');
   });
 
-  it('snapshot 带回 subagents / backgroundTasks，切会话不会清空 TaskBar', async () => {
+  it('snapshot 带回 backgroundTasks，切会话不会清空 TaskBar', async () => {
     const events: AgentWorkerEvent[] = [];
     const supervisor = new SessionSupervisor({
       emit: (event) => events.push(event),
@@ -491,18 +494,15 @@ describe('SessionSupervisor deterministic child lifecycle', () => {
     supervisor.handleCommand({ type: 'spawn-parent', identity: parent, cwd: '/workspace', model });
     await waitFor(events, 'parent-ready');
     const internals = supervisor as unknown as {
-      sessions: Map<string, { subagents: Map<string, unknown> }>;
       bgTasks: { snapshot: (sessionId: string) => unknown[] };
     };
-    const agent = { id: 'a1', description: 'recon', status: 'running', startedAt: 1 };
-    internals.sessions.get(parent.sessionId)?.subagents.set(agent.id, agent);
     const task = { taskId: 't1', command: 'pnpm test', status: 'running', startedAt: 1, tail: '' };
     internals.bgTasks.snapshot = (sessionId) => (sessionId === parent.sessionId ? [task] : []);
 
     supervisor.handleCommand({ type: 'snapshot', sessionId: parent.sessionId });
     expect(events.at(-1)).toMatchObject({
       type: 'snapshot',
-      sessions: [expect.objectContaining({ subagents: [agent], backgroundTasks: [task] })],
+      sessions: [expect.objectContaining({ backgroundTasks: [task] })],
     });
   });
 
@@ -589,6 +589,92 @@ describe('SessionSupervisor deterministic child lifecycle', () => {
     expect(parentSession.prompt).toHaveBeenCalledWith(expect.stringContaining('explicit handoff'));
   });
 
+  it.each([
+    {
+      label: 'apply_patch + 探后折叠 + 关沙箱',
+      editMode: 'apply_patch' as const,
+      exploreFold: true,
+      isolatedSandbox: false,
+      tools: 'all' as const,
+    },
+    {
+      label: 'replace + 默认沙箱',
+      editMode: 'replace' as const,
+      exploreFold: false,
+      isolatedSandbox: true,
+      tools: 'all' as const,
+    },
+    {
+      label: 'readonly',
+      editMode: 'apply_patch' as const,
+      exploreFold: false,
+      isolatedSandbox: false,
+      tools: 'readonly' as const,
+    },
+  ])('$label 的 child proof 工具与共享推导一致', async (spec) => {
+    const events: AgentWorkerEvent[] = [];
+    const supervisor = new SessionSupervisor({
+      emit: (event) => events.push(event),
+      agentDir: '/tmp/agent',
+      sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-dispatch-profile-')),
+    });
+    supervisor.handleCommand({
+      type: 'spawn-parent',
+      identity: parent,
+      cwd: '/workspace',
+      model,
+      editMode: spec.editMode,
+      ...(spec.exploreFold ? { exploreFoldEnabled: true } : {}),
+      ...(spec.isolatedSandbox ? {} : { disabledTools: ['isolated_sandbox'] }),
+    });
+    await waitFor(events, 'parent-ready');
+    const typeKey =
+      spec.tools === 'readonly' ? ('builtin:scout' as const) : ('builtin:worker' as const);
+    supervisor.handleCommand({
+      type: 'spawn-child',
+      identity: {
+        sessionId: 'parent::cw-profile',
+        generation: '44444444-4444-4444-8444-444444444444',
+        parent,
+        instanceId: '55555555-5555-4555-8555-555555555555',
+        instanceName: 'profile',
+        typeKey,
+      },
+      cwd: '/workspace',
+      config: {
+        typeKey,
+        displayName: 'Profile',
+        description: 'profile proof',
+        spawnSpecId: 'spawn-profile',
+        systemPrompt: 'role',
+        model,
+        tools: spec.tools,
+        skillPaths: [],
+        skillBindingIds: [],
+        mcpServers: [],
+        mcpBindingIds: [],
+        systemPromptHash: 'profile-hash',
+      },
+    });
+    await waitFor(events, 'child-ready');
+    const ready = events.find(
+      (event) => event.type === 'child-ready' && event.identity.typeKey === typeKey
+    );
+    expect(ready?.type).toBe('child-ready');
+    if (ready?.type !== 'child-ready') return;
+    expect([...ready.proof.toolIds].sort()).toEqual(
+      [
+        ...childProfileToolIds(spec.tools, {
+          editMode: spec.editMode,
+          shell: childProfileShell({ platform: process.platform }),
+          exploreFold: spec.exploreFold,
+          isolatedSandbox: spec.isolatedSandbox,
+        }),
+      ].sort()
+    );
+    await supervisor.shutdown();
+  });
+
   it('idle 投影但 pi 仍在 streaming（agent_end 尚未回流）：等空闲后按新轮 prompt，不 steer', async () => {
     const supervisor = new SessionSupervisor({
       emit: vi.fn(),
@@ -609,8 +695,9 @@ describe('SessionSupervisor deterministic child lifecycle', () => {
       return undefined;
     });
     supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'follow up' });
-    await settle();
-    expect(parentSession.prompt).toHaveBeenCalledWith('follow up', undefined);
+    await vi.waitFor(() =>
+      expect(parentSession.prompt).toHaveBeenCalledWith('follow up', undefined)
+    );
     expect(parentSession.steer).not.toHaveBeenCalled();
   });
 
@@ -647,6 +734,175 @@ describe('SessionSupervisor deterministic child lifecycle', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  async function spawnParent() {
+    const events: AgentWorkerEvent[] = [];
+    const supervisor = new SessionSupervisor({
+      emit: (event) => events.push(event),
+      agentDir: '/tmp/agent',
+      sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-dispatch-')),
+    });
+    supervisor.handleCommand({ type: 'spawn-parent', identity: parent, cwd: '/workspace', model });
+    await waitFor(events, 'parent-ready');
+    return { events, supervisor, piSession: mocks.sessions[0] as ReturnType<typeof session> };
+  }
+
+  /** 受控压缩：waitForIdle 挂到 finish() 才空闲，模拟 pi 的 isIdle 口径 */
+  function holdCompaction(piSession: ReturnType<typeof session>, streaming = false) {
+    const idle = Promise.withResolvers<undefined>();
+    piSession.isCompacting = true;
+    piSession.isStreaming = streaming;
+    piSession.waitForIdle = vi.fn(() =>
+      piSession.isCompacting || piSession.isStreaming ? idle.promise : Promise.resolve(undefined)
+    );
+    return () => {
+      piSession.isCompacting = false;
+      piSession.isStreaming = false;
+      idle.resolve(undefined);
+    };
+  }
+
+  it('轮次收束后压缩进行中收到 prompt：等压完再按新轮 prompt，不报错', async () => {
+    const { events, supervisor, piSession } = await spawnParent();
+    const finish = holdCompaction(piSession);
+    supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'queued' });
+    await settle();
+    expect(piSession.prompt).not.toHaveBeenCalled();
+
+    finish();
+    await vi.waitFor(() => expect(piSession.prompt).toHaveBeenCalledWith('queued', undefined));
+    expect(events.some((event) => event.type === 'turn-failed')).toBe(false);
+  });
+
+  it('pi 自动压缩超过僵尸时限：继续等压完，不按僵尸轮失败', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { events, supervisor, piSession } = await spawnParent();
+      const finish = holdCompaction(piSession, true);
+      supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'queued' });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(events.some((event) => event.type === 'turn-failed')).toBe(false);
+      expect(piSession.prompt).not.toHaveBeenCalled();
+
+      finish();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(piSession.prompt).toHaveBeenCalledWith('queued', undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('空闲后下一个宏任务才启动的记忆压缩：新轮让一拍复查，等压完再发', async () => {
+    const { supervisor, piSession } = await spawnParent();
+    const idle = Promise.withResolvers<undefined>();
+    piSession.isStreaming = true;
+    piSession.waitForIdle = vi.fn(async () => {
+      if (piSession.isCompacting) return idle.promise;
+      // agent_settled：扩展用 setTimeout(0) 延后触发压缩，空闲等待者先被唤醒
+      piSession.isStreaming = false;
+      setTimeout(() => {
+        piSession.isCompacting = true;
+      }, 0);
+      return undefined;
+    });
+    supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'after abort' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(piSession.prompt).not.toHaveBeenCalled();
+
+    piSession.isCompacting = false;
+    idle.resolve(undefined);
+    await vi.waitFor(() => expect(piSession.prompt).toHaveBeenCalledWith('after abort', undefined));
+  });
+
+  it('重试倒计时中 abort：pi 不再发 agent_end，按失败收口并放弃排队压缩', async () => {
+    const { events, supervisor, piSession } = await spawnParent();
+    piSession.emit({ type: 'agent_start' });
+    supervisor.handleCommand({ type: 'compact', identity: parent });
+    await settle();
+    piSession.isRetrying = true;
+    events.length = 0;
+
+    supervisor.handleCommand({ type: 'abort', identity: parent });
+    await settle();
+
+    expect(piSession.abort).toHaveBeenCalled();
+    expect(events.some((event) => event.type === 'turn-failed')).toBe(true);
+    expect(
+      events.some(
+        (event) => event.type === 'compaction' && event.state === 'end' && event.abandoned
+      )
+    ).toBe(true);
+  });
+
+  describe('乐观回显投递回执 delivery-settled', () => {
+    async function spawned() {
+      const events: AgentWorkerEvent[] = [];
+      const supervisor = new SessionSupervisor({
+        emit: (event) => events.push(event),
+        agentDir: '/tmp/agent',
+        sessionDir: mkdtempSync(path.join(tmpdir(), 'enso-dispatch-')),
+      });
+      supervisor.handleCommand({
+        type: 'spawn-parent',
+        identity: parent,
+        cwd: '/workspace',
+        model,
+      });
+      await waitFor(events, 'parent-ready');
+      const piSession = mocks.sessions[0] as ReturnType<typeof session>;
+      // 真实 pi 的 prompt 整轮跑完才 resolve，user 消息在此之前上屏
+      piSession.prompt.mockImplementation(() => new Promise<undefined>(() => {}));
+      const userMessage = (text: string) =>
+        piSession.emit({
+          type: 'message_start',
+          message: { role: 'user', content: [{ type: 'text', text }], timestamp: 1 },
+        });
+      const settled = () =>
+        events.flatMap((event) => (event.type === 'delivery-settled' ? [event.deliveryId] : []));
+      return { events, supervisor, piSession, userMessage, settled };
+    }
+
+    it('prompt 的 user 消息上屏后回执 deliveryId，且排在该 upsert 之后', async () => {
+      const { events, supervisor, userMessage } = await spawned();
+      supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'hi', deliveryId: 'd1' });
+      await settle();
+      userMessage('pi 改写后的 hi');
+      const upsert = events.findIndex(
+        (event) => event.type === 'message-upsert' && event.message.role === 'user'
+      );
+      const receipt = events.findIndex((event) => event.type === 'delivery-settled');
+      expect(upsert).toBeGreaterThan(-1);
+      expect(receipt).toBeGreaterThan(upsert);
+      expect(events[receipt]).toMatchObject({ identity: parent, deliveryId: 'd1' });
+      await supervisor.shutdown();
+    });
+
+    it('新 prompt 的 user 消息先于滞留的 steer；无 id 的投递占位不串号', async () => {
+      const { supervisor, userMessage, settled } = await spawned();
+      supervisor.handleCommand({ type: 'steer', identity: parent, text: 'late', deliveryId: 's1' });
+      supervisor.handleCommand({ type: 'steer', identity: parent, text: 'phone' });
+      await settle();
+      supervisor.handleCommand({ type: 'prompt', identity: parent, text: 'new', deliveryId: 'p1' });
+      await settle();
+      userMessage('new');
+      userMessage('late');
+      userMessage('phone');
+      expect(settled()).toEqual(['p1', 's1']);
+      await supervisor.shutdown();
+    });
+
+    it('pi 拒收的 steer 不占队列位', async () => {
+      const { supervisor, piSession, userMessage, settled } = await spawned();
+      piSession.steer.mockRejectedValueOnce(new Error('boom'));
+      supervisor.handleCommand({ type: 'steer', identity: parent, text: 'bad', deliveryId: 's1' });
+      await settle();
+      supervisor.handleCommand({ type: 'steer', identity: parent, text: 'ok', deliveryId: 's2' });
+      await settle();
+      userMessage('ok');
+      expect(settled()).toEqual(['s2']);
+      await supervisor.shutdown();
+    });
   });
 
   it('worker 中不存在的会话收到 prompt：发 parent-rejected 而非静默丢弃', async () => {

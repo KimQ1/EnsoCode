@@ -181,6 +181,7 @@ export function RemoteNodeChat(props: RemoteNodeChatProps) {
             items={timeline}
             // view 为 null = 快照尚未到达，显示加载态而非空态
             busy={running || view === null}
+            loading={!running && view === null}
             running={running}
             error={undefined}
             emptyTitle={entry?.projectName || node.label}
@@ -272,7 +273,7 @@ function TabPill({
         className={cn(
           'h-1.5 w-1.5 shrink-0 rounded-full',
           status === 'running'
-            ? 'animate-pulse bg-blue-500'
+            ? 'animate-pulse bg-brand'
             : status === 'failed'
               ? 'bg-destructive'
               : 'bg-muted-foreground/30'

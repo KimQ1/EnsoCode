@@ -41,6 +41,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -67,8 +68,8 @@ import {
   routeDrop,
   UNGROUPED_GROUP_DROP_ID,
 } from '@/components/chat/dragDrop';
+import { GroupChips, POPOVER_ROW_CLASS } from '@/components/chat/GroupChips';
 import { GroupEditorDialog } from '@/components/chat/GroupEditorDialog';
-import { GroupSelector } from '@/components/chat/GroupSelector';
 import { ImportSessionDialog } from '@/components/chat/ImportSessionDialog';
 import { openDirectoryFromMenu, openDirectoryLabel } from '@/components/chat/openDirectoryAction';
 import { ProjectSettingsDialog } from '@/components/chat/ProjectSettingsDialog';
@@ -84,7 +85,14 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
-import { Input } from '@/components/ui/input';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogPanel,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import {
   Menu,
   MenuItem,
@@ -95,6 +103,7 @@ import {
   MenuSubTrigger,
   MenuTrigger,
 } from '@/components/ui/menu';
+import { Popover, PopoverPopup, PopoverTrigger } from '@/components/ui/popover';
 import { addToast } from '@/components/ui/toast';
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
 import { useI18n } from '@/i18n';
@@ -102,12 +111,12 @@ import { effectiveKeybindings, formatBinding, IS_MAC } from '@/lib/keybindings';
 import { heightVariants, springStandard } from '@/lib/motion';
 import { formatRelativeTime } from '@/lib/time';
 import { cn } from '@/lib/utils';
+import { Z_INDEX } from '@/lib/z-index';
 import { useRemoteNodesStore } from '@/stores/remoteNodes';
 import { useSessionsStore } from '@/stores/sessions';
 import {
   activeConversationIds,
   archivedConversationGroups,
-  archivedConversationIds,
   pinnedConversationIds,
   projectConversationIds,
   staleArchivedConversationIds,
@@ -144,7 +153,7 @@ import { WorktreeRenameDialog } from './WorktreeRenameDialog';
 const ARCHIVE_PURGE_DAYS = [7, 15, 30] as const;
 
 const ICON_BUTTON_CLASS =
-  'flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground';
+  'flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground';
 
 interface SidebarProps {
   width?: number;
@@ -163,7 +172,8 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
   const reorderProjectGroups = useSettingsStore((state) => state.reorderProjectGroups);
   const setProjectGroupId = useSettingsStore((state) => state.setProjectGroupId);
   const keybindings = useSettingsStore((state) => state.keybindings);
-  const searchShortcut = formatBinding(effectiveKeybindings(keybindings)['search-workspace']);
+  const searchBinding = effectiveKeybindings(keybindings)['search-workspace'];
+  const searchShortcut = searchBinding ? formatBinding(searchBinding) : '';
   const addProject = useSettingsStore((state) => state.addProject);
   const removeProject = useSettingsStore((state) => state.removeProject);
   const conversations = useSessionsStore((state) =>
@@ -375,6 +385,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
   >(null);
   const [projectSettingsId, setProjectSettingsId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [pendingProject, setPendingProject] = useState<{
     name: string;
     path: string;
@@ -461,7 +472,6 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
 
   const activeIds = activeConversationIds(order, conversations, archivedProjectIds);
   const pinnedIds = pinnedConversationIds(order, conversations, pinnedOrderIds, archivedProjectIds);
-  const archivedIds = archivedConversationIds(order, conversations, archivedProjectIds);
   const archivedGroups = archivedConversationGroups(
     order,
     conversations,
@@ -515,17 +525,29 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
     if (owner !== surface) return undefined;
     return formatBinding(`mod+${index + 1}`);
   };
+  // 已归档弹窗(缺省关闭,重启回到关闭);搜索框独立于侧栏搜索
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveQuery, setArchiveQuery] = useState('');
+  const [archiveCleanupOpen, setArchiveCleanupOpen] = useState<string | null>(null);
   // 搜索时:归档项目名命中则整组保留(与活动项目一致),否则只留命中的会话
-  const visibleArchivedGroups = searching
+  const visibleArchivedGroups = archiveQuery.trim()
     ? archivedGroups
         .map((group) => {
           const project = projects.find((item) => item.id === group.projectId);
           const projectHit =
             group.projectArchived === true &&
             Boolean(
-              project && matchesQuery(listQuery, [project.alias ?? '', project.name, project.path])
+              project &&
+                matchesQuery(archiveQuery, [project.alias ?? '', project.name, project.path])
             );
-          return projectHit ? group : { ...group, ids: group.ids.filter(convMatches) };
+          return projectHit
+            ? group
+            : {
+                ...group,
+                ids: group.ids.filter((id) =>
+                  matchesQuery(archiveQuery, [conversations[id]?.title || t('New conversation')])
+                ),
+              };
         })
         .filter((group) => group.ids.length > 0)
     : archivedGroups;
@@ -539,9 +561,13 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
     return project.groupId === resolvedGroupId;
   };
   const slicedArchivedGroups = visibleArchivedGroups.filter(archivedInSlice);
-  // 底部「已归档」栏目的折叠态(缺省收起,重启回到收起)
-  const [archivedOpen, setArchivedOpen] = useState(false);
-  const [archiveCleanupOpen, setArchiveCleanupOpen] = useState<string | null>(null);
+  const archivedCount = archivedGroups
+    .filter(archivedInSlice)
+    .reduce((count, group) => count + group.ids.length, 0);
+  const openArchive = () => {
+    setArchiveQuery('');
+    setArchiveOpen(true);
+  };
 
   // 相对时间每分钟自刷（“3 分钟前”不随时间僵住）
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -691,7 +717,9 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
             type="button"
             onClick={onOpenSearch}
             className={ICON_BUTTON_CLASS}
-            title={`${t('Search anything')} (${searchShortcut})`}
+            title={
+              searchShortcut ? `${t('Search anything')} (${searchShortcut})` : t('Search anything')
+            }
           >
             <Search className="h-4 w-4" />
           </button>
@@ -704,14 +732,16 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
             <FolderPlus className="h-4 w-4" />
           </button>
           <div className="flex-1" />
-          <button
-            type="button"
-            onClick={onToggleCollapse}
-            className={ICON_BUTTON_CLASS}
-            title={t('Expand sidebar')}
-          >
-            <PanelLeft className="h-4 w-4" />
-          </button>
+          {archivedCount > 0 && (
+            <button
+              type="button"
+              onClick={openArchive}
+              className={ICON_BUTTON_CLASS}
+              title={`${t('Archived')} (${archivedCount})`}
+            >
+              <Archive className="h-4 w-4" />
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
@@ -730,10 +760,18 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
           >
             <Settings className="h-4 w-4" />
           </button>
+          <button
+            type="button"
+            onClick={onToggleCollapse}
+            className={ICON_BUTTON_CLASS}
+            title={t('Expand sidebar')}
+          >
+            <PanelLeft className="h-4 w-4" />
+          </button>
         </div>
       )}
       <div className={cn('flex h-full min-h-0 flex-col', collapsed && 'hidden')} style={{ width }}>
-        <div className="flex h-12 shrink-0 items-center justify-between border-b pr-3 pl-1.5">
+        <div className="flex h-12 shrink-0 items-center justify-between pr-3 pl-1.5">
           {/* 节点切换器：本机 / 已连的远程 EnsoCode 桌面 */}
           <NodeSwitcher />
           <div className="flex items-center">
@@ -741,78 +779,93 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
               type="button"
               onClick={onOpenSearch}
               className={ICON_BUTTON_CLASS}
-              title={`${t('Search anything')} (${searchShortcut})`}
+              title={
+                searchShortcut
+                  ? `${t('Search anything')} (${searchShortcut})`
+                  : t('Search anything')
+              }
             >
               <Search className="h-4 w-4" />
             </button>
-            <button
-              type="button"
-              onClick={() => setAddOpen(true)}
-              className={ICON_BUTTON_CLASS}
-              title={t('Add project')}
-            >
-              <FolderPlus className="h-4 w-4" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setGroupEditor({ mode: 'create' })}
-              className={ICON_BUTTON_CLASS}
-              title={t('New group')}
-            >
-              <Layers className="h-4 w-4" />
-            </button>
+            <Popover open={addMenuOpen} onOpenChange={setAddMenuOpen}>
+              <PopoverTrigger
+                className={cn(
+                  ICON_BUTTON_CLASS,
+                  'data-popup-open:bg-muted data-popup-open:text-foreground'
+                )}
+                title={t('Add project or group')}
+                aria-label={t('Add project or group')}
+              >
+                <Plus className="h-4 w-4" />
+              </PopoverTrigger>
+              <PopoverPopup
+                side="bottom"
+                align="end"
+                className="w-44 [&_[data-slot=popover-viewport]]:p-1"
+              >
+                {[
+                  { icon: FolderPlus, label: t('Add project'), run: () => setAddOpen(true) },
+                  {
+                    icon: Layers,
+                    label: t('New group'),
+                    run: () => setGroupEditor({ mode: 'create' }),
+                  },
+                ].map(({ icon: Icon, label, run }) => (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => {
+                      setAddMenuOpen(false);
+                      run();
+                    }}
+                    className={cn(
+                      POPOVER_ROW_CLASS,
+                      'text-muted-foreground hover:bg-muted hover:text-foreground'
+                    )}
+                  >
+                    <Icon className="size-3.5 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate">{label}</span>
+                  </button>
+                ))}
+              </PopoverPopup>
+            </Popover>
           </div>
         </div>
-        {projectGroups.length > 0 && (
-          <GroupSelector
-            groups={projectGroups}
-            selectedId={resolvedGroupId}
-            counts={Object.fromEntries(
-              projectGroups.map((group) => [
-                group.id,
-                filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, group.id)
-                  .length,
-              ])
-            )}
-            totalCount={
-              filterProjectsByGroup(
-                orderedProjects,
-                projectGroups,
-                archivedProjectIds,
-                ALL_GROUP_ID
-              ).length
-            }
-            ungroupedCount={
-              filterProjectsByGroup(
-                orderedProjects,
-                projectGroups,
-                archivedProjectIds,
-                UNGROUPED_GROUP_ID
-              ).length
-            }
-            onSelect={selectGroup}
-            onAddGroup={() => setGroupEditor({ mode: 'create' })}
-            onEditGroup={(id) => setGroupEditor({ mode: 'edit', id })}
-          />
-        )}
-        <div className="shrink-0 border-b px-2 py-2">
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 z-10 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={listQuery}
-              onChange={(e) => setListQuery(e.target.value)}
-              placeholder={t('Search conversations...')}
-              className="h-8 text-xs [&_input]:pl-8"
-            />
-          </div>
-        </div>
+        <GroupChips
+          groups={projectGroups}
+          selectedId={resolvedGroupId}
+          counts={Object.fromEntries(
+            projectGroups.map((group) => [
+              group.id,
+              filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, group.id)
+                .length,
+            ])
+          )}
+          totalCount={
+            filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, ALL_GROUP_ID)
+              .length
+          }
+          ungroupedCount={
+            filterProjectsByGroup(
+              orderedProjects,
+              projectGroups,
+              archivedProjectIds,
+              UNGROUPED_GROUP_ID
+            ).length
+          }
+          query={listQuery}
+          onQueryChange={setListQuery}
+          onSelect={selectGroup}
+          onAddGroup={() => setGroupEditor({ mode: 'create' })}
+          onEditGroup={(id) => setGroupEditor({ mode: 'edit', id })}
+        />
 
         <div className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
           {projects.length === 0 && (
             <button
               type="button"
               onClick={() => setAddOpen(true)}
-              className="w-full rounded-lg border border-dashed px-3 py-6 text-center text-sm text-muted-foreground transition-colors hover:border-ring hover:text-foreground"
+              className="w-full rounded-lg border border-dashed px-3 py-6 text-center text-sm text-muted-foreground transition-colors hover:border-brand/50 hover:text-foreground"
             >
               {t('Add a project to start')}
             </button>
@@ -1055,9 +1108,9 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                           render={
                             (
                               <div ref={drag.setNodeRef} style={drag.style}>
-                                {/* 项目行：图标列（折叠态文件夹/hover 折叠箭头）+ 名称 + 常驻操作；整行可拖拽排序 */}
+                                {/* 项目行：图标列（折叠态文件夹/hover 折叠箭头）+ 名称 + 悬停操作；整行可拖拽排序 */}
                                 <div
-                                  className="group flex w-full items-center gap-1 rounded-lg px-2 py-2 transition-colors hover:bg-accent/30"
+                                  className="group flex w-full items-center gap-1 rounded-lg px-2 py-2 transition-colors hover:bg-muted/60"
                                   {...drag.handleProps}
                                 >
                                   <button
@@ -1083,18 +1136,10 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                       )}
                                     </span>
                                   </button>
-                                  {projectPinned && (
-                                    <span
-                                      className="flex shrink-0 items-center justify-center rounded p-1 group-hover:hidden"
-                                      aria-hidden
-                                    >
-                                      <Pin className="h-3.5 w-3.5 text-muted-foreground/70" />
-                                    </span>
-                                  )}
                                   <button
                                     type="button"
                                     onClick={() => togglePinProject(project.id)}
-                                    className="hidden shrink-0 rounded p-1 text-muted-foreground group-hover:block hover:bg-muted hover:text-foreground"
+                                    className="hidden shrink-0 rounded-md p-1 text-muted-foreground group-hover:block hover:bg-muted hover:text-foreground"
                                     title={projectPinned ? t('Unpin project') : t('Pin project')}
                                   >
                                     {projectPinned ? (
@@ -1103,16 +1148,25 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                       <Pin className="h-3.5 w-3.5" />
                                     )}
                                   </button>
-                                  {/* 高频新建会话常驻;其余走三点菜单,右键仍可用 */}
+                                  {/* 操作悬停才显示，常驻会让每个项目都挂两枚图标;用 opacity 占位,名称截断不随悬停跳动 */}
                                   <button
                                     type="button"
                                     onClick={() => void newConversation(project.id)}
-                                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                    className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100"
                                     title={t('New conversation')}
                                   >
                                     <MessageSquarePlus className="h-3.5 w-3.5" />
                                   </button>
                                   <ProjectOverflowMenu actions={projectActions} />
+                                  {/* 置顶标记放最右：左侧透明操作位仍占宽，放在它们前面会悬在行中间 */}
+                                  {projectPinned && (
+                                    <span
+                                      className="flex shrink-0 items-center justify-center rounded p-1 group-hover:hidden"
+                                      aria-hidden
+                                    >
+                                      <Pin className="h-3.5 w-3.5 text-muted-foreground/70" />
+                                    </span>
+                                  )}
                                 </div>
                                 <AnimatePresence initial={false}>
                                   {!folded && (
@@ -1121,10 +1175,9 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                       animate="animate"
                                       exit="exit"
                                       variants={heightVariants}
-                                      transition={springStandard}
                                       className="overflow-hidden"
                                     >
-                                      <div className="mt-0.5 flex flex-col gap-y-0.5">
+                                      <div className="enso-conv-tree mt-0.5 flex flex-col gap-y-0.5">
                                         {visibleConversations.slice(0, shownCount).map((id) => (
                                           <motion.div
                                             key={id}
@@ -1184,7 +1237,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                                               ),
                                                             }))
                                                           }
-                                                          className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                                                          className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
                                                         >
                                                           {t('Show {{n}} more', {
                                                             n: hiddenIds.length,
@@ -1220,7 +1273,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                                       ),
                                                     }))
                                                   }
-                                                  className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                                                  className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
                                                 >
                                                   {t('Collapse')}
                                                 </button>
@@ -1250,7 +1303,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
               };
               if (resolvedGroupId === ALL_GROUP_ID && projectGroups.length > 0) {
                 return (
-                  <div className="space-y-2">
+                  <div className="space-y-4">
                     {pinnedProjects.length > 0 && (
                       <div>
                         <SidebarSectionLabel>{t('Pinned projects')}</SidebarSectionLabel>
@@ -1286,7 +1339,6 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
                                 animate="animate"
                                 exit="exit"
                                 variants={heightVariants}
-                                transition={springStandard}
                                 className="overflow-hidden"
                               >
                                 <div className="space-y-1 pt-0.5">
@@ -1317,149 +1369,6 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
           </SortableContext>
         </div>
 
-        {slicedArchivedGroups.length > 0 && (
-          <div data-slot="archived-section" className="shrink-0 border-t p-2">
-            {/* 列表在折叠头上方：固定底部向上展开 */}
-            <AnimatePresence initial={false}>
-              {(searching || archivedOpen) && (
-                <motion.div
-                  initial="initial"
-                  animate="animate"
-                  exit="exit"
-                  variants={heightVariants}
-                  transition={springStandard}
-                  className="overflow-hidden"
-                >
-                  <div className="mb-0.5 flex max-h-72 flex-col gap-y-1.5 overflow-y-auto">
-                    {slicedArchivedGroups.map((group) => {
-                      const archivedProject = projects.find(
-                        (project) => project.id === group.projectId
-                      );
-                      const projectName = archivedProject
-                        ? projectDisplayName(archivedProject)
-                        : t('Other');
-                      return (
-                        <div key={group.projectId}>
-                          <div className="group flex items-center gap-2 rounded-md pr-0.5 pl-2">
-                            {group.projectArchived && (
-                              <FolderGit2 className="size-4 shrink-0 text-muted-foreground" />
-                            )}
-                            <span className="min-w-0 flex-1 truncate py-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-                              {projectName}
-                            </span>
-                            <span className="shrink-0 text-[10px] text-muted-foreground">
-                              {group.ids.length}
-                            </span>
-                            {group.projectArchived ? (
-                              <button
-                                type="button"
-                                onClick={() => toggleArchiveProject(group.projectId)}
-                                className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                                title={t('Unarchive project')}
-                              >
-                                <ArchiveRestore className="h-3.5 w-3.5" />
-                              </button>
-                            ) : (
-                              <ArchiveCleanupMenu
-                                open={archiveCleanupOpen === group.projectId}
-                                onOpenChange={(open) =>
-                                  setArchiveCleanupOpen(open ? group.projectId : null)
-                                }
-                                idsForDays={(days) =>
-                                  staleArchivedConversationIds(
-                                    order,
-                                    conversations,
-                                    days,
-                                    Date.now(),
-                                    group.projectId
-                                  )
-                                }
-                                onPick={(days, ids) =>
-                                  setPendingRemove({
-                                    kind: 'archived',
-                                    days,
-                                    conversationIds: ids,
-                                    projectName,
-                                  })
-                                }
-                              />
-                            )}
-                          </div>
-                          <div className="flex flex-col gap-y-0.5">
-                            {group.ids.map((id) => (
-                              <motion.div key={id} layout="position" transition={springStandard}>
-                                <DraggableChat id={id} conversation={conversations[id]}>
-                                  <ConversationRow
-                                    id={id}
-                                    conversation={conversations[id]}
-                                    active={activeId === id}
-                                    locale={locale}
-                                    nowTick={nowTick}
-                                    worktreeStatus={
-                                      conversations[id].worktree ? worktreeStatuses[id] : undefined
-                                    }
-                                    isolated={Boolean(conversations[id].worktree)}
-                                    onSelect={selectConversation}
-                                    onTogglePin={togglePinConversation}
-                                    onToggleArchive={(conversationId) =>
-                                      void handleToggleArchive(conversationId)
-                                    }
-                                    onCleanupWorktree={(conversationId) =>
-                                      void handleCleanupWorktree(conversationId)
-                                    }
-                                    onMoveToWorktree={(conversationId) =>
-                                      void handleMoveToWorktree(conversationId)
-                                    }
-                                    onRemove={(conversationId) =>
-                                      void openRemoveConversation(conversationId)
-                                    }
-                                  />
-                                </DraggableChat>
-                              </motion.div>
-                            ))}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-            <div className="group flex items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-accent/30">
-              <button
-                type="button"
-                onClick={() => setArchivedOpen((open) => !open)}
-                className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
-              >
-                <IconSlot>
-                  <ChevronRight
-                    className={cn(
-                      'size-3.5 transition-transform duration-150',
-                      archivedOpen && 'rotate-90'
-                    )}
-                  />
-                </IconSlot>
-                <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
-                  {t('Archived')}
-                </span>
-                <span className="shrink-0 text-[10px] text-muted-foreground">
-                  {archivedIds.length}
-                </span>
-              </button>
-              <ArchiveCleanupMenu
-                open={archiveCleanupOpen === '*'}
-                onOpenChange={(open) => setArchiveCleanupOpen(open ? '*' : null)}
-                idsForDays={(days) =>
-                  staleArchivedConversationIds(order, conversations, days, Date.now())
-                }
-                onPick={(days, ids) =>
-                  setPendingRemove({ kind: 'archived', days, conversationIds: ids })
-                }
-              />
-            </div>
-          </div>
-        )}
-
         <div className="flex shrink-0 items-center justify-between border-t p-2">
           <button
             type="button"
@@ -1470,6 +1379,17 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
             <PanelLeftClose className="h-4 w-4" />
           </button>
           <div className="flex items-center">
+            {archivedCount > 0 && (
+              <button
+                type="button"
+                data-slot="archived-button"
+                onClick={openArchive}
+                className={ICON_BUTTON_CLASS}
+                title={`${t('Archived')} (${archivedCount})`}
+              >
+                <Archive className="h-4 w-4" />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -1492,6 +1412,136 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
         </div>
       </div>
 
+      <Dialog open={archiveOpen} onOpenChange={setArchiveOpen}>
+        <DialogContent className="h-[min(40rem,85vh)] max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-baseline gap-2">
+              {t('Archived')}
+              <span className="font-sans text-sm text-muted-foreground tabular-nums">
+                {archivedCount}
+              </span>
+            </DialogTitle>
+            <div className="mt-1 flex items-center gap-2">
+              <InputGroup data-size="sm">
+                <InputGroupAddon>
+                  <Search />
+                </InputGroupAddon>
+                <InputGroupInput
+                  value={archiveQuery}
+                  placeholder={t('Search conversations...')}
+                  onChange={(event) => setArchiveQuery(event.target.value)}
+                />
+              </InputGroup>
+              <ArchiveCleanupMenu
+                open={archiveCleanupOpen === '*'}
+                onOpenChange={(open) => setArchiveCleanupOpen(open ? '*' : null)}
+                idsForDays={(days) =>
+                  staleArchivedConversationIds(order, conversations, days, Date.now())
+                }
+                onPick={(days, ids) =>
+                  setPendingRemove({ kind: 'archived', days, conversationIds: ids })
+                }
+                className="h-8 w-8 rounded-md opacity-100 hover:bg-muted"
+              />
+            </div>
+          </DialogHeader>
+          <DialogPanel className="flex flex-col gap-y-3 border-t pt-3!">
+            {slicedArchivedGroups.length === 0 && (
+              <p className="py-10 text-center text-sm text-muted-foreground">
+                {archiveQuery.trim() ? t('No matching conversations') : t('No conversations')}
+              </p>
+            )}
+            {slicedArchivedGroups.map((group) => {
+              const archivedProject = projects.find((project) => project.id === group.projectId);
+              const projectName = archivedProject
+                ? projectDisplayName(archivedProject)
+                : t('Other');
+              return (
+                <div key={group.projectId}>
+                  <div className="group flex items-center gap-2 rounded-md pr-0.5 pl-2">
+                    {group.projectArchived && (
+                      <FolderGit2 className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate py-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      {projectName}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+                      {group.ids.length}
+                    </span>
+                    {group.projectArchived ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleArchiveProject(group.projectId)}
+                        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title={t('Unarchive project')}
+                      >
+                        <ArchiveRestore className="h-3.5 w-3.5" />
+                      </button>
+                    ) : (
+                      <ArchiveCleanupMenu
+                        open={archiveCleanupOpen === group.projectId}
+                        onOpenChange={(open) =>
+                          setArchiveCleanupOpen(open ? group.projectId : null)
+                        }
+                        idsForDays={(days) =>
+                          staleArchivedConversationIds(
+                            order,
+                            conversations,
+                            days,
+                            Date.now(),
+                            group.projectId
+                          )
+                        }
+                        onPick={(days, ids) =>
+                          setPendingRemove({
+                            kind: 'archived',
+                            days,
+                            conversationIds: ids,
+                            projectName,
+                          })
+                        }
+                      />
+                    )}
+                  </div>
+                  <div className="flex flex-col gap-y-0.5">
+                    {group.ids.map((id) => (
+                      <motion.div key={id} layout="position" transition={springStandard}>
+                        <ConversationRow
+                          id={id}
+                          conversation={conversations[id]}
+                          active={activeId === id}
+                          locale={locale}
+                          nowTick={nowTick}
+                          worktreeStatus={
+                            conversations[id].worktree ? worktreeStatuses[id] : undefined
+                          }
+                          isolated={Boolean(conversations[id].worktree)}
+                          menuZIndex={Z_INDEX.DROPDOWN_IN_MODAL}
+                          onSelect={(conversationId) => {
+                            selectConversation(conversationId);
+                            setArchiveOpen(false);
+                          }}
+                          onTogglePin={togglePinConversation}
+                          onToggleArchive={(conversationId) =>
+                            void handleToggleArchive(conversationId)
+                          }
+                          onCleanupWorktree={(conversationId) =>
+                            void handleCleanupWorktree(conversationId)
+                          }
+                          onMoveToWorktree={(conversationId) =>
+                            void handleMoveToWorktree(conversationId)
+                          }
+                          onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                        />
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </DialogPanel>
+        </DialogContent>
+      </Dialog>
       <AddProjectDialog
         open={addOpen}
         onOpenChange={setAddOpen}
@@ -1660,7 +1710,7 @@ export function Sidebar({ width, collapsed, onToggleCollapse, onOpenSearch }: Si
             />
           ) : (
             (dragPayload?.type === 'chat' || dragPayload?.type === 'workspace-file') && (
-              <div className="flex w-56 items-center gap-2 rounded-lg border bg-background/95 px-3 py-1.5 text-sm shadow-md">
+              <div className="flex w-56 items-center gap-2 rounded-lg border bg-background/95 px-3 py-1.5 text-sm shadow-float">
                 {dragPayload.type === 'workspace-file' ? (
                   <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : (
@@ -1724,8 +1774,8 @@ function ProjectGroupHeader({
         opacity: sortableDrag.isDragging ? 0.4 : undefined,
       }}
       className={cn(
-        'group relative flex h-7 w-full select-none items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent/30 hover:text-foreground',
-        droppable.isOver && 'bg-accent/40 text-foreground',
+        'group relative flex h-7 w-full select-none items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground',
+        droppable.isOver && 'bg-brand/10 text-foreground',
         sortable && 'cursor-grab'
       )}
       {...(sortable ? sortableDrag.listeners : {})}
@@ -1735,24 +1785,23 @@ function ProjectGroupHeader({
         type="button"
         onClick={onToggle}
         onPointerDown={(event) => event.stopPropagation()}
-        className="flex min-w-0 flex-1 items-center gap-2"
+        className="flex min-w-0 flex-1 items-center gap-1.5"
       >
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <ChevronRight
-            className={cn('size-3.5 transition-transform duration-150', !folded && 'rotate-90')}
-          />
-        </span>
-        {/* emoji/色点跟在名字右侧,不占左侧图标列,否则设了标记的分组名会比其他分组右移 */}
-        <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          <span className="min-w-0 truncate text-left">{name}</span>
-          {emoji && <span className="shrink-0 text-sm leading-none">{emoji}</span>}
-          {color && (
-            <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+        {/* 分组是小节标签而非树节点:不占左侧图标列;箭头跟在名字后,展开态悬停才出现,折叠态常驻提示 */}
+        <span className="min-w-0 truncate text-left">{name}</span>
+        {emoji && <span className="shrink-0 text-sm leading-none">{emoji}</span>}
+        {color && (
+          <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+        )}
+        <ChevronRight
+          className={cn(
+            'size-3 shrink-0 transition-[opacity,transform] duration-150',
+            !folded && 'rotate-90 opacity-0 group-hover:opacity-100'
           )}
-        </span>
+        />
         <span
           className={cn(
-            'shrink-0 text-[10px] text-muted-foreground/70 tabular-nums',
+            'ml-auto shrink-0 text-[10px] text-muted-foreground/70 tabular-nums',
             onEdit && 'transition-opacity group-hover:opacity-0'
           )}
         >
@@ -1768,7 +1817,7 @@ function ProjectGroupHeader({
             onEdit();
           }}
           onPointerDown={(event) => event.stopPropagation()}
-          className="absolute inset-y-0 right-1 my-auto flex size-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
+          className="absolute inset-y-0 right-1 my-auto flex size-5 items-center justify-center rounded-md opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
         >
           <Pencil className="h-3.5 w-3.5" />
         </button>
@@ -1807,7 +1856,7 @@ function ProjectDragPreview({
   const hiddenCount = Math.max(0, sessionIds.length - shownIds.length);
   return (
     <div
-      className="pointer-events-none rounded-lg border bg-background/95 py-0.5 shadow-md"
+      className="pointer-events-none rounded-lg border bg-background/95 py-0.5 shadow-float"
       style={{ width: width ?? 224 }}
     >
       <div className="flex items-center gap-2 px-2 py-2 text-sm font-medium">
@@ -1890,11 +1939,13 @@ function ArchiveCleanupMenu({
   onOpenChange,
   idsForDays,
   onPick,
+  className,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   idsForDays: (days: number) => string[];
   onPick: (days: number, ids: string[]) => void;
+  className?: string;
 }) {
   const { t } = useI18n();
   return (
@@ -1902,14 +1953,15 @@ function ArchiveCleanupMenu({
       <MenuTrigger
         className={cn(
           'flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive',
-          open && 'opacity-100'
+          open && 'opacity-100',
+          className
         )}
         title={t('Clean up archived')}
         aria-label={t('Clean up archived')}
       >
         <Eraser className="h-3.5 w-3.5" />
       </MenuTrigger>
-      <MenuPopup align="end" side="top" className="min-w-40">
+      <MenuPopup align="end" className="min-w-40" zIndex={Z_INDEX.DROPDOWN_IN_MODAL}>
         {ARCHIVE_PURGE_DAYS.map((days) => {
           const ids = idsForDays(days);
           return (
@@ -2016,7 +2068,7 @@ function PinnedDropZone({
   return (
     <div
       ref={setNodeRef}
-      className={cn('rounded-lg', isOver && draggingChat && 'bg-accent/40 ring-1 ring-ring')}
+      className={cn('rounded-lg', isOver && draggingChat && 'bg-brand/8 ring-1 ring-brand/40')}
       {...rest}
     >
       {children}
@@ -2057,6 +2109,8 @@ interface ConversationRowProps {
   /** 隔离会话的 worktree 状态（徽标：未提交/未合并） */
   worktreeStatus?: WorktreeStatus;
   switchHint?: string;
+  /** 右键菜单层级；弹窗内的行需要压过弹窗 */
+  menuZIndex?: number;
   onSelect: (id: string) => void;
   onTogglePin: (id: string) => void;
   onToggleArchive: (id: string) => void;
@@ -2081,6 +2135,7 @@ function ConversationRow({
   isolated,
   worktreeStatus,
   switchHint,
+  menuZIndex,
   onSelect,
   onTogglePin,
   onToggleArchive,
@@ -2144,8 +2199,8 @@ function ConversationRow({
         // 会话行与项目行共用图标/文字基准，worktree 与浏览器/终端计数在第二行
         'group grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 gap-y-0.5 rounded-lg py-1.5 pr-2 pl-2 text-sm transition-colors',
         active
-          ? 'bg-muted text-foreground'
-          : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'
+          ? 'bg-brand/10 text-foreground dark:bg-brand/15'
+          : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
       )}
       onClick={() => {
         if (!renaming) onSelect(id);
@@ -2208,7 +2263,7 @@ function ConversationRow({
                   aria-hidden
                 />
               )}
-              <span className="shrink-0 text-[10px] text-muted-foreground group-hover:hidden">
+              <span className="shrink-0 text-[10px] text-muted-foreground/80 tabular-nums group-hover:hidden">
                 {formatRelativeTime(
                   conversation.lastActiveAt ?? conversation.createdAt,
                   locale,
@@ -2279,7 +2334,7 @@ function ConversationRow({
     <>
       <ContextMenu>
         <ContextMenuTrigger render={row as React.ReactElement<Record<string, unknown>>} />
-        <ContextMenuPopup className="min-w-36">
+        <ContextMenuPopup className="min-w-36" zIndex={menuZIndex}>
           <ContextMenuItem onClick={() => setRenaming(true)}>
             <Pencil />
             {t('Rename')}
@@ -2531,7 +2586,7 @@ function ProjectOverflowMenu({ actions }: { actions: ProjectAction[] }) {
     <Menu>
       <MenuTrigger
         aria-label={t('More actions')}
-        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground data-popup-open:bg-muted data-popup-open:text-foreground"
+        className="shrink-0 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100 data-popup-open:bg-muted data-popup-open:text-foreground data-popup-open:opacity-100"
         title={t('More actions')}
         onPointerDown={(event) => event.stopPropagation()}
       >
@@ -2569,7 +2624,7 @@ function ConversationDot({
     status: string;
     spawning: boolean;
     unread?: boolean;
-    pendingAsks?: { requestId: string }[];
+    pendingAsks?: readonly { requestId: string }[];
     hasRunningChild?: boolean;
   };
 }) {
@@ -2580,10 +2635,11 @@ function ConversationDot({
     pendingAskCount: conversation.pendingAsks?.length ?? 0,
     hasRunningChild: conversation.hasRunningChild,
   });
-  // 锁进与项目行同宽的图标列:圆点/图标两种形态切换时标题不再左右跳动
+  // 锁进与项目行同宽的图标列:圆点/图标两种形态切换时标题不再左右跳动。
+  // 空闲不画点:满列空心圈没有信息量,只有运行/待回答/失败/未读才需要被看见
   return (
     <span className="flex size-4 shrink-0 items-center justify-center">
-      <ConversationStatusIndicator tone={tone} size="sm" />
+      {tone !== 'idle' && <ConversationStatusIndicator tone={tone} size="sm" />}
     </span>
   );
 }

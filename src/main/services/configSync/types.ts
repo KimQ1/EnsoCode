@@ -1,3 +1,4 @@
+import type { AccentColor } from '@shared/accentColor';
 import type { CompactStrategy } from '@shared/compactStrategy';
 import type { DefaultModelRef } from '@shared/defaultModel';
 import type { Locale } from '@shared/i18n';
@@ -91,7 +92,9 @@ export interface ConfigSyncState {
   subagentModelsEnabled?: boolean;
   disabledBuiltinAgentTypes?: string[];
   disabledBuiltinTools?: string[];
+  subagentAllowedModes?: ('task' | 'coworker')[];
   theme?: 'light' | 'dark' | 'system' | 'sync-terminal';
+  accentColor?: AccentColor;
   language?: Locale;
   terminalTheme?: string;
   terminalFontSize?: number;
@@ -133,7 +136,10 @@ export interface ConfigSyncState {
   openChangesOnFileEdit?: boolean;
   compactReadOnlyTools?: boolean;
   expandLiveEdits?: boolean;
+  expandLiveReasoning?: boolean;
   autoCollapseTurns?: boolean;
+  collapseCompletedActivity?: boolean;
+  pinUnfinishedTodos?: boolean;
   chatWide?: boolean;
   notifyMainAgentOnly?: boolean;
   maxActiveCoworkers?: number;

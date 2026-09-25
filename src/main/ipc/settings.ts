@@ -10,10 +10,15 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { normalizeSshTimeoutSeconds } from '@shared/sshTimeout';
 import { IPC_CHANNELS, isEditMode, resolveEditMode } from '@shared/types';
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { readStoredOauthCredentialKeys } from '../services/oauthProviders';
-import { parseTraySleepPolicy, type TraySleepPolicy } from '../services/pairPowerKeepAlive';
+import {
+  parseTrayPreventDisplaySleep,
+  parseTraySleepPolicy,
+  type TraySleepPolicy,
+} from '../services/pairPowerKeepAlive';
 import { deleteSystemPrompt, isSystemPromptId } from '../services/systemPromptStore';
 import { getWindowWebContents, sendToWindow } from '../windows/createAppWindow';
 
@@ -33,6 +38,7 @@ const MAX_WAIT_MS = 5000;
 
 export const SETTINGS_STATE_FIELDS = [
   'theme',
+  'accentColor',
   'language',
   'terminalTheme',
   'terminalFontSize',
@@ -61,10 +67,14 @@ export const SETTINGS_STATE_FIELDS = [
   'openChangesOnFileEdit',
   'compactReadOnlyTools',
   'expandLiveEdits',
+  'expandLiveReasoning',
   'autoCollapseTurns',
+  'collapseCompletedActivity',
+  'pinUnfinishedTodos',
   'chatWide',
   'notifyMainAgentOnly',
   'maxActiveCoworkers',
+  'sshTimeoutSeconds',
   'generationStallTimeoutMin',
   'autoArchiveIdleDays',
   'autoArchiveMergedWorktrees',
@@ -106,6 +116,8 @@ export const SETTINGS_STATE_FIELDS = [
   'agentTypes',
   'disabledBuiltinAgentTypes',
   'disabledBuiltinTools',
+  'disabledWorkflowPresets',
+  'subagentAllowedModes',
   'memoryEmbeddingModel',
   'memoryEmbeddingAutoDownload',
   'memoryModelIdleMinutes',
@@ -131,6 +143,7 @@ const CONFIG_SYNC_EXCLUDED_STATE_FIELDS = new Set<SettingsStateField>([
   'autoRestartWhenIdle',
   'proxyMode',
   'customProxyUrl',
+  'sshTimeoutSeconds',
   'backgroundImageEnabled',
   'backgroundSourceType',
   'backgroundImagePath',
@@ -145,6 +158,7 @@ const CONFIG_SYNC_EXCLUDED_STATE_FIELDS = new Set<SettingsStateField>([
   'onboarded',
   'projects',
   'projectGroups',
+  'disabledWorkflowPresets',
 ]);
 
 export const CONFIG_SYNC_COMMIT_FIELDS = SETTINGS_STATE_FIELDS.filter(
@@ -166,6 +180,13 @@ function notifyMemoryEmbeddingSettings(settings: Record<string, unknown>): void 
         syncMemoryKgFromSettings(state);
       }
     )
+    .catch(() => {});
+}
+
+function notifyTrayToggleShortcut(settings: Record<string, unknown>): void {
+  const keybindings = settingsStateOf(settings).keybindings;
+  void import('../services/trayToggleShortcut')
+    .then(({ syncTrayToggleShortcut }) => syncTrayToggleShortcut(keybindings))
     .catch(() => {});
 }
 
@@ -311,6 +332,7 @@ function scheduleWrite(
     cachedSettings = data;
     isDirty = true;
     notifyMemoryEmbeddingSettings(data);
+    notifyTrayToggleShortcut(data);
 
     // 普通 store 写排除 sender；Gateway 写显式选择 all-renderers。
     for (const win of BrowserWindow.getAllWindows()) {
@@ -349,10 +371,13 @@ function scheduleWrite(
     }, DEBOUNCE_MS);
 
     void import('../services/agentHost')
-      .then(async ({ pushApprovalReviewer, pushMaxActiveCoworkers }) => {
-        pushApprovalReviewer(await readStoredOauthCredentialKeys());
-        pushMaxActiveCoworkers();
-      })
+      .then(
+        async ({ pushApprovalReviewer, pushMaxActiveCoworkers, pushDisabledWorkflowPresets }) => {
+          pushApprovalReviewer(await readStoredOauthCredentialKeys());
+          pushMaxActiveCoworkers();
+          pushDisabledWorkflowPresets();
+        }
+      )
       .catch(() => {});
     return true;
   } catch {
@@ -446,6 +471,7 @@ export function commitSettingsTransaction(
   cachedSettings = next;
   isDirty = false;
   notifyMemoryEmbeddingSettings(next);
+  notifyTrayToggleShortcut(next);
   try {
     for (const win of BrowserWindow.getAllWindows()) {
       if (win.isDestroyed()) continue;
@@ -455,9 +481,10 @@ export function commitSettingsTransaction(
     // Durable write already succeeded; a dead renderer must not fail the import.
   }
   void import('../services/agentHost')
-    .then(async ({ pushApprovalReviewer, pushMaxActiveCoworkers }) => {
+    .then(async ({ pushApprovalReviewer, pushMaxActiveCoworkers, pushDisabledWorkflowPresets }) => {
       pushApprovalReviewer(await readStoredOauthCredentialKeys());
       pushMaxActiveCoworkers();
+      pushDisabledWorkflowPresets();
     })
     .catch(() => {});
   return { ok: true, backupPath };
@@ -523,6 +550,20 @@ export function readTraySleepPolicy(): TraySleepPolicy {
 
 export function writeTraySleepPolicy(policy: TraySleepPolicy): boolean {
   return writeTrayState({ sleepPolicy: policy });
+}
+
+export function readTrayPreventDisplaySleep(): boolean {
+  return parseTrayPreventDisplaySleep(
+    objectRecord(readSettings()?.[TRAY_SETTINGS_KEY])?.preventDisplaySleep
+  );
+}
+
+export function readSshTimeoutSeconds(): number {
+  return normalizeSshTimeoutSeconds(settingsStateOf(readSettings()).sshTimeoutSeconds);
+}
+
+export function writeTrayPreventDisplaySleep(enabled: boolean): boolean {
+  return writeTrayState({ preventDisplaySleep: enabled });
 }
 
 function trayState(): Record<string, unknown> {

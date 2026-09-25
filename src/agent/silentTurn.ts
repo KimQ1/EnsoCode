@@ -1,6 +1,6 @@
 import type { ProjectedMessage } from '@shared/types/agent';
 
-/** 空轮次自动续跑时追加到当次 systemPrompt，跑完即撤。 */
+/** 空轮次恢复时只追加到恢复轮的模型请求，恢复轮结束或取消即撤。 */
 export const SILENT_TURN_NUDGE = [
   'The previous assistant reply was empty: no visible text and no tool call.',
   'Continue the same user request. Call tools if work is needed, or write the answer in the reply.',
@@ -33,5 +33,6 @@ export function silentTurnKind(
   messages: ProjectedMessage[] | undefined
 ): SilentTurnKind | undefined {
   if (!isSilentAssistantTurn(messages?.at(-1))) return undefined;
-  return messages?.at(-2)?.role === 'toolResult' ? 'post-tool' : 'empty';
+  const previous = messages?.findLast((m, i) => i < messages.length - 1 && m.role !== 'system');
+  return previous?.role === 'toolResult' ? 'post-tool' : 'empty';
 }

@@ -40,6 +40,7 @@ import type {
   TreeNodeDto,
   TreeQuery,
 } from '@shared/memory/graphDto';
+import type { PlanRespondAction } from '@shared/planMode';
 import type { BrowserSearchTab } from '@shared/searchAnything';
 import type { SettingsDeepLink } from '@shared/settingsDeepLink';
 import type {
@@ -73,6 +74,7 @@ import type {
   OauthAccountUsage,
   OauthCodexImportResult,
   OauthProviderInfo,
+  OpenInApp,
   PairCatalogPayload,
   PairCreatedSession,
   PairQueueAction,
@@ -142,6 +144,11 @@ import type {
   TerminalExitEvent,
 } from '@shared/types/sidePanel';
 import type { UpdateStatus } from '@shared/types/updater';
+import type {
+  WorkflowPresetDraft,
+  WorkflowPresetSaveResult,
+  WorkflowPresetSummary,
+} from '@shared/types/workflow';
 import type {
   SessionWorktree,
   WorkspaceBranchesResult,
@@ -335,6 +342,9 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.ASSETS_COLLECT_IMPORT, scanId, candidateIds),
     listProjectSkills: (cwd: string): Promise<{ name: string; description: string }[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.ASSETS_LIST_PROJECT_SKILLS, cwd),
+    /** 按会话列出工作流预设；项目根由 Main 从会话记录推导 */
+    listWorkflowPresets: (conversationId: string): Promise<WorkflowPresetSummary[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.ASSETS_LIST_WORKFLOW_PRESETS, conversationId),
     skillOccupancy: (ids: string[]): Promise<AssetOccupancyRow[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.ASSETS_SKILL_OCCUPANCY, ids),
     instructionOccupancy: (ids: string[]): Promise<AssetOccupancyRow[]> =>
@@ -366,6 +376,18 @@ const electronAPI = {
     delete: (id: string): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.INSTRUCTIONS_DELETE, id),
   },
 
+  /** 设置页托管的工作流预设；id 由 Main 生成，文件路径不经 renderer */
+  workflowPresets: {
+    list: (): Promise<WorkflowPresetSummary[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKFLOW_PRESETS_LIST),
+    read: (id: string): Promise<(WorkflowPresetDraft & { id: string }) | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKFLOW_PRESETS_READ, id),
+    save: (draft: WorkflowPresetDraft, id?: string): Promise<WorkflowPresetSaveResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKFLOW_PRESETS_SAVE, draft, id),
+    delete: (id: string): Promise<boolean> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKFLOW_PRESETS_DELETE, id),
+  },
+
   presets: {
     readSystemPrompt: (id?: string): Promise<{ ok: boolean; content: string; error?: string }> =>
       ipcRenderer.invoke(IPC_CHANNELS.PRESETS_SYSTEM_PROMPT_READ, id),
@@ -385,12 +407,14 @@ const electronAPI = {
   projects: {
     /** 从本机编辑器 / 编程应用读取最近打开的目录 */
     getRecent: (): Promise<RecentProject[]> => ipcRenderer.invoke(IPC_CHANNELS.PROJECTS_GET_RECENT),
-    /** 在系统文件管理器里打开项目或会话的实际工作目录；ssh 项目返回 unsupported */
+    /** 在系统文件管理器（或 appId 指定的应用）里打开项目或会话的实际工作目录；ssh 项目返回 unsupported */
     reveal: (request: {
       projectId: string;
       conversationId?: string;
+      appId?: string;
     }): Promise<{ ok: boolean; error?: string }> =>
       ipcRenderer.invoke(IPC_CHANNELS.PROJECTS_REVEAL, request),
+    openInApps: (): Promise<OpenInApp[]> => ipcRenderer.invoke(IPC_CHANNELS.PROJECTS_OPEN_IN_APPS),
   },
 
   git: {
@@ -537,15 +561,17 @@ const electronAPI = {
     prompt: (
       sessionId: string,
       text: string,
-      images?: AttachedImage[]
+      images?: AttachedImage[],
+      deliveryId?: string
     ): Promise<AgentActionResult> =>
-      ipcRenderer.invoke(IPC_CHANNELS.AGENT_PROMPT, sessionId, text, images),
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_PROMPT, sessionId, text, images, deliveryId),
     steer: (
       sessionId: string,
       text: string,
-      images?: AttachedImage[]
+      images?: AttachedImage[],
+      deliveryId?: string
     ): Promise<AgentActionResult> =>
-      ipcRenderer.invoke(IPC_CHANNELS.AGENT_STEER, sessionId, text, images),
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_STEER, sessionId, text, images, deliveryId),
     abort: (sessionId: string): Promise<AgentActionResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_ABORT, sessionId),
     abortRetry: (sessionId: string): Promise<AgentActionResult> =>
@@ -622,10 +648,19 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_APPROVAL_RESPOND, sessionId, requestId, decision),
     setApprovalMode: (sessionId: string, mode: ApprovalMode): Promise<AgentActionResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_SET_APPROVAL_MODE, sessionId, mode),
+    setPlanMode: (sessionId: string, active: boolean): Promise<AgentActionResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_SET_PLAN_MODE, sessionId, active),
+    respondPlan: (
+      sessionId: string,
+      response: { planId: string; action: PlanRespondAction; feedback?: string }
+    ): Promise<AgentActionResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_PLAN_RESPOND, sessionId, response),
     stopTask: (sessionId: string, taskId: string): Promise<AgentActionResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_TASK_STOP, sessionId, taskId),
     stopSubagent: (sessionId: string, agentId: string): Promise<AgentActionResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_SUBAGENT_STOP, sessionId, agentId),
+    stopWorkflow: (sessionId: string, runId: string): Promise<AgentActionResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_WORKFLOW_STOP, sessionId, runId),
     /** 手动压缩上下文；忙碌时 worker 自行排队，进度经 compaction 事件回来 */
     compact: (sessionId: string, instructions?: string): Promise<AgentActionResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.AGENT_COMPACT, sessionId, instructions),

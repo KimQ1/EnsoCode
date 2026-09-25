@@ -1,5 +1,6 @@
 import {
   DEFAULT_STATUS_LINE_SEGMENTS,
+  isStatusLineSegmentPinned,
   STATUS_LINE_SEGMENT_IDS,
   type StatusLineSegmentId,
 } from '@shared/statusLine';
@@ -27,31 +28,28 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { Popover, PopoverPopup, PopoverTrigger } from '@/components/ui/popover';
-import { Separator } from '@/components/ui/separator';
 import { fetchAccountUsage, USAGE_CACHE_TTL_MS, usageCache } from '@/hooks/useAccountUsage';
 import { type TFunction, useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
 import { Z_INDEX } from '@/lib/z-index';
 import type { Conversation } from '@/stores/sessions';
 import { useSessionsStore } from '@/stores/sessions';
-import { computeStats, formatDuration, formatTokens } from '@/stores/sessions/stats';
+import { computeStats, formatDuration } from '@/stores/sessions/stats';
 import { useSettingsStore } from '@/stores/settings';
 import { ContextInspector } from './ContextInspector';
-import { contextSegmentUsed } from './contextSegment';
+import { ContextMeter } from './ContextMeter';
 import { StatusLineSettings } from './StatusLineSettings';
+import {
+  buildUsageSegmentValues,
+  CRITICAL_PERCENT,
+  type SegmentValue,
+  toSessionUsageStats,
+} from './usageSegments';
+
+export type { SegmentValue };
 
 interface StatsLineProps {
   conversationId: string;
-}
-
-/** 段位当前值：`compact` 是状态栏内联展示（紧凑，可为空串走纯 icon），
- *  `full` 是设置弹层预览用的完整句子（不含段名前缀，行内已单独显示段名）。
- *  `percent`：仅 `context` 段在窗口已知时设置，驱动图形环；`critical`：该段是否需要警示色。 */
-export interface SegmentValue {
-  compact: string;
-  full: string;
-  percent?: number;
-  critical?: boolean;
 }
 
 /**
@@ -124,8 +122,8 @@ const APPROVAL_ICONS: Record<ApprovalMode, LucideIcon> = {
   assistant: Sparkles,
 };
 
-/** 设置弹层里代表每段的 icon（全部 13 段恒有值）；状态栏本体的 `context` 段用图形环
- *  代替这里的图标（见 `ContextRing`），`approval` 的 icon 随档位变化。 */
+/** 设置弹层里代表每段的 icon（全部 13 段恒有值），`approval` 的 icon 随档位变化；
+ *  状态栏本体的 `context` 段在窗口已知时用进度条代替图标。 */
 const SEGMENT_ICONS: Record<Exclude<StatusLineSegmentId, 'approval'>, LucideIcon> = {
   model: Cpu,
   context: Gauge,
@@ -140,9 +138,6 @@ const SEGMENT_ICONS: Record<Exclude<StatusLineSegmentId, 'approval'>, LucideIcon
   coworkers: Users,
   usage: Wallet,
 };
-
-/** 状态栏对「资源即将耗尽」统一用的警戒阈值：占用/额度达到或超过此百分比即判定紧张，标红提示 */
-const CRITICAL_PERCENT = 90;
 
 // 订阅额度的缓存/去重已提取到 hooks/useAccountUsage，与 ModelPicker/ProvidersSettings 共享同一份缓存
 
@@ -207,36 +202,6 @@ export function resolveSegmentIcons(
     ...SEGMENT_ICONS,
     approval: APPROVAL_ICONS[conversation.approvalMode ?? 'full'],
   };
-}
-
-/** 图形化上下文占用环，手写 SVG：一个底环 + 一个按百分比裁切的进度环（circle + strokeDasharray/
- *  strokeDashoffset），比纯数字更直观地传达「还剩多少」。 */
-function ContextRing({ percent, critical }: { percent: number; critical: boolean }) {
-  const radius = 4.5;
-  const circumference = 2 * Math.PI * radius;
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" className="-rotate-90 shrink-0" aria-hidden>
-      <circle
-        cx="6"
-        cy="6"
-        r={radius}
-        fill="none"
-        strokeWidth="2"
-        className="stroke-muted-foreground/25"
-      />
-      <circle
-        cx="6"
-        cy="6"
-        r={radius}
-        fill="none"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeDasharray={circumference}
-        strokeDashoffset={circumference * (1 - percent / 100)}
-        className={critical ? 'stroke-destructive' : 'stroke-muted-foreground'}
-      />
-    </svg>
-  );
 }
 
 /** 订阅额度：按 auth accountKey 拉取，模块级缓存 + in-flight 去重节流，⛔ 不每次 render 都发 IPC。
@@ -305,18 +270,18 @@ function buildSegmentValues(
   const stats = computeStats(messages);
   const values: Record<StatusLineSegmentId, SegmentValue | undefined> = {
     model: undefined,
-    context: undefined,
     turns: undefined,
     duration: undefined,
     sessionTime: undefined,
-    speed: undefined,
-    tokens: undefined,
-    cache: undefined,
     cwd: undefined,
     sessionName: undefined,
     approval: undefined,
     coworkers: undefined,
     usage: undefined,
+    ...buildUsageSegmentValues(
+      t,
+      toSessionUsageStats(stats, conversation.occupancy, conversation.contextWindow)
+    ),
   };
 
   if (conversation.lastModelId) {
@@ -326,34 +291,9 @@ function buildSegmentValues(
       conversation.lastModelId;
     const level = conversation.reasoningEnabled ? conversation.thinkingLevel : undefined;
     values.model = {
-      compact: level ? `${label}·${t(THINKING_LEVEL_SHORT_KEYS[level])}` : label,
+      compact: level ? `${label} · ${t(THINKING_LEVEL_SHORT_KEYS[level])}` : label,
       full: level ? `${label} · ${t(THINKING_LEVEL_FULL_KEYS[level])}` : label,
     };
-  }
-
-  const used = contextSegmentUsed(conversation.occupancy);
-  if (used !== null) {
-    const window =
-      conversation.occupancy?.contextWindow && conversation.occupancy.contextWindow > 0
-        ? conversation.occupancy.contextWindow
-        : conversation.contextWindow && conversation.contextWindow > 0
-          ? conversation.contextWindow
-          : 0;
-    // 窗口未知时不编造百分比：显示已用 tokens，用 `?` 表示窗口未知，而不是拿一个假窗口凑百分比
-    if (window > 0) {
-      const percent = Math.min(100, Math.round((used / window) * 100));
-      values.context = {
-        compact: `${percent}%`,
-        full: `${formatTokens(window)} · ${percent}%`,
-        percent,
-        critical: percent >= CRITICAL_PERCENT,
-      };
-    } else {
-      values.context = {
-        compact: `${formatTokens(used)}·?`,
-        full: `${formatTokens(used)} · ?`,
-      };
-    }
   }
 
   if (stats.steps > 0) {
@@ -377,7 +317,7 @@ function buildSegmentValues(
     durationFull.push(t('Tool calls {{duration}}', { duration: formatDuration(totalToolMs) }));
   }
   if (durationCompact.length > 0) {
-    values.duration = { compact: durationCompact.join('·'), full: durationFull.join(' · ') };
+    values.duration = { compact: durationCompact.join(' · '), full: durationFull.join(' · ') };
   }
 
   // 会话墙钟：createdAt 只在创建/导入时写一次、resume 不重写，是稳定的「会话开始」时刻；
@@ -387,39 +327,6 @@ function buildSegmentValues(
     compact: formatElapsed(sessionElapsed),
     full: formatElapsed(sessionElapsed),
   };
-
-  const speedCompact: string[] = [];
-  const speedFull: string[] = [];
-  if (stats.ttftAvgMs !== null) {
-    speedCompact.push(formatDuration(stats.ttftAvgMs));
-    speedFull.push(
-      t('First token avg {{duration}}', { duration: formatDuration(stats.ttftAvgMs) })
-    );
-  }
-  if (stats.tokensPerSecond !== null) {
-    speedCompact.push(`${stats.tokensPerSecond}tok/s`);
-    speedFull.push(t('{{speed}} tok/s', { speed: stats.tokensPerSecond }));
-  }
-  if (speedCompact.length > 0) {
-    values.speed = { compact: speedCompact.join('·'), full: speedFull.join(' · ') };
-  }
-
-  if (stats.inputTokens > 0 || stats.outputTokens > 0) {
-    values.tokens = {
-      compact: `↑${formatTokens(stats.inputTokens)} ↓${formatTokens(stats.outputTokens)}`,
-      full: t('Input {{input}} tok · Output {{output}} tok', {
-        input: formatTokens(stats.inputTokens),
-        output: formatTokens(stats.outputTokens),
-      }),
-    };
-  }
-
-  if (stats.cacheHitPercent !== null) {
-    values.cache = {
-      compact: `${stats.cacheHitPercent}%`,
-      full: t('Cache hit {{percent}}%', { percent: stats.cacheHitPercent }),
-    };
-  }
 
   const project = projects.find((p) => p.id === conversation.projectId);
   if (project) {
@@ -477,7 +384,7 @@ function buildSegmentValues(
   return values;
 }
 
-/** composer 下方的会话统计条：段位驱动、以 icon 为主的紧凑呈现，文字标签只在设置弹层里。
+/** composer 下方的会话统计条：段位驱动、每段「图标 + 值」的紧凑呈现，段名只在悬停提示与设置弹层里。
  *  段位顺序 = `statusLineSegments` 数组自身顺序（用户可在设置弹层拖拽），预设不进存储，
  *  见 `statusLinePresetOf`。外层恒占一行高度（h-7）：避免统计从无到有时输入框跳动；
  *  全部段位关掉时仍渲染空容器 + hover 齿轮，否则用户关完就再也打不开设置。 */
@@ -492,6 +399,8 @@ export function StatsLine({ conversationId }: StatsLineProps) {
   // 只在 store 里的原始值真的变化时才重新计算，不会每次 render 都产生新数组打断记忆化。
   const enabledSegments = useMemo(() => sanitizeStatusLineSegments(rawSegments), [rawSegments]);
   const [hoveredId, setHoveredId] = useState<StatusLineSegmentId | null>(null);
+  // 上下文弹层打开期间保持展开：否则鼠标移向弹层时悬停段收起，居中的锚点横移，弹层跟着跳
+  const [contextOpen, setContextOpen] = useState(false);
 
   const accountKey = useMemo(() => {
     if (!enabledSegments.includes('usage')) return undefined;
@@ -539,12 +448,11 @@ export function StatsLine({ conversationId }: StatsLineProps) {
       className="group relative flex h-7 items-center justify-center px-1"
     >
       {visibleSegments.length > 0 && (
-        <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
+        <div className="flex min-w-0 flex-nowrap items-center gap-3 overflow-hidden">
           {visibleSegments.map((id, index) => {
             const value = values[id];
             if (!value) return null;
             const Icon = icons[id];
-            const showRing = id === 'context' && value.percent !== undefined;
             const segment = (
               <span
                 title={`${t(SEGMENT_LABEL_KEYS[id])} · ${value.full}`}
@@ -552,13 +460,13 @@ export function StatsLine({ conversationId }: StatsLineProps) {
                 onMouseLeave={() => setHoveredId((current) => (current === id ? null : current))}
                 className={cn(
                   'relative flex items-center gap-1 text-[11px] tabular-nums',
-                  value.critical ? 'text-destructive' : 'text-muted-foreground/70'
+                  value.critical ? 'text-destructive' : 'text-muted-foreground/80'
                 )}
               >
-                {showRing ? (
-                  <ContextRing percent={value.percent ?? 0} critical={Boolean(value.critical)} />
+                {id === 'context' && value.percent !== undefined ? (
+                  <ContextMeter percent={value.percent} critical={Boolean(value.critical)} />
                 ) : (
-                  <Icon className="h-3 w-3 shrink-0" />
+                  <Icon className="h-3 w-3 shrink-0 opacity-75" />
                 )}
                 {value.compact && <span className="truncate">{value.compact}</span>}
                 {hoveredId === id && id !== 'context' && (
@@ -573,10 +481,18 @@ export function StatsLine({ conversationId }: StatsLineProps) {
               </span>
             );
             return (
-              <span key={id} className="flex shrink-0 items-center gap-1.5">
-                {index > 0 && <Separator orientation="vertical" className="h-3" />}
+              // 常驻段见 isStatusLineSegmentPinned，其余悬停/聚焦时展开，降低常驻噪音
+              <span
+                key={id}
+                className={cn(
+                  'shrink-0 items-center',
+                  contextOpen || isStatusLineSegmentPinned(id, index)
+                    ? 'flex'
+                    : 'hidden group-focus-within:flex group-hover:flex'
+                )}
+              >
                 {id === 'context' ? (
-                  <Popover>
+                  <Popover open={contextOpen} onOpenChange={setContextOpen}>
                     <PopoverTrigger className="rounded-sm outline-none">{segment}</PopoverTrigger>
                     <PopoverPopup side="top" className="w-72 [&_[data-slot=popover-viewport]]:p-0">
                       <ContextInspector

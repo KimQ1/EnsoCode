@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  cycleWorkspaceSearchScope,
+  highlightWorkspaceMatches,
+  mergeWorkspaceHits,
   searchWorkspace,
   WORKSPACE_SEARCH_RESULT_LIMIT,
   WORKSPACE_SEARCH_SNIPPET_MAX_LENGTH,
   type WorkspaceSearchDoc,
+  type WorkspaceSearchHit,
 } from './workspaceSearch';
 
 function doc(
@@ -208,5 +212,147 @@ describe('searchWorkspace 空查询', () => {
     const docs = [doc({ conversationId: 'c1', title: 'term' })];
     const hits = searchWorkspace(docs, '   ', baseOptions);
     expect(hits).toEqual([]);
+  });
+});
+
+describe('searchWorkspace 会话 id', () => {
+  const id = '311fca9f-e4d4-499f-a979-03d34cb276d9';
+  const docs = [
+    doc({
+      conversationId: id,
+      title: 'unrelated',
+      fields: [
+        { field: 'title', text: 'unrelated' },
+        { field: 'id', text: id },
+      ],
+    }),
+  ];
+
+  it('按整个 id 的前缀命中', () => {
+    expect(searchWorkspace(docs, '311FCA9F-e4', baseOptions)[0]?.field).toBe('id');
+  });
+
+  it('不命中 id 中间段', () => {
+    expect(searchWorkspace(docs, 'e4d4', baseOptions)).toEqual([]);
+    expect(searchWorkspace(docs, 'a', baseOptions)).toEqual([]);
+  });
+});
+
+describe('mergeWorkspaceHits（热命中 + Main 冷命中）', () => {
+  const coldHit = (conversationId: string, snippet = 'cold term body'): WorkspaceSearchHit => ({
+    conversationId,
+    projectId: 'proj-a',
+    title: '<raw first message>',
+    field: 'body',
+    snippet,
+  });
+
+  it('冷命中的标题、归档、当前、父会话以本地投影为准', () => {
+    const docs = [
+      doc({
+        conversationId: 'c1',
+        title: '多角度调研',
+        isCurrent: true,
+        parentConversationId: 'p',
+      }),
+    ];
+    const [hit] = mergeWorkspaceHits(docs, [], [coldHit('c1')], 'term', baseOptions);
+    expect(hit).toMatchObject({
+      conversationId: 'c1',
+      title: '多角度调研',
+      field: 'body',
+      snippet: 'cold term body',
+      isCurrent: true,
+      parentConversationId: 'p',
+    });
+  });
+
+  it('本地投影里没有的会话（打不开）丢弃', () => {
+    expect(mergeWorkspaceHits([], [], [coldHit('ghost')], 'term', baseOptions)).toEqual([]);
+  });
+
+  it('冷命中按范围过滤归档与草稿', () => {
+    const docs = [
+      doc({ conversationId: 'archived', archived: true }),
+      doc({ conversationId: 'draft', isDraftEmpty: true }),
+    ];
+    const cold = [coldHit('archived'), coldHit('draft')];
+    const all = { ...baseOptions, scope: 'all' as const };
+    expect(mergeWorkspaceHits(docs, [], cold, 'term', all)).toEqual([]);
+    const withArchived = mergeWorkspaceHits(docs, [], cold, 'term', {
+      ...baseOptions,
+      scope: 'all-including-archived',
+    });
+    expect(withArchived.map((hit) => [hit.conversationId, hit.archived])).toEqual([
+      ['archived', true],
+    ]);
+  });
+
+  it('同一会话热命中优先', () => {
+    const docs = [doc({ conversationId: 'c1', title: 'term' })];
+    const hot = searchWorkspace(docs, 'term', baseOptions);
+    const merged = mergeWorkspaceHits(docs, hot, [coldHit('c1')], 'term', baseOptions);
+    expect(merged.map((hit) => hit.field)).toEqual(['title']);
+  });
+
+  it('合并后按同一排序规则重排：当前项目正文排在其他项目正文之前', () => {
+    const docs = [
+      doc({
+        conversationId: 'other-hot',
+        projectId: 'proj-b',
+        lastActiveAt: 9000,
+        fields: [{ field: 'body', text: 'term in other project' }],
+      }),
+      doc({ conversationId: 'current-cold', lastActiveAt: 1000 }),
+    ];
+    const options = { ...baseOptions, scope: 'all' as const };
+    const hot = searchWorkspace(docs, 'term', options);
+    const merged = mergeWorkspaceHits(docs, hot, [coldHit('current-cold')], 'term', options);
+    expect(merged.map((hit) => hit.conversationId)).toEqual(['current-cold', 'other-hot']);
+  });
+});
+
+describe('cycleWorkspaceSearchScope', () => {
+  it('Tab 依次 当前项目 → 全部项目 → 含归档 → 当前项目', () => {
+    expect(cycleWorkspaceSearchScope('project')).toBe('all');
+    expect(cycleWorkspaceSearchScope('all')).toBe('all-including-archived');
+    expect(cycleWorkspaceSearchScope('all-including-archived')).toBe('project');
+  });
+
+  it('Shift+Tab 反向', () => {
+    expect(cycleWorkspaceSearchScope('project', true)).toBe('all-including-archived');
+    expect(cycleWorkspaceSearchScope('all', true)).toBe('project');
+  });
+});
+
+describe('highlightWorkspaceMatches', () => {
+  const marked = (text: string, query: string) =>
+    highlightWorkspaceMatches(text, query)
+      .map((part) => (part.match ? `[${part.text}]` : part.text))
+      .join('');
+
+  it('按词首前缀大小写不敏感高亮，与搜索命中规则一致', () => {
+    expect(marked('Cart discount logic', 'cart DIS')).toBe('[Cart] [dis]count logic');
+  });
+
+  it('不高亮词中间的片段', () => {
+    expect(marked('recart discount', 'cart count')).toBe('recart discount');
+  });
+
+  it('同一个词出现多次时全部高亮', () => {
+    expect(marked('fix cart, then cart-test', 'cart')).toBe('fix [cart], then [cart]-test');
+  });
+
+  it('中文按子串高亮', () => {
+    expect(marked('修复购物车折扣逻辑', '折扣')).toBe('修复购物车[折扣]逻辑');
+  });
+
+  it('重叠的查询词合并为一段', () => {
+    expect(marked('cart', 'ca cart')).toBe('[cart]');
+  });
+
+  it('空查询或无命中返回原文', () => {
+    expect(highlightWorkspaceMatches('Cart', '  ')).toEqual([{ text: 'Cart', match: false }]);
+    expect(highlightWorkspaceMatches('Cart', 'zzz')).toEqual([{ text: 'Cart', match: false }]);
   });
 });

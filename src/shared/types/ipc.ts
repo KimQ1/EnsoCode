@@ -89,6 +89,7 @@ export const IPC_CHANNELS = {
   ASSETS_SCAN_LOCAL: 'assets:scan-local',
   ASSETS_COLLECT_IMPORT: 'assets:collect-import',
   ASSETS_LIST_PROJECT_SKILLS: 'assets:list-project-skills',
+  ASSETS_LIST_WORKFLOW_PRESETS: 'assets:list-workflow-presets',
   ASSETS_SKILL_OCCUPANCY: 'assets:skill-occupancy',
   ASSETS_INSTRUCTION_OCCUPANCY: 'assets:instruction-occupancy',
   ASSETS_MCP_OCCUPANCY: 'assets:mcp-occupancy',
@@ -106,6 +107,11 @@ export const IPC_CHANNELS = {
   INSTRUCTIONS_WRITE: 'instructions:write',
   INSTRUCTIONS_WRITE_SOURCE: 'instructions:write-source',
   INSTRUCTIONS_DELETE: 'instructions:delete',
+  // Settings-managed workflow presets (userData/agent/workflows)
+  WORKFLOW_PRESETS_LIST: 'workflow-presets:list',
+  WORKFLOW_PRESETS_READ: 'workflow-presets:read',
+  WORKFLOW_PRESETS_SAVE: 'workflow-presets:save',
+  WORKFLOW_PRESETS_DELETE: 'workflow-presets:delete',
 
   // Preset custom system prompt content (UUID-backed external files)
   PRESETS_SYSTEM_PROMPT_READ: 'presets:system-prompt-read',
@@ -133,11 +139,14 @@ export const IPC_CHANNELS = {
   AGENT_SET_REASONING: 'agent:set-reasoning',
   AGENT_APPROVAL_RESPOND: 'agent:approval-respond',
   AGENT_SET_APPROVAL_MODE: 'agent:set-approval-mode',
+  AGENT_SET_PLAN_MODE: 'agent:set-plan-mode',
+  AGENT_PLAN_RESPOND: 'agent:plan-respond',
   NOTIFICATION_FOCUS_SESSION: 'notification:focus-session',
   /** renderer → main：上报当前正在查看的会话，供系统通知抑制判断 */
   NOTIFICATION_ACTIVE_SESSION: 'notification:active-session',
   AGENT_TASK_STOP: 'agent:task-stop',
   AGENT_SUBAGENT_STOP: 'agent:subagent-stop',
+  AGENT_WORKFLOW_STOP: 'agent:workflow-stop',
   AGENT_REWIND: 'agent:rewind',
   /** 手动压缩会话上下文（/compact 与上下文面板按钮共用） */
   AGENT_COMPACT: 'agent:compact',
@@ -190,8 +199,10 @@ export const IPC_CHANNELS = {
 
   // Recent projects from local apps
   PROJECTS_GET_RECENT: 'projects:get-recent',
-  /** 在系统文件管理器里打开项目根目录或会话 worktree（仅本地项目） */
+  /** 在系统文件管理器或指定 appId 的应用里打开项目根目录或会话 worktree（仅本地项目） */
   PROJECTS_REVEAL: 'projects:reveal',
+  /** 列出本机已安装、可打开项目目录的编辑器 / 终端 */
+  PROJECTS_OPEN_IN_APPS: 'projects:open-in-apps',
 
   // SSH connection profiles (settings + add-project picker)
   SSH_CONNECTIONS_LIST: 'ssh-connections:list',

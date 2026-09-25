@@ -1,10 +1,12 @@
 import type { RendererAgentEvent, SessionSnapshot } from '@shared/types/agent';
+import { PROJECTED_FILE_TEXT_LIMIT } from '@shared/types/fileChanges';
 import { describe, expect, it } from 'vitest';
 import {
   applyAgentEvent,
   applyDispatchEvent,
   applyHistoryPage,
   emptyProjection,
+  retainedOptimisticTail,
   rewindTruncatedNeedsSnapshotResync,
   type SessionProjection,
   truncatedNeedsSnapshotResync,
@@ -656,6 +658,100 @@ describe('applyAgentEvent', () => {
     expect(delivered.messages).toHaveLength(1);
     expect(delivered.messages[0]).not.toHaveProperty('optimistic', true);
     expect(delivered.messages[0].content).toEqual([{ type: 'text', text: expanded }]);
+  });
+
+  it.each([
+    ['带文字', '加个按钮', '加个按钮\n\n'],
+    ['纯图片', '', '\n\n'],
+  ])('pi 追加图片缩放提示的 user upsert 消费乐观回显（%s）', (_, typed, prefix) => {
+    const image = { type: 'image' as const, data: 'x', mimeType: 'image/png' };
+    const hints =
+      '[Image converted from image/webp to image/png.]\n' +
+      '[Image: original 3773x1017, displayed at 2000x539. Multiply coordinates by 1.89 to map to original image.]';
+    const withEcho = {
+      ...base,
+      messages: [
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: typed }, image],
+          optimistic: true as const,
+        },
+      ],
+    };
+    const delivered = applyAgentEvent(withEcho, 's1', {
+      type: 'message-upsert',
+      identity: identity(),
+      seq: 1,
+      index: 0,
+      message: { role: 'user', content: [{ type: 'text', text: prefix + hints }, image] },
+    });
+    expect(delivered.messages).toHaveLength(1);
+    expect(delivered.messages[0]).not.toHaveProperty('optimistic', true);
+  });
+
+  it('超长 user 正文投影被截断后仍消费乐观回显（upsert 与 snapshot）', () => {
+    const typed = 'log line\n'.repeat(8000);
+    const truncated = `${typed.slice(0, PROJECTED_FILE_TEXT_LIMIT)}\n…`;
+    const withEcho = {
+      ...base,
+      messages: [
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: typed }],
+          optimistic: true as const,
+        },
+      ],
+    };
+    const delivered = applyAgentEvent(withEcho, 's1', {
+      type: 'message-upsert',
+      identity: identity(),
+      seq: 1,
+      index: 0,
+      message: { role: 'user', content: [{ type: 'text', text: truncated }] },
+    });
+    expect(delivered.messages).toHaveLength(1);
+    expect(delivered.messages[0]).not.toHaveProperty('optimistic', true);
+    expect(
+      retainedOptimisticTail(withEcho.messages, [
+        { role: 'user', content: [{ type: 'text', text: truncated }] },
+      ])
+    ).toEqual([]);
+  });
+
+  it('delivery-settled 按 deliveryId 收回文本对不上的乐观回显', () => {
+    const echo = (text: string, deliveryId: string) => ({
+      role: 'user' as const,
+      content: [{ type: 'text' as const, text }],
+      optimistic: true as const,
+      deliveryId,
+    });
+    const withEcho = { ...base, messages: [echo('原文', 'd1'), echo('另一条', 'd2')] };
+    const upserted = applyAgentEvent(withEcho, 's1', {
+      type: 'message-upsert',
+      identity: identity(),
+      seq: 1,
+      index: 0,
+      message: { role: 'user', content: [{ type: 'text', text: '改写后的原文' }] },
+    });
+    expect(upserted.messages.filter((message) => message.optimistic)).toHaveLength(2);
+    const settled = applyAgentEvent(upserted, 's1', {
+      type: 'delivery-settled',
+      identity: identity(),
+      seq: 2,
+      deliveryId: 'd1',
+    });
+    expect(
+      settled.messages.map((message) => (message.content[0] as { text: string }).text)
+    ).toEqual(['改写后的原文', '另一条']);
+    expect(settled.lastSeq).toBe(2);
+    const unknown = applyAgentEvent(settled, 's1', {
+      type: 'delivery-settled',
+      identity: identity(),
+      seq: 3,
+      deliveryId: 'gone',
+    });
+    expect(unknown.messages).toBe(settled.messages);
+    expect(unknown.lastSeq).toBe(3);
   });
 
   it('restored generation replaces the projection and rejects stale generation events', () => {
@@ -1501,5 +1597,55 @@ describe('snapshot running clocks', () => {
     expect(rewindTruncatedNeedsSnapshotResync(40, 42, false)).toBe(false);
     expect(rewindTruncatedNeedsSnapshotResync(undefined, 2, true)).toBe(false);
     expect(rewindTruncatedNeedsSnapshotResync(40, 10, false)).toBe(true);
+  });
+});
+
+describe('Plan 模式投影', () => {
+  const planState = { active: true, resolutions: {} };
+
+  it('plan-state 事件写入投影，过期 seq 丢弃', () => {
+    const next = applyAgentEvent(base, 's1', {
+      type: 'plan-state',
+      identity: identity(),
+      seq: 2,
+      state: planState,
+    });
+    expect(next.planState).toEqual(planState);
+    const stale = applyAgentEvent(next, 's1', {
+      type: 'plan-state',
+      identity: identity(),
+      seq: 1,
+      state: { active: false, resolutions: {} },
+    });
+    expect(stale.planState).toEqual(planState);
+  });
+
+  it('快照带 planState 时覆盖投影', () => {
+    const next = applyAgentEvent(base, 's1', {
+      type: 'snapshot',
+      sessions: [{ ...snapshot(), planState }],
+    });
+    expect(next.planState).toEqual(planState);
+  });
+
+  it('Plan 提示前缀的 user upsert 消费同文乐观回显', () => {
+    const withEcho: SessionProjection = {
+      ...base,
+      messages: [{ role: 'user', content: [{ type: 'text', text: '帮我重构' }], optimistic: true }],
+    };
+    const next = applyAgentEvent(withEcho, 's1', {
+      type: 'message-upsert',
+      identity: identity(),
+      seq: 1,
+      index: 0,
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<plan-mode>\nPlan mode is ON.\n</plan-mode>\n\n帮我重构' },
+        ],
+      },
+    });
+    expect(next.messages).toHaveLength(1);
+    expect(next.messages[0]?.optimistic).toBeUndefined();
   });
 });

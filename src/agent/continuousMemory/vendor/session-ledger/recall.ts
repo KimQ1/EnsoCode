@@ -6,6 +6,7 @@ import {
 	type Observation,
 	type Reflection,
 } from "./types.js";
+import { isSystemMessageEntry } from "../tokens.js";
 
 const SOURCE_TYPES = new Set(["message", "custom_message", "branch_summary"]);
 
@@ -72,7 +73,7 @@ type IndexedObservation = ObservationLedgerLocation & { observation: Observation
 type IndexedReflection = ReflectionLedgerLocation & { reflection: Reflection };
 
 function isSourceEntry(entry: Entry): boolean {
-	return SOURCE_TYPES.has(entry.type);
+	return SOURCE_TYPES.has(entry.type) && !isSystemMessageEntry(entry);
 }
 
 function uniqueById(entries: Entry[]): Entry[] {
@@ -122,8 +123,12 @@ function indexLedger(entries: Entry[]): {
 }
 
 function resolveObservationSources(entries: Entry[], observation: Observation, location: ObservationLedgerLocation): RecalledObservation {
-	const sourceEntryIds = uniqueStrings(observation.sourceEntryIds);
 	const byId = new Map(entries.map((entry) => [entry.id, entry]));
+	// 旧记忆可能引用 system entry：直接滤掉，不算缺失，免得同组有效证据被标成 partial
+	const sourceEntryIds = uniqueStrings(observation.sourceEntryIds).filter((id) => {
+		const entry = byId.get(id);
+		return !entry || !isSystemMessageEntry(entry);
+	});
 	const sourceEntries: Entry[] = [];
 	const missingSourceEntryIds: string[] = [];
 	const nonSourceEntryIds: string[] = [];

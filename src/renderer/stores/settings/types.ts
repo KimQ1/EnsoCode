@@ -20,7 +20,7 @@ import type {
   SkillEntry,
   SubagentModelEntry,
 } from '@shared/types';
-import type { ApprovalMode, ThinkingLevel } from '@shared/types/agent';
+import type { AgentMode, ApprovalMode, ThinkingLevel } from '@shared/types/agent';
 import type { ModelPricing, PricingTable } from '@shared/usage/pricing';
 import type { WindowsLocalShell } from '@shared/windowsLocalShell';
 import type { OauthCredentialSnapshot } from '@/stores/oauthCredentials';
@@ -53,6 +53,8 @@ export type DefaultModelRevalidation =
 
 export type Theme = 'light' | 'dark' | 'system' | 'sync-terminal';
 
+export { ACCENT_COLORS, type AccentColor } from '@shared/accentColor';
+
 export type FontWeight =
   | 'normal'
   | 'bold'
@@ -75,6 +77,8 @@ export type BackgroundSizeMode = 'cover' | 'contain' | 'repeat' | 'center';
 export interface SettingsState {
   // UI
   theme: Theme;
+  /** 界面强调色；写入 `html[data-accent]`，缺省 violet */
+  accentColor: import('@shared/accentColor').AccentColor;
   language: Locale;
 
   // Terminal appearance
@@ -154,14 +158,22 @@ export interface SettingsState {
   compactReadOnlyTools: boolean;
   /** agent 运行中 edit/write 的行到位时自动展开 diff/内容；缺省 true */
   expandLiveEdits: boolean;
+  /** 推理流式输出时自动展开思考块，结束后仍收起；缺省 true，与改前行为一致 */
+  expandLiveReasoning: boolean;
   /** 发送新消息后自动折叠历史轮次，只留最后一轮展开；缺省 false */
   autoCollapseTurns: boolean;
+  /** 回答完成后把连续的思考与工具调用折成一行过程摘要 */
+  collapseCompletedActivity: boolean;
+  /** 输入框上方固定显示最新 todo 清单（仍有未完成项时）；缺省 true */
+  pinUnfinishedTodos: boolean;
   /** 聊天列铺满：去掉两侧阶梯 max-w；缺省 false（居中阅读宽度） */
   chatWide: boolean;
   /** 仅主 agent 发送完成/失败通知；coworker 提问/审批仍提醒；缺省 true */
   notifyMainAgentOnly: boolean;
   /** 同一父会话同时在编 coworker 上限；缺省 5，范围 1–20 */
   maxActiveCoworkers: number;
+  /** SSH 远端单次命令超时（秒）；缺省 30，范围 5–300 */
+  sshTimeoutSeconds: number;
   /** 无 token/工具结果超过此时长则中止；0 = 永不；单位分钟 */
   generationStallTimeoutMin: number;
   /** 闲置超过此天数自动归档；0 = 永不；缺省 30 */
@@ -247,6 +259,10 @@ export interface SettingsState {
   disabledBuiltinAgentTypes: string[];
   /** 被关闭的内置工具（id 集合;默认全开） */
   disabledBuiltinTools: string[];
+  /** 被关闭的内置工作流预设（id 集合;默认全开） */
+  disabledWorkflowPresets: string[];
+  /** 统一 subagent 工具允许创建的 Agent 模式。 */
+  subagentAllowedModes: AgentMode[];
 
   /** 是否已完成首次运行引导；老用户（已有配置）视为已完成 */
   onboarded: boolean;
@@ -264,6 +280,7 @@ export interface SettingsState {
 
   // Setters
   setTheme: (theme: Theme) => void;
+  setAccentColor: (accent: import('@shared/accentColor').AccentColor) => void;
   setLanguage: (language: Locale) => void;
   setTerminalTheme: (theme: string) => void;
   setTerminalFontSize: (size: number) => void;
@@ -296,10 +313,14 @@ export interface SettingsState {
   setOpenChangesOnFileEdit: (value: boolean) => void;
   setCompactReadOnlyTools: (value: boolean) => void;
   setExpandLiveEdits: (value: boolean) => void;
+  setExpandLiveReasoning: (value: boolean) => void;
   setAutoCollapseTurns: (value: boolean) => void;
+  setCollapseCompletedActivity: (value: boolean) => void;
+  setPinUnfinishedTodos: (value: boolean) => void;
   setChatWide: (value: boolean) => void;
   setNotifyMainAgentOnly: (value: boolean) => void;
   setMaxActiveCoworkers: (value: number) => void;
+  setSshTimeoutSeconds: (value: number) => void;
   setGenerationStallTimeoutMin: (minutes: number) => void;
   setAutoArchiveIdleDays: (days: number) => void;
   setAutoArchiveMergedWorktrees: (value: boolean) => void;
@@ -391,6 +412,8 @@ export interface SettingsState {
   removeAgentType: (id: string) => void;
   toggleBuiltinAgentType: (name: string, enabled: boolean) => void;
   toggleBuiltinTool: (id: string, enabled: boolean) => void;
+  toggleWorkflowPreset: (id: string, enabled: boolean) => void;
+  setSubagentAllowedModes: (modes: AgentMode[]) => void;
 
   // Onboarding
   setOnboarded: (value: boolean) => void;
@@ -439,6 +462,8 @@ export interface SettingsState {
   ) => void;
   /** null = 跟随全局；数组覆盖全局（空 = 本项目全开） */
   setProjectDisabledBuiltinTools: (projectId: string, disabled: string[] | null) => void;
+  /** null = 跟随全局；数组是项目级显式权限掩码。 */
+  setProjectSubagentAllowedModes: (projectId: string, modes: AgentMode[] | null) => void;
 
   /** 非法条目不写入，返回 false */
   setUsageModelPricing: (modelId: string, pricing: ModelPricing) => boolean;

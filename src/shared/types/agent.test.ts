@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseAgentCommand,
+  parseAgentControlToolRequest,
   parseAgentSessionCustomEntry,
   parseAgentWorkerEvent,
   parseChildSessionIdentity,
@@ -73,7 +74,112 @@ const receipt = {
   sequence: 0,
 };
 
-describe('workspace switch internal protocol', () => {
+describe('agent control tool protocol', () => {
+  it('accepts normalized spawn/send/wait requests with bounded gate shape', () => {
+    expect(
+      parseAgentControlToolRequest({
+        operation: 'spawn',
+        mode: 'task',
+        description: 'review',
+        prompt: 'review it',
+        wait: false,
+        gate: { commandRef: 'tests' },
+      })
+    ).not.toBeNull();
+    expect(
+      parseAgentControlToolRequest({
+        operation: 'send',
+        agentId: 'agent-1',
+        message: 'fix issue',
+        delivery: 'next',
+        wait: false,
+        gate: { commandRef: 'tests' },
+      })
+    ).not.toBeNull();
+    expect(
+      parseAgentControlToolRequest({
+        operation: 'wait',
+        runIds: ['run-1', 'run-2'],
+        until: 'any',
+        timeoutMs: 100,
+      })
+    ).not.toBeNull();
+  });
+
+  it('rejects invalid operation combinations, duplicate waits and free shell gate', () => {
+    for (const request of [
+      {
+        operation: 'spawn',
+        mode: 'task',
+        description: 'x',
+        prompt: 'x',
+        wait: false,
+        agentId: 'x',
+      },
+      {
+        operation: 'send',
+        agentId: 'a',
+        message: 'x',
+        delivery: 'auto',
+        wait: false,
+        mode: 'task',
+      },
+      { operation: 'wait', runIds: ['same', 'same'], until: 'all' },
+      { operation: 'wait', runIds: [], until: 'all' },
+      { operation: 'report', runId: 'r', timeoutMs: 1 },
+      { operation: 'stop', runId: '' },
+      {
+        operation: 'spawn',
+        mode: 'task',
+        description: 'x',
+        prompt: 'x',
+        wait: false,
+        gate: 'pnpm test',
+      },
+      {
+        operation: 'spawn',
+        mode: 'task',
+        description: 'x',
+        prompt: 'x',
+        wait: false,
+        gate: { argv: [''] },
+      },
+      {
+        operation: 'spawn',
+        mode: 'task',
+        description: 'x',
+        prompt: 'x',
+        wait: false,
+        gate: { argv: ['pnpm', 'test'] },
+      },
+    ]) {
+      expect(parseAgentControlToolRequest(request)).toBeNull();
+    }
+  });
+
+  it('worker RPC binds an exact actor identity and request id in both directions', () => {
+    const request = { operation: 'report', runId: 'run-1' } as const;
+    const invoke = {
+      type: 'agent-control-invoke',
+      identity: parent,
+      seq: 3,
+      requestId: 'rpc-1',
+      request,
+    } as const;
+    expect(parseAgentWorkerEvent(invoke)).toEqual(invoke);
+    expect(
+      parseAgentCommand({
+        type: 'agent-control-result',
+        identity: parent,
+        requestId: 'rpc-1',
+        response: { ok: true, value: { runId: 'run-1' } },
+      })
+    ).not.toBeNull();
+    expect(parseAgentWorkerEvent({ ...invoke, identity: { sessionId: 'parent' } })).toBeNull();
+    expect(parseAgentWorkerEvent({ ...invoke, requestId: '' })).toBeNull();
+    expect(parseAgentCommand({ ...invoke, type: 'agent-control-result' })).toBeNull();
+  });
+
   it('accepts consumption only with exact session generation, sequence and operation nonce', () => {
     const event = {
       type: 'workspace-branch-context-consumed',
@@ -92,6 +198,29 @@ describe('workspace switch internal protocol', () => {
       { requestId: '' },
       { branch: 'wrong' },
       { cwd: '/arbitrary' },
+    ]) {
+      expect(parseAgentWorkerEvent({ ...event, ...patch })).toBeNull();
+    }
+  });
+
+  it.each(['prompt', 'steer'])('%s 命令可带有界的 deliveryId', (type) => {
+    const command = { type, identity: parent, text: 'hi', deliveryId: 'delivery-1' };
+    expect(parseAgentCommand(command)).toEqual(command);
+    expect(parseAgentCommand({ type, identity: parent, text: 'hi' })).not.toBeNull();
+    for (const deliveryId of ['', 42, 'x'.repeat(129)]) {
+      expect(parseAgentCommand({ ...command, deliveryId })).toBeNull();
+    }
+  });
+
+  it('delivery-settled 只接受精确 identity、seq 与 deliveryId', () => {
+    const event = { type: 'delivery-settled', identity: parent, seq: 3, deliveryId: 'delivery-1' };
+    expect(parseAgentWorkerEvent(event)).toEqual(event);
+    for (const patch of [
+      { identity: { sessionId: parent.sessionId } },
+      { seq: -1 },
+      { deliveryId: '' },
+      { deliveryId: 'x'.repeat(129) },
+      { extra: true },
     ]) {
       expect(parseAgentWorkerEvent({ ...event, ...patch })).toBeNull();
     }
@@ -312,6 +441,39 @@ describe('Main-owned source authority contracts', () => {
       parseConversationAuthorityRequest({ requestId: 'c2', conversationId, version: 2 })
     ).not.toBeNull();
     expect(
+      parseConversationAuthorityRequest({
+        requestId: 'c2',
+        conversationId,
+        version: 2,
+        selectionEpoch: 4,
+      })
+    ).toMatchObject({ selectionEpoch: 4 });
+    expect(
+      parseConversationAuthorityRequest({
+        requestId: 'c2',
+        conversationId,
+        version: 2,
+        selectionEpoch: -1,
+      })
+    ).toBeNull();
+    expect(
+      parseConversationAuthorityRequest({
+        requestId: 'c2',
+        conversationId,
+        version: 2,
+        selectionEpoch: 4,
+        selectionBootId: 'boot-a',
+      })
+    ).toMatchObject({ selectionBootId: 'boot-a' });
+    expect(
+      parseConversationAuthorityRequest({
+        requestId: 'c2',
+        conversationId,
+        version: 2,
+        selectionBootId: '',
+      })
+    ).toBeNull();
+    expect(
       parseUpdateConversationSelectionRequest({
         requestId: 'c3',
         conversationId,
@@ -353,6 +515,17 @@ describe('parent/child commands', () => {
     expect(parseAgentCommand({ ...base, rolePrompt: 1 })).toBeNull();
   });
 
+  it('workflow-stop 必须 exact identity + 合法 runId', () => {
+    const command = { type: 'workflow-stop', identity: parent, runId: 'run-1' };
+    expect(parseAgentCommand(command)).toEqual(command);
+    expect(
+      parseAgentCommand({ ...command, identity: { ...parent, generation: 'old' } })
+    ).toBeNull();
+    expect(parseAgentCommand({ ...command, runId: '' })).toBeNull();
+    expect(parseAgentCommand({ ...command, runId: 'x'.repeat(81) })).toBeNull();
+    expect(parseAgentCommand({ ...command, extra: 1 })).toBeNull();
+  });
+
   it('subagent-stop 必须 exact identity + 非空 agentId', () => {
     const command = { type: 'subagent-stop', identity: parent, agentId: 'agent-1' };
     expect(parseAgentCommand(command)).toEqual(command);
@@ -376,6 +549,16 @@ describe('parent/child commands', () => {
     expect(parseAgentCommand({ type: 'set-max-active-coworkers', limit: 21 })).toBeNull();
     expect(parseAgentCommand({ type: 'set-max-active-coworkers', limit: 5.5 })).toBeNull();
     expect(parseAgentCommand({ type: 'set-max-active-coworkers' })).toBeNull();
+  });
+
+  it('set-disabled-workflow-presets 只接受合法 id 数组', () => {
+    expect(
+      parseAgentCommand({ type: 'set-disabled-workflow-presets', ids: ['parallel-review'] })
+    ).toEqual({ type: 'set-disabled-workflow-presets', ids: ['parallel-review'] });
+    expect(parseAgentCommand({ type: 'set-disabled-workflow-presets', ids: [] })).not.toBeNull();
+    expect(parseAgentCommand({ type: 'set-disabled-workflow-presets', ids: ['../x'] })).toBeNull();
+    expect(parseAgentCommand({ type: 'set-disabled-workflow-presets', ids: 'x' })).toBeNull();
+    expect(parseAgentCommand({ type: 'set-disabled-workflow-presets' })).toBeNull();
   });
 
   it('spawn-parent 携 editMode:仅接受三个互斥模式', () => {
@@ -535,6 +718,13 @@ describe('parent/child commands', () => {
         remote: { host: 'h', auth: 'key', password: 'nope' },
       })
     ).toBeNull();
+    const withTimeout = { ...base, remote: { host: 'h', auth: 'key', timeoutSeconds: 60 } };
+    expect(parseAgentCommand(withTimeout)).toEqual(withTimeout);
+    for (const timeoutSeconds of [0, 12.5, '60']) {
+      expect(
+        parseAgentCommand({ ...base, remote: { host: 'h', auth: 'key', timeoutSeconds } })
+      ).toBeNull();
+    }
   });
 
   it('release-parent 可解析（Move to worktree 依赖；漏白名单会被 worker 静默丢弃）', () => {

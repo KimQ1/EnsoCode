@@ -1,3 +1,4 @@
+import { truncatedProjectionHead } from '@shared/projectedText';
 import type { ProjectedMessage } from '@shared/types/agent';
 
 export type QueuedCatalogItem = { id: string; text: string; hasImages?: boolean };
@@ -27,9 +28,15 @@ export function captureQueueSendEcho(
     messageId,
     text,
     ...(item.hasImages ? { hasImages: true } : {}),
-    priorMatches: userTexts.filter((entry) => entry === text).length,
+    priorMatches: userTexts.filter((entry) => sameText(text, entry)).length,
     priorUserCount: userTexts.length,
   };
+}
+
+function sameText(text: string, delivered: string): boolean {
+  if (delivered === text) return true;
+  const head = truncatedProjectionHead(delivered);
+  return head !== null && text.trimStart().startsWith(head);
 }
 
 export function withoutQueuedIds(
@@ -57,12 +64,15 @@ export function appendEchoMessages(
 export function retainQueueSendEchoes(
   echoes: readonly QueueSendEcho[],
   sessionId: string,
-  userTexts: readonly string[]
+  userTexts: readonly string[],
+  /** turnSettled：本会话刚从运行中收束。此时已有新 user 落地的回显一律收掉，兜底文本对不上 */
+  opts?: { turnSettled?: boolean }
 ): QueueSendEcho[] {
   return echoes.filter((echo) => {
     if (echo.sessionId !== sessionId) return true;
+    if (opts?.turnSettled && userTexts.length > echo.priorUserCount) return false;
     if (echo.text) {
-      return userTexts.filter((entry) => entry === echo.text).length <= echo.priorMatches;
+      return userTexts.filter((entry) => sameText(echo.text, entry)).length <= echo.priorMatches;
     }
     return userTexts.length <= echo.priorUserCount;
   });

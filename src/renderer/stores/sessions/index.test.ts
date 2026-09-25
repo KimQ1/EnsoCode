@@ -124,11 +124,22 @@ const agentRelease = vi.fn(async (_id: string) => ({ ok: true }));
 const btwSpawn = vi.fn(async () => ({ ok: true }));
 const btwDispose = vi.fn(async () => ({ ok: true }));
 const agentRewind = vi.fn(async () => ({ ok: true }));
+const agentFork = vi.fn(async (_sourceId: string, _targetId: string, _anchor: unknown) => ({
+  ok: true,
+}));
 const requestSnapshot = vi.fn(async () => ({ ok: true }));
+const agentSetPlanMode = vi.fn(
+  async (_id: string, _active: boolean) =>
+    ({ ok: true }) as {
+      ok: boolean;
+      error?: string;
+    }
+);
 
 vi.stubGlobal('navigator', { language: 'en-US' });
 vi.stubGlobal('document', {
   documentElement: {
+    dataset: {},
     lang: 'en',
     classList: { toggle: vi.fn() },
     style: { setProperty: vi.fn(), removeProperty: vi.fn() },
@@ -168,7 +179,9 @@ vi.stubGlobal('window', {
       abort: agentAbort,
       release: agentRelease,
       rewind: agentRewind,
+      fork: agentFork,
       steer: vi.fn(async () => ({ ok: true })),
+      setPlanMode: agentSetPlanMode,
     },
     btw: {
       spawn: btwSpawn,
@@ -502,12 +515,146 @@ describe('typed Agent child projection', () => {
       'parent::cw-child-1',
       'parent::cw-child-2',
     ]);
-    expect(state.conversations.parent.activeTabId).toBe('parent::cw-child-2');
+    expect(state.activeId).toBe('parent');
+    expect(state.conversations.parent.activeTabId).toBeUndefined();
     expect(state.conversations['parent::cw-child-1']).toMatchObject({
       spawning: true,
       child: { agentTypeKey: 'builtin:scout', agentInstanceName: 'Scout · a1' },
     });
     expect(state.conversations.parent.messages).toEqual([]);
+  });
+
+  it('本窗口手动派发才聚焦新 child；正在看别的会话或别的 child 时不抢', async () => {
+    let requestId = '';
+    dispatch.mockImplementation(async (request: { requestId: string }) => {
+      requestId = request.requestId;
+      return {
+        accepted: true,
+        requestId,
+        dispatchId: '123e4567-e89b-42d3-a456-426614174021',
+        child: childIdentity(1),
+      };
+    });
+    const accepted = await sessionsModule.useSessionsStore
+      .getState()
+      .dispatchAgent(
+        'builtin:scout',
+        { text: 'inspect the project', images: [], fileMentions: [] },
+        { providerId: 'parent-provider', modelId: 'parent-model' }
+      );
+    expect(accepted.accepted).toBe(true);
+    const first = reserve(1);
+    if (first.type !== 'child-reserved') throw new Error('expected reservation');
+    onAgentEvent?.({ ...first, requestId });
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.activeTabId).toBe(
+      'parent::cw-child-1'
+    );
+
+    sessionsModule.useSessionsStore.setState((state) => ({
+      activeId: 'other',
+      conversations: {
+        ...state.conversations,
+        other: {
+          ...state.conversations.parent,
+          id: 'other',
+          parentId: undefined,
+          activeTabId: undefined,
+        },
+        parent: { ...state.conversations.parent, activeTabId: 'parent::cw-child-1' },
+      },
+    }));
+    dispatch.mockImplementation(async (request: { requestId: string }) => {
+      requestId = request.requestId;
+      return {
+        accepted: true,
+        requestId,
+        dispatchId: '123e4567-e89b-42d3-a456-426614174022',
+        child: childIdentity(2),
+      };
+    });
+    sessionsModule.useSessionsStore.setState({ activeId: 'parent' });
+    await sessionsModule.useSessionsStore
+      .getState()
+      .dispatchAgent(
+        'builtin:scout',
+        { text: 'second', images: [], fileMentions: [] },
+        { providerId: 'parent-provider', modelId: 'parent-model' }
+      );
+    sessionsModule.useSessionsStore.setState({ activeId: 'other' });
+    const second = reserve(2);
+    if (second.type !== 'child-reserved') throw new Error('expected reservation');
+    onAgentEvent?.({ ...second, requestId });
+    expect(sessionsModule.useSessionsStore.getState().activeId).toBe('other');
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.activeTabId).toBe(
+      'parent::cw-child-1'
+    );
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.coworkerIds).toContain(
+      'parent::cw-child-2'
+    );
+  });
+
+  it('后到的旧 select 不再写回 fork 来源', async () => {
+    const original = selectConversation.getMockImplementation();
+    let releaseOld: () => void = () => {};
+    sourceProjection = {
+      ...sourceProjection,
+      conversations: [
+        ...sourceProjection.conversations,
+        {
+          conversationId: 'old',
+          projectId: 'project',
+          kind: 'root' as const,
+          lifecycle: 'ready' as const,
+          version: 1,
+        },
+      ],
+    };
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        old: { ...state.conversations.parent, id: 'old' },
+      },
+    }));
+    selectConversation.mockImplementation(async (request: { conversationId: string }) => {
+      if (request.conversationId === 'old') {
+        return new Promise((resolve) => {
+          releaseOld = () =>
+            resolve({
+              accepted: true,
+              value: {
+                conversationId: 'old',
+                projectId: 'project',
+                kind: 'root',
+                lifecycle: 'ready',
+                version: 1,
+                forkedFrom: { conversationId: 'origin-conversation', entryId: 'entry-1' },
+              },
+            });
+        });
+      }
+      return {
+        accepted: true as const,
+        value: sourceProjection.conversations.find(
+          (conversation) => conversation.conversationId === request.conversationId
+        )!,
+      };
+    });
+    try {
+      sessionsModule.useSessionsStore.getState().selectConversation('old');
+      sessionsModule.useSessionsStore.getState().selectConversation('parent');
+      await vi.waitFor(() =>
+        expect(selectConversation).toHaveBeenCalledWith(
+          expect.objectContaining({ conversationId: 'parent', selectionEpoch: expect.any(Number) })
+        )
+      );
+      releaseOld();
+      await Promise.resolve();
+      expect(
+        sessionsModule.useSessionsStore.getState().conversations.old.forkedFromConversationId
+      ).toBeUndefined();
+    } finally {
+      if (original) selectConversation.mockImplementation(original);
+    }
   });
 
   it('keeps child task, ASK, receipt history, and stale generation handling in the child TAB', () => {
@@ -968,6 +1115,50 @@ describe('typed Agent child projection', () => {
       await Promise.resolve();
       expect(readChildHistory).not.toHaveBeenCalled();
     });
+
+    it('冷缓存清掉正文后清掉已尝试标记，再打开会重读', async () => {
+      try {
+        endedChild();
+        readChildHistory.mockResolvedValue({
+          ok: true,
+          projection: {
+            records: [{ type: 'safe-user-text', text: '把主题改成暗色', at: 1 }],
+            partial: false,
+          },
+        } as never);
+        sessionsModule.useSessionsStore.getState().selectTab('parent', 'ended');
+        await vi.waitFor(() =>
+          expect(
+            sessionsModule.useSessionsStore.getState().conversations.ended.messages
+          ).toHaveLength(1)
+        );
+        sessionsModule.useSessionsStore.getState().selectTab('parent', undefined);
+        const leftAt = Date.now();
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(leftAt + MESSAGE_CACHE_TTL_MS + 1);
+        sessionsModule.useSessionsStore.setState((state) => ({
+          conversations: {
+            ...state.conversations,
+            other: {
+              ...state.conversations.parent,
+              id: 'other',
+              parentId: undefined,
+              activeTabId: undefined,
+            },
+          },
+        }));
+        sessionsModule.useSessionsStore.getState().selectConversation('other');
+        expect(sessionsModule.useSessionsStore.getState().conversations.ended.messages).toEqual([]);
+        expect(
+          sessionsModule.useSessionsStore.getState().conversations.ended.historyLoadAttempted
+        ).toBeUndefined();
+        readChildHistory.mockClear();
+        sessionsModule.useSessionsStore.getState().selectTab('parent', 'ended');
+        await vi.waitFor(() => expect(readChildHistory).toHaveBeenCalledTimes(1));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('coworker dismiss 兑底与 ended 标记', () => {
@@ -1063,6 +1254,58 @@ describe('typed Agent child projection', () => {
         sessionsModule.useSessionsStore.getState().conversations['parent::cw-dead'];
       expect(conversation.started).toBe(true);
       expect(conversation.ended).toBeUndefined();
+    });
+
+    it('已预约的 coworker 收到模型后写入 lastModelId，输入栏能显示当前模型', () => {
+      onAgentEvent?.(reserve(1));
+      const child = childIdentity(1);
+      onAgentEvent?.({
+        type: 'coworker-update',
+        identity: child.parent,
+        seq: 2,
+        coworker: {
+          id: child.sessionId,
+          child: {
+            parentId: 'parent',
+            childGeneration: child.generation,
+            agentTypeKey: child.typeKey,
+            agentInstanceId: child.instanceId,
+            agentInstanceName: child.instanceName,
+            dispatchOrigin: 'typed-mention',
+          },
+          name: child.instanceName,
+          agentType: child.typeKey,
+          status: 'running',
+          modelId: 'claude-opus-5',
+          createdAt: 1,
+        },
+      });
+      expect(
+        sessionsModule.useSessionsStore.getState().conversations[child.sessionId].lastModelId
+      ).toBe('claude-opus-5');
+    });
+
+    it('worker 回流的 coworker-update 不带 mode 时保留 Main 预约的 task / coworker 模式', () => {
+      const reserved = reserve(1);
+      if (reserved.type !== 'child-reserved') throw new Error('expected reservation');
+      onAgentEvent?.({ ...reserved, metadata: { ...reserved.metadata, mode: 'task' } });
+      const child = childIdentity(1);
+      onAgentEvent?.({
+        type: 'coworker-update',
+        identity: child.parent,
+        seq: 2,
+        coworker: {
+          id: child.sessionId,
+          child: { ...reserved.metadata },
+          name: child.instanceName,
+          agentType: child.typeKey,
+          status: 'running',
+          createdAt: 1,
+        },
+      });
+      expect(
+        sessionsModule.useSessionsStore.getState().conversations[child.sessionId].child?.mode
+      ).toBe('task');
     });
   });
 
@@ -1866,7 +2109,13 @@ describe('typed Agent child projection', () => {
     }));
     await pending;
 
-    expect(agentPrompt).toHaveBeenCalledWith('parent', 'urgent', undefined);
+    expect(agentPrompt).toHaveBeenCalledWith('parent', 'urgent', undefined, expect.any(String));
+    const echo = sessionsModule.useSessionsStore
+      .getState()
+      .conversations.parent.messages.find((message) => message.optimistic);
+    // 投递标识与回显一致，worker 回执 delivery-settled 才能精确收回它
+    expect(echo?.deliveryId).toBe((agentPrompt.mock.calls.at(-1) as unknown[] | undefined)?.[3]);
+    expect(echo?.deliveryId).toEqual(expect.any(String));
     expect(
       sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages
     ).toHaveLength(0);
@@ -1951,7 +2200,9 @@ describe('typed Agent child projection', () => {
     store.updateQueuedMessage('parent', 'q1', 'after');
     store.sendQueuedNow('parent', 'q1');
 
-    await vi.waitFor(() => expect(agentPrompt).toHaveBeenCalledWith('parent', 'after', images));
+    await vi.waitFor(() =>
+      expect(agentPrompt).toHaveBeenCalledWith('parent', 'after', images, expect.any(String))
+    );
   });
 
   it('仅图片回退事件也把图片交给输入框', () => {
@@ -1965,6 +2216,58 @@ describe('typed Agent child projection', () => {
     expect(sessionsModule.useSessionsStore.getState().conversations.parent).toMatchObject({
       draftImages: [{ data: 'AAAA', mimeType: 'image/png' }],
     });
+  });
+
+  it('运行中每次只 steer 队首一条排队消息', async () => {
+    const steer = vi.mocked(window.electronAPI.agent.steer);
+    steer.mockClear();
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: true,
+          status: 'running' as const,
+          queuedMessages: [
+            { id: 'q1', text: 'first' },
+            { id: 'q2', text: 'second' },
+          ],
+        },
+      },
+    }));
+
+    sessionsModule.useSessionsStore.getState().steerQueued('parent');
+
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(1));
+    expect(steer.mock.calls[0][1]).toBe('first');
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages).toEqual([
+      { id: 'q2', text: 'second' },
+    ]);
+  });
+
+  it('未在运行时不 steer 排队消息', () => {
+    const steer = vi.mocked(window.electronAPI.agent.steer);
+    steer.mockClear();
+    agentPrompt.mockClear();
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: true,
+          status: 'idle' as const,
+          queuedMessages: [{ id: 'q1', text: 'first' }],
+        },
+      },
+    }));
+
+    sessionsModule.useSessionsStore.getState().steerQueued('parent');
+
+    expect(steer).not.toHaveBeenCalled();
+    expect(agentPrompt).not.toHaveBeenCalled();
+    expect(
+      sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages
+    ).toHaveLength(1);
   });
 
   it('连续回退用本次内容成对替换草稿，避免文本和图片串台', () => {
@@ -2057,7 +2360,12 @@ describe('typed Agent child projection', () => {
     });
 
     await vi.waitFor(() =>
-      expect(agentPrompt).toHaveBeenCalledWith('parent', 'after compact', undefined)
+      expect(agentPrompt).toHaveBeenCalledWith(
+        'parent',
+        'after compact',
+        undefined,
+        expect.any(String)
+      )
     );
     expect(
       sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages
@@ -2065,6 +2373,45 @@ describe('typed Agent child projection', () => {
     expect(
       sessionsModule.useSessionsStore.getState().conversations.parent.compaction
     ).toBeUndefined();
+  });
+
+  it('压缩结束时已有投递在途（worker 等压完才起轮）：不再泵下一条', async () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: true,
+          status: 'idle' as const,
+          generation: 'pg1',
+          compaction: 'running',
+          messages: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'in flight' }],
+              timestamp: 1,
+              optimistic: true,
+              deliveryId: 'd1',
+            },
+          ],
+          queuedMessages: [{ id: 'q2', text: 'next' }],
+        },
+      },
+    }));
+    agentPrompt.mockClear();
+
+    onAgentEvent?.({
+      type: 'compaction',
+      identity: { sessionId: 'parent', generation: 'pg1' },
+      seq: 1,
+      state: 'end',
+    });
+    await Promise.resolve();
+
+    expect(agentPrompt).not.toHaveBeenCalled();
+    expect(sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages).toEqual([
+      { id: 'q2', text: 'next' },
+    ]);
   });
 
   it('轮次结束时压缩仍在排队则不投递，等压缩结束再发', async () => {
@@ -2101,7 +2448,12 @@ describe('typed Agent child projection', () => {
       state: 'end',
     });
     await vi.waitFor(() =>
-      expect(agentPrompt).toHaveBeenCalledWith('parent', 'wait for compact', undefined)
+      expect(agentPrompt).toHaveBeenCalledWith(
+        'parent',
+        'wait for compact',
+        undefined,
+        expect.any(String)
+      )
     );
   });
 
@@ -2148,7 +2500,12 @@ describe('typed Agent child projection', () => {
     }));
     onAgentEvent?.(snapshot);
     await vi.waitFor(() =>
-      expect(agentPrompt).toHaveBeenCalledWith('parent', 'after reload', undefined)
+      expect(agentPrompt).toHaveBeenCalledWith(
+        'parent',
+        'after reload',
+        undefined,
+        expect.any(String)
+      )
     );
     expect(
       sessionsModule.useSessionsStore.getState().conversations.parent.queuedMessages
@@ -2199,7 +2556,8 @@ describe('typed Agent child projection', () => {
         expect(agentPrompt).toHaveBeenCalledWith(
           'parent',
           expect.stringContaining('<goal-continuation>'),
-          undefined
+          undefined,
+          expect.any(String)
         )
       );
       expect(sessionsModule.useSessionsStore.getState().conversations.parent.goal).toMatchObject({
@@ -2677,6 +3035,12 @@ describe('parent history tail hydrate', () => {
 
   it('worker 释放冷会话（parent-ended）时清掉可能掉队的正文，切回走尾窗', () => {
     seedReleasable('released');
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        released: { ...state.conversations.released, historyLoadAttempted: true },
+      },
+    }));
     onAgentEvent?.({
       type: 'parent-ended',
       identity: { sessionId: 'released', generation: 'g1' },
@@ -2688,6 +3052,7 @@ describe('parent history tail hydrate', () => {
     expect(released.messages).toEqual([]);
     expect(released.customEntries).toEqual([]);
     expect(released.historyBaseIndex).toBeUndefined();
+    expect(released.historyLoadAttempted).toBeUndefined();
     readParentHistoryTail.mockClear();
     sessionsModule.useSessionsStore.getState().selectConversation('released');
     expect(readParentHistoryTail).toHaveBeenCalledWith('released');
@@ -2752,6 +3117,45 @@ describe('parent history tail hydrate', () => {
     expect(phoneFed.generation).toBe('g1');
   });
 
+  it('冷会话正文本来就是空时，快照不清掉失败标记', () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        emptyCold: {
+          ...state.conversations.parent,
+          id: 'emptyCold',
+          parentId: undefined,
+          activeTabId: undefined,
+          started: true,
+          spawning: false,
+          status: 'idle',
+          generation: 'g1',
+          sessionFile: '/tmp/emptyCold.jsonl',
+          messages: [],
+          customEntries: [],
+          historyLoadAttempted: true,
+        },
+      },
+      order: ['parent', 'emptyCold'],
+      activeId: 'parent',
+    }));
+    onAgentEvent?.({
+      type: 'snapshot',
+      partial: true,
+      sessions: [
+        {
+          identity: { sessionId: 'emptyCold', generation: 'g1' },
+          status: 'idle',
+          messages: [],
+          commands: [],
+        },
+      ],
+    });
+    expect(
+      sessionsModule.useSessionsStore.getState().conversations.emptyCold.historyLoadAttempted
+    ).toBe(true);
+  });
+
   it('空 partial snapshot 带 sessionId：目标不在 worker 则收回 started，正在看就清空并读尾窗', () => {
     sessionsModule.useSessionsStore.setState((state) => ({
       conversations: {
@@ -2777,6 +3181,46 @@ describe('parent history tail hydrate', () => {
     expect(gone.started).toBe(false);
     expect(gone.messages).toEqual([]);
     expect(readParentHistoryTail).toHaveBeenCalledWith('gone');
+  });
+
+  it('空 snapshot 清掉已尝试过的正文后仍会再读历史', async () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: { ...state.conversations.parent, activeTabId: 'watched-child' },
+        'watched-child': {
+          ...state.conversations.parent,
+          id: 'watched-child',
+          parentId: 'parent',
+          started: true,
+          spawning: false,
+          status: 'idle',
+          sessionFile: '/tmp/watched-child.jsonl',
+          historyLoadAttempted: true,
+          messages: [{ role: 'assistant', content: [{ type: 'text', text: '前半' }] }],
+        },
+      },
+      activeId: 'parent',
+    }));
+    readChildHistory.mockResolvedValueOnce({
+      ok: true,
+      projection: {
+        records: [{ type: 'safe-assistant-text', text: '补回', at: 1 }],
+        partial: false,
+      },
+    } as never);
+    onAgentEvent?.({
+      type: 'snapshot',
+      partial: true,
+      sessionId: 'watched-child',
+      sessions: [],
+    });
+    await vi.waitFor(() =>
+      expect(
+        sessionsModule.useSessionsStore.getState().conversations['watched-child'].messages
+      ).toHaveLength(1)
+    );
+    expect(readChildHistory).toHaveBeenCalledWith('watched-child');
   });
 
   it('空 partial snapshot 带 sessionId：spawning 中的会话不动', () => {
@@ -2848,6 +3292,78 @@ describe('parent history tail hydrate', () => {
     });
     const message = sessionsModule.useSessionsStore.getState().conversations.leave.messages[0];
     expect((message.content[0] as { text: string }).text).toBe('后半');
+  });
+
+  it('连续切 coworker 时，已过 TTL 的正文马上清掉，不等下一次满 TTL', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const template = sessionsModule.useSessionsStore.getState().conversations.parent;
+    const body = (text: string) => [
+      { role: 'assistant' as const, content: [{ type: 'text' as const, text }] },
+    ];
+    sessionsModule.useSessionsStore.setState({
+      conversations: {
+        parent: {
+          ...template,
+          id: 'parent',
+          parentId: undefined,
+          activeTabId: undefined,
+          coworkerIds: ['cw-a', 'cw-b'],
+          messages: body('parent-body'),
+        },
+        'cw-a': {
+          ...template,
+          id: 'cw-a',
+          parentId: 'parent',
+          activeTabId: undefined,
+          messages: body('a-body'),
+        },
+        'cw-b': {
+          ...template,
+          id: 'cw-b',
+          parentId: 'parent',
+          activeTabId: undefined,
+          messages: body('b-body'),
+        },
+      },
+      order: ['parent'],
+      activeId: 'parent',
+    });
+    const store = sessionsModule.useSessionsStore.getState();
+    // 先钉住当前视图再写正文，避免沿用上一个测试留下的过期盖章。
+    try {
+      store.selectTab('parent', undefined);
+      sessionsModule.useSessionsStore.setState((state) => ({
+        conversations: {
+          ...state.conversations,
+          parent: {
+            ...state.conversations.parent,
+            activeTabId: undefined,
+            messages: body('parent-body'),
+          },
+          'cw-a': { ...state.conversations['cw-a'], messages: body('a-body') },
+          'cw-b': { ...state.conversations['cw-b'], messages: body('b-body') },
+        },
+      }));
+      store.selectTab('parent', 'cw-a');
+      // 若 cw-b 还带着过期盖章，上面这次切换会清掉它；补回后再离开，才算仍在 TTL 内。
+      sessionsModule.useSessionsStore.setState((state) => ({
+        conversations: {
+          ...state.conversations,
+          'cw-b': { ...state.conversations['cw-b'], messages: body('b-body') },
+        },
+      }));
+      store.selectTab('parent', 'cw-b');
+      vi.setSystemTime(10_000 + MESSAGE_CACHE_TTL_MS);
+      store.selectTab('parent', undefined);
+
+      const conversations = sessionsModule.useSessionsStore.getState().conversations;
+      expect(conversations['cw-a'].messages).toEqual([]);
+      expect(conversations['cw-b'].messages).toEqual(body('b-body'));
+      expect(conversations.parent.messages).toEqual(body('parent-body'));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('冷会话的可见输出仍续 lastOutputAt（节流），正文不落地，用户消息不算', () => {
@@ -3707,6 +4223,73 @@ describe('rewind 在 failed 状态放行、running 仍拦截', () => {
     expect(agentSpawn).not.toHaveBeenCalled();
     expect(agentRewind).not.toHaveBeenCalled();
   });
+
+  it('冷加载主会话分支：先 resume，含该会话 snapshot 后才 fork', async () => {
+    enableRewindResumeModel();
+    agentFork.mockClear();
+    let finishSpawn: ((value: { ok: true }) => void) | undefined;
+    agentSpawn.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSpawn = resolve;
+        })
+    );
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: false,
+          spawning: false,
+          status: 'idle' as const,
+          sessionFile: '/tmp/cold.jsonl',
+          lastProviderId: 'p1',
+          lastModelId: 'm1',
+        },
+      },
+    }));
+    nextConversationId = 'forked';
+    const forked = sessionsModule.useSessionsStore.getState().forkFromMessage('parent', 1);
+    await vi.waitFor(() =>
+      expect(agentSpawn).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: 'parent', resumeFile: '/tmp/cold.jsonl' })
+      )
+    );
+    finishSpawn?.({ ok: true });
+    await vi.waitFor(() =>
+      expect(sessionsModule.useSessionsStore.getState().conversations.parent.started).toBe(true)
+    );
+    expect(agentFork).not.toHaveBeenCalled();
+    emitRewindSnapshot();
+    await expect(forked).resolves.toBe('forked');
+    expect(agentFork).toHaveBeenCalledWith('parent', 'forked', { userIndexFromEnd: 1 });
+  });
+
+  it('冷会话 resume 失败不 fork、不建分支会话', async () => {
+    enableRewindResumeModel();
+    agentFork.mockClear();
+    agentSpawn.mockResolvedValueOnce({ ok: false });
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        parent: {
+          ...state.conversations.parent,
+          started: false,
+          spawning: false,
+          status: 'idle' as const,
+          sessionFile: '/tmp/cold.jsonl',
+          lastProviderId: 'p1',
+          lastModelId: 'm1',
+        },
+      },
+    }));
+    nextConversationId = 'forked';
+    await expect(
+      sessionsModule.useSessionsStore.getState().forkFromMessage('parent', 0)
+    ).resolves.toBe(null);
+    expect(agentFork).not.toHaveBeenCalled();
+    expect(sessionsModule.useSessionsStore.getState().conversations.forked).toBeUndefined();
+  });
 });
 
 describe('btw session send', () => {
@@ -3849,5 +4432,72 @@ describe('btw session send', () => {
     expect(messages?.some((message) => message.optimistic)).toBe(false);
     expect(messages?.some((message) => message.role === 'assistant')).toBe(true);
     expect(JSON.stringify(messages)).toContain('用的是 bash');
+  });
+});
+
+describe('Plan 模式', () => {
+  beforeAll(async () => {
+    settingsModule ??= await import('../settings');
+    sessionsModule ??= await import('./index');
+  });
+
+  beforeEach(async () => {
+    nextConversationId = 'plan-parent';
+    sourceProjection = {
+      projects: [
+        { projectId: 'project', canonicalPath: '/workspace', state: 'active', version: 1 },
+      ],
+      conversations: [],
+    };
+    sessionsModule.useSessionsStore.setState({
+      conversations: {},
+      order: [],
+      activeId: null,
+      pendingAgentPrefill: undefined,
+    });
+    settingsModule.useSettingsStore.setState({
+      projects: [{ id: 'project', name: 'Project', path: '/workspace' }],
+    });
+    await seedParent();
+    agentSpawn.mockClear();
+    agentPrompt.mockClear();
+    agentSetPlanMode.mockClear();
+  });
+
+  const conv = () => sessionsModule.useSessionsStore.getState().conversations['plan-parent'];
+  const target = { providerId: 'provider-1', modelId: 'model-1', cwd: '/workspace' };
+
+  it('未启动时 /plan 正文：开启 Plan 随 spawn 下发，正文照常发送', async () => {
+    await sessionsModule.useSessionsStore.getState().send('/plan 帮我重构登录', target);
+    expect(conv()?.planState?.active).toBe(true);
+    expect(agentSetPlanMode).not.toHaveBeenCalled();
+    expect(agentSpawn).toHaveBeenCalledWith(expect.objectContaining({ planMode: true }));
+    expect(agentPrompt).toHaveBeenCalledWith(
+      'plan-parent',
+      '帮我重构登录',
+      undefined,
+      expect.anything()
+    );
+  });
+
+  it('已启动时 /plan off 即时下发且不发消息；下发失败回滚', async () => {
+    sessionsModule.useSessionsStore.setState((state) => ({
+      conversations: {
+        ...state.conversations,
+        'plan-parent': {
+          ...state.conversations['plan-parent'],
+          started: true,
+          planState: { active: true, resolutions: {} },
+        },
+      },
+    }));
+    await sessionsModule.useSessionsStore.getState().send('/plan off', target);
+    expect(agentSetPlanMode).toHaveBeenCalledWith('plan-parent', false);
+    expect(agentPrompt).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(conv()?.planState?.active).toBe(false));
+
+    agentSetPlanMode.mockResolvedValueOnce({ ok: false, error: 'stale' });
+    sessionsModule.useSessionsStore.getState().setPlanMode('plan-parent', true);
+    await vi.waitFor(() => expect(conv()?.planState?.active).toBe(false));
   });
 });

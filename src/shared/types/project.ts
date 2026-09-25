@@ -38,6 +38,8 @@ export interface Project {
    * 新建或冷恢复会话生效。
    */
   disabledBuiltinTools?: string[];
+  /** 本项目允许统一 subagent 工具创建的 Agent 模式；缺省跟随全局。 */
+  subagentAllowedModes?: ('task' | 'coworker')[];
 }
 
 /** 从本地编辑器 / 编程应用读到的最近打开目录 */
@@ -45,4 +47,13 @@ export interface RecentProject {
   path: string;
   displayPath: string;
   sourceName: string;
+}
+
+/** 本机已安装、可用于打开项目目录的编辑器 / 终端（id 是注册表标识，不是路径） */
+export interface OpenInApp {
+  id: string;
+  name: string;
+  kind: 'editor' | 'terminal';
+  /** PNG data URL */
+  icon?: string;
 }

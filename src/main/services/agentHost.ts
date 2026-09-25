@@ -12,6 +12,11 @@ import {
   type SessionIdentity,
 } from '@shared/builtinAgents';
 import type { CapabilityExecutionEnvelope } from '@shared/capabilities/types';
+import {
+  type ChildProfileToolOptions,
+  childProfileShell,
+  childProfileToolIds,
+} from '@shared/childProfileTools';
 import { resolveCompactStrategy } from '@shared/compactStrategy';
 import {
   type DefaultModelRef,
@@ -66,6 +71,7 @@ import {
   type ModelThinkingLevelOverride,
 } from '@shared/types/llm';
 import type { AgentDispatchTask } from '@shared/types/mentions';
+import { parseDisabledWorkflowPresets } from '@shared/types/workflow';
 import { parseWindowsLocalShell } from '@shared/windowsLocalShell';
 import { app, type UtilityProcess, utilityProcess } from 'electron';
 import { ENSO_SYSTEM_PROMPT } from '../../agent/ensoPrompt';
@@ -97,6 +103,7 @@ export type AgentTypeResolution =
       config: ResolvedAgentTypeSpawnConfig;
       expectedModel: ModelRef;
       expectedToolIds: readonly string[];
+      allowsModelOverride?: boolean;
     }
   | { ok: false; error: string };
 
@@ -136,13 +143,22 @@ export function setAgentEventListener(
   onEvent = listener;
 }
 
+/** worker 数据根（ENSO_AGENT_DATA_DIR）；worker 在其下读 workflows/ 等 Main 写入的内容。 */
+export function agentDataDir(): string {
+  return path.join(app.getPath('userData'), 'agent');
+}
+
+export function customWorkflowPresetDir(): string {
+  return path.join(agentDataDir(), 'workflows');
+}
+
 export function startAgentWorker(): void {
   if (worker) return;
   const child = utilityProcess.fork(agentWorkerPath, [], {
     serviceName: 'enso-agent-worker',
     env: {
       ...process.env,
-      ENSO_AGENT_DATA_DIR: path.join(app.getPath('userData'), 'agent'),
+      ENSO_AGENT_DATA_DIR: agentDataDir(),
       PI_CODING_AGENT_DIR: path.join(app.getPath('userData'), 'agent', 'pi-agent'),
       ENSO_RTK_PATH: bundledRtkPath({
         packaged: app.isPackaged,
@@ -178,6 +194,7 @@ export function startAgentWorker(): void {
     for (const command of queued) child.postMessage(command);
     pushApprovalReviewer();
     pushMaxActiveCoworkers();
+    pushDisabledWorkflowPresets();
   });
   child.on('message', (raw) => {
     const event = parseAgentWorkerEvent(raw);
@@ -351,27 +368,41 @@ export function resolveModelSelection(
   };
 }
 
-export function expectedAgentTypeToolIds(tools: AgentTypeEntry['tools']): readonly string[] {
-  return tools === 'readonly'
-    ? ['read', 'grep', 'find', 'ls', 'message_main_agent', 'message_coworker']
-    : [
-        'read',
-        'grep',
-        'find',
-        'ls',
-        'bash',
-        'edit',
-        'apply_patch',
-        'write',
-        'message_main_agent',
-        'message_coworker',
-      ];
+const parentToolProfiles = new Map<string, ChildProfileToolOptions>();
+
+export interface AgentTypeProfileContext {
+  parentSessionId?: string;
+  projectId?: string;
+  remote?: boolean;
+}
+
+/** 记下父会话 spawn 时下发给 worker 的工具档。事后改设置不能拿来做 proof。 */
+export function rememberParentToolProfile(
+  sessionId: string,
+  profile: ChildProfileToolOptions
+): void {
+  parentToolProfiles.set(sessionId, profile);
+}
+
+export function forgetParentToolProfile(sessionId: string): void {
+  parentToolProfiles.delete(sessionId);
+}
+
+export function expectedAgentTypeToolIds(
+  tools: AgentTypeEntry['tools'],
+  options?: ChildProfileToolOptions & AgentTypeProfileContext
+): readonly string[] {
+  const remembered = options?.parentSessionId
+    ? parentToolProfiles.get(options.parentSessionId)
+    : undefined;
+  return childProfileToolIds(tools, remembered ?? options);
 }
 
 export function resolveAgentTypeSpawnConfig(
   typeKey: AgentTypeKey,
   parentModel: ResolvedModelSelection,
-  authenticatedAccountKeys: ReadonlySet<string>
+  authenticatedAccountKeys: ReadonlySet<string>,
+  context?: AgentTypeProfileContext
 ): AgentTypeResolution {
   const snapshot = agentTypeRegistrySnapshot();
   const candidate = snapshot.candidates.find((entry) => entry.typeKey === typeKey);
@@ -397,6 +428,7 @@ export function resolveAgentTypeSpawnConfig(
       },
       expectedModel: parentModel.ref,
       expectedToolIds: ENSO_LOCKED_PROFILE.toolIds,
+      allowsModelOverride: false,
     };
   }
 
@@ -431,6 +463,23 @@ export function resolveAgentTypeSpawnConfig(
 
   const resources = resolveAgentTypeResources(definition);
   if (!resources.ok) return resources;
+  const disabledTools = resolveDisabledBuiltinTools(state?.disabledBuiltinTools, {
+    disabledBuiltinTools: projectDisabledBuiltinTools(state?.projects, context?.projectId),
+  });
+  const liveProfile: ChildProfileToolOptions = {
+    editMode: resolveEditMode(state?.editMode, state?.hashlineEditEnabled),
+    shell: childProfileShell({
+      platform: process.platform,
+      remote: context?.remote === true,
+      preference: state?.windowsLocalShell,
+    }),
+    exploreFold: state?.exploreFoldEnabled === true,
+    isolatedSandbox: !disabledTools.includes('isolated_sandbox'),
+  };
+  const expectedToolIds = expectedAgentTypeToolIds(definition.tools, {
+    ...liveProfile,
+    ...(context?.parentSessionId ? { parentSessionId: context.parentSessionId } : {}),
+  });
   return {
     ok: true,
     config: {
@@ -441,6 +490,7 @@ export function resolveAgentTypeSpawnConfig(
       systemPrompt: definition.systemPrompt,
       model: selectedModel.config,
       tools: definition.tools,
+      allowedToolIds: expectedToolIds,
       skillPaths: resources.skillPaths,
       skillBindingIds: resources.skillPaths.map(() => randomUUID()),
       mcpServers: resources.mcpServers,
@@ -448,7 +498,15 @@ export function resolveAgentTypeSpawnConfig(
       systemPromptHash: createHash('sha256').update(definition.systemPrompt).digest('hex'),
     },
     expectedModel: selectedModel.ref,
-    expectedToolIds: expectedAgentTypeToolIds(definition.tools),
+    expectedToolIds,
+    allowsModelOverride:
+      (definition.modelMode ??
+        (definition.providerId && definition.modelId
+          ? 'fixed'
+          : typeKey.startsWith('builtin:')
+            ? 'agent_pick'
+            : 'follow')) === 'agent_pick' &&
+      configuredSubagentModels(authenticatedAccountKeys).length > 0,
   };
 }
 
@@ -532,7 +590,7 @@ export function spawnSession(
   const memoryLanguage = typeof state?.memoryLanguage === 'string' ? state.memoryLanguage : 'en';
   // worker 崩溃/退出后不自动拉起的话，所有会话都只能靠重启 app 恢复；在 spawn 入口按需重建
   if (!worker && workerExited) startAgentWorker();
-  return sendAgentCommand({
+  const sent = sendAgentCommand({
     type: 'spawn-parent',
     identity,
     cwd: request.cwd,
@@ -554,6 +612,7 @@ export function spawnSession(
     ...(skillPaths.length > 0 ? { skillPaths } : {}),
     ...(mcpServers.length > 0 ? { mcpServers } : {}),
     ...(request.approvalMode ? { approvalMode: request.approvalMode } : {}),
+    ...(request.planMode !== undefined ? { planMode: request.planMode } : {}),
     ...(approvalReviewerConfig ? { approvalReviewer: approvalReviewerConfig } : {}),
     ...(agentTypes.length > 0 ? { agentTypes } : {}),
     ...(subagentModels.length > 0 ? { subagentModels } : {}),
@@ -563,6 +622,19 @@ export function spawnSession(
     ...(options?.rolePrompt ? { rolePrompt: options.rolePrompt } : {}),
     ...(systemPrompt.content ? { systemPrompt: systemPrompt.content } : {}),
   });
+  if (sent.ok) {
+    rememberParentToolProfile(identity.sessionId, {
+      editMode,
+      shell: childProfileShell({
+        platform: process.platform,
+        remote: remote !== undefined,
+        preference: windowsLocalShell,
+      }),
+      exploreFold: exploreFoldEnabled,
+      isolatedSandbox: !disabledTools.includes('isolated_sandbox'),
+    });
+  }
+  return sent;
 }
 
 export function resolvePresetSystemPrompt(
@@ -721,26 +793,30 @@ export function setSessionReasoning(
 export function promptSession(
   identity: SessionIdentity,
   text: string,
-  images?: AttachedImage[]
+  images?: AttachedImage[],
+  deliveryId?: string
 ): { ok: boolean; error?: string } {
   return sendAgentCommand({
     type: 'prompt',
     identity,
     text,
     ...(images?.length ? { images } : {}),
+    ...(deliveryId ? { deliveryId } : {}),
   });
 }
 
 export function steerSession(
   identity: SessionIdentity,
   text: string,
-  images?: AttachedImage[]
+  images?: AttachedImage[],
+  deliveryId?: string
 ): { ok: boolean; error?: string } {
   return sendAgentCommand({
     type: 'steer',
     identity,
     text,
     ...(images?.length ? { images } : {}),
+    ...(deliveryId ? { deliveryId } : {}),
   });
 }
 
@@ -973,6 +1049,13 @@ export function stopBackgroundTask(
   return sendAgentCommand({ type: 'task-stop', identity, taskId });
 }
 
+export function stopWorkflow(
+  identity: SessionIdentity,
+  runId: string
+): { ok: boolean; error?: string } {
+  return sendAgentCommand({ type: 'workflow-stop', identity, runId });
+}
+
 export function stopSubagent(
   identity: SessionIdentity,
   agentId: string
@@ -1102,6 +1185,30 @@ function configuredSubagentModels(
   return options;
 }
 
+export function resolveSubagentModelSelection(
+  name: string,
+  authenticatedAccountKeys: ReadonlySet<string>
+): { ok: true; selection: ResolvedModelSelection } | { ok: false; error: string } {
+  const selected = configuredSubagentModels(authenticatedAccountKeys).find(
+    (entry) => entry.name === name
+  );
+  if (!selected) return { ok: false, error: `Subagent model is unavailable: ${name}` };
+  return {
+    ok: true,
+    selection: {
+      ref: {
+        providerId: selected.config.settingsProviderId,
+        modelId: selected.config.modelId,
+      },
+      runtimeRef: {
+        providerId: selected.config.oauthAccountKey ?? selected.config.settingsProviderId,
+        modelId: selected.config.modelId,
+      },
+      config: selected.config,
+    },
+  };
+}
+
 function isSubagentModelEntry(value: unknown): value is SubagentModelEntry {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const entry = value as Partial<SubagentModelEntry>;
@@ -1222,6 +1329,14 @@ export function pushMaxActiveCoworkers(): void {
   worker.postMessage({
     type: 'set-max-active-coworkers',
     limit: normalizeMaxActiveCoworkers(readSettingsState()?.maxActiveCoworkers),
+  } satisfies AgentCommand);
+}
+
+export function pushDisabledWorkflowPresets(): void {
+  if (!worker || !workerReady) return;
+  worker.postMessage({
+    type: 'set-disabled-workflow-presets',
+    ids: parseDisabledWorkflowPresets(readSettingsState()?.disabledWorkflowPresets),
   } satisfies AgentCommand);
 }
 

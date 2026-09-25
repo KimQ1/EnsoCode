@@ -7,6 +7,7 @@ import { ApprovalBar } from '@/components/chat/ApprovalBar';
 import { AskBar } from '@/components/chat/AskBar';
 import { Composer } from '@/components/chat/Composer';
 import { ChatHostContext } from '@/components/chat/chatHost';
+import { EnsoMark } from '@/components/chat/EnsoMark';
 import { GoalBar } from '@/components/chat/GoalBar';
 import { MessageQueue } from '@/components/chat/MessageQueue';
 import {
@@ -21,6 +22,7 @@ import { buildTimeline } from '@/stores/sessions/timeline';
 import type { ConnState, SessionView } from './client';
 import { compressImage } from './image';
 import { appendEchoMessages, type QueueSendEcho } from './queueSendEcho';
+import { SessionStatsLine } from './SessionStatsLine';
 import { setDisplayedConversation } from './stubs/sessions-store';
 
 interface Props {
@@ -54,6 +56,8 @@ interface Props {
   echoes?: QueueSendEcho[];
   /** 会话目标（桌面下发）：GoalBar 展示与暂停/继续/清除 */
   goal?: CatalogEntry['goal'];
+  /** 输入框下状态栏的用量统计（桌面下发） */
+  stats?: CatalogEntry['stats'];
   slashCommands?: SlashCommand[];
   onSend(text: string, images: AttachedImage[]): void;
   onAbort(): void;
@@ -259,9 +263,13 @@ export function ChatScreen(props: Props) {
           <div
             ref={tabsRef}
             role="tablist"
-            className="t-tabs flex shrink-0 items-center gap-1 overflow-x-auto border-b px-2 py-1"
+            className="t-tabs relative flex shrink-0 items-center justify-start gap-1 overflow-x-auto border-b px-2 py-1"
           >
-            <span ref={pillRef} aria-hidden="true" className="t-tabs-pill" />
+            <span
+              ref={pillRef}
+              aria-hidden="true"
+              className="t-tabs-pill pointer-events-none absolute top-0 left-0 z-0 rounded-md bg-muted"
+            />
             <button
               type="button"
               role="tab"
@@ -287,7 +295,7 @@ export function ChatScreen(props: Props) {
                   className={cn(
                     'h-1.5 w-1.5 shrink-0 rounded-full',
                     child.status === 'running'
-                      ? 'animate-pulse bg-blue-500'
+                      ? 'animate-pulse bg-brand'
                       : child.status === 'failed'
                         ? 'bg-destructive'
                         : 'bg-muted-foreground/30'
@@ -299,8 +307,11 @@ export function ChatScreen(props: Props) {
         )}
 
         {sessionId === null ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-1 px-6 text-center">
-            <p className="font-medium text-lg">EnsoCode</p>
+          <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+            <span className="mb-3 flex size-11 items-center justify-center rounded-[13px] border border-brand/20 bg-brand/8 text-brand dark:bg-brand/14">
+              <EnsoMark className="size-6" />
+            </span>
+            <p className="font-semibold text-[22px] tracking-tight">EnsoCode</p>
             <p className="text-muted-foreground text-sm">
               {props.connState === 'online' ? '从左上角选择会话，或新建一个' : props.stateLabel}
             </p>
@@ -312,6 +323,7 @@ export function ChatScreen(props: Props) {
             items={timeline}
             // 本地已有正文就不要盖「正在读取历史」；无正文且同步中才是加载态
             busy={view === null ? Boolean(props.syncing) : running}
+            loading={view === null}
             running={running}
             error={undefined}
             emptyTitle={props.projectName || 'EnsoCode'}
@@ -327,7 +339,7 @@ export function ChatScreen(props: Props) {
         {sessionId !== null && (
           // 浏览器里 safe-area 为 0，用 0.5rem 兜底不贴边；standalone 下取
           // home indicator 的实际高度，不再叠加，避免下方留出多余空白
-          <div className="phone-dock @container shrink-0 pt-1 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+          <div className="phone-dock @container shrink-0 pt-1 pb-safe">
             <div className={CHAT_COL}>
               {/* 自动重试横幅：只展示不可取消（pair 桥无 abort-retry 通道，整轮 abort 已够用） */}
               {view?.retry && <RetryBar retry={view.retry} />}
@@ -376,6 +388,7 @@ export function ChatScreen(props: Props) {
                 }}
                 onAbort={props.onAbort}
               />
+              <SessionStatsLine stats={props.stats} />
             </div>
           </div>
         )}

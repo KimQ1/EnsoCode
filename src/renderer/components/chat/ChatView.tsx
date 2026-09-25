@@ -1,6 +1,7 @@
-import { ENSO_AGENT_TYPE_KEY } from '@shared/builtinAgents';
+import { agentTypeDisplayName, ENSO_AGENT_TYPE_KEY } from '@shared/builtinAgents';
 import { conversationDotTone } from '@shared/conversationDotTone';
 import { resolveChatModel, scopedDefaultModels } from '@shared/defaultModel';
+import { planPhase } from '@shared/planMode';
 import type { AgentTypeMentionCandidate } from '@shared/types/mentions';
 import { Loader2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -26,21 +27,34 @@ import { ChatSessionTimeline } from './ChatSessionTimeline';
 import { Composer } from './Composer';
 import { ConversationStatusIndicator } from './ConversationStatusIndicator';
 import { CoworkerTabs } from './CoworkerTabs';
+import { insertComposerText, requestFocusComposer } from './composerMentionBridge';
 import { routeComposerPayload } from './composerRouting';
 import { GoalBar } from './GoalBar';
+import { MarkdownLinkContext } from './Markdown';
 import { MessageQueue } from './MessageQueue';
 import { CHAT_COL, type MessageTimelineHandle } from './MessageTimeline';
 import { ModelPicker } from './ModelPicker';
+import { PlanBar } from './PlanBar';
+import { PlanModeToggle } from './PlanModeToggle';
 import { PresetPicker } from './PresetPicker';
 import { RetryBar } from './RetryBar';
 import { StatsLine } from './StatsLine';
+import { dedupeSlashCommands } from './skillCompletion';
 import { TaskBar } from './TaskBar';
+import { TodoBar } from './TodoBar';
+import { WorkspaceBadge } from './WorkspaceBadge';
 import { WorktreeMissingDialog } from './WorktreeMissingDialog';
 import { WorktreePicker } from './WorktreePicker';
+
+/** 空会话建议：填入输入框并聚焦，由用户确认后再发送 */
+const pickSuggestion = (prompt: string) => {
+  if (insertComposerText(prompt)) requestFocusComposer();
+};
 
 export function ChatView() {
   const { t } = useI18n();
   const providers = useSettingsStore((state) => state.providers);
+  const customAgentTypes = useSettingsStore((state) => state.agentTypes);
   const defaultModel = useSettingsStore((state) => state.defaultModel);
   const projects = useSettingsStore((state) => state.projects);
   const projectGroups = useSettingsStore((state) => state.projectGroups);
@@ -148,6 +162,16 @@ export function ChatView() {
               );
 
   const project = projects.find((p) => p.id === chrome?.projectId);
+  const pickerId = chrome?.id;
+  const [localBranch, setLocalBranch] = useState<{ id: string; branch: string }>();
+  const handleBranchChange = useCallback(
+    (branch: string | undefined) =>
+      setLocalBranch(pickerId && branch ? { id: pickerId, branch } : undefined),
+    [pickerId]
+  );
+  const branch =
+    chrome?.parentWorktreeBranch ??
+    (localBranch?.id === chrome?.parentId ? localBranch?.branch : undefined);
   const skills = useSettingsStore((state) => state.skills);
   const loadLocalSkills = useSettingsStore((state) => state.loadLocalSkills);
   const [projectSkills, setProjectSkills] = useState<{ name: string; description: string }[]>([]);
@@ -182,6 +206,10 @@ export function ChatView() {
       name: '/compact',
       description: t('Compact the context now (/compact [summary focus])'),
     };
+    const plan = {
+      name: '/plan',
+      description: t('Plan mode: research read-only, then approve a plan (/plan [task] · off)'),
+    };
     const fromSettings = skills
       .filter((skill) => skill.enabled !== false)
       .map((skill) => ({
@@ -192,22 +220,21 @@ export function ChatView() {
       name: `/skill:${skill.name}`,
       description: skill.description,
     }));
-    const seen = new Set([
-      goal.name,
-      compact.name,
-      ...fromSettings.map((command) => command.name),
-      ...fromProject.map((command) => command.name),
-    ]);
-    return [
+    // 设置里登记的同名技能优先；项目扫描和会话命令里的副本不再各占一行
+    return dedupeSlashCommands([
       goal,
       compact,
+      plan,
       ...fromSettings,
       ...fromProject,
-      ...chromeCommands.filter((command) => !seen.has(command.name)),
-    ];
+      ...chromeCommands,
+    ]);
   }, [t, skills, projectSkills, chromeCommands]);
 
   const timelineRef = useRef<MessageTimelineHandle>(null);
+  const planning =
+    !chrome?.displayedParentId &&
+    ['planning', 'awaiting_review'].includes(planPhase(chrome?.planState));
   const running = chrome?.status === 'running';
   const busy = chrome?.busy === true;
   const toolCwd = chrome?.parentWorktreePath ?? project?.path;
@@ -252,6 +279,14 @@ export function ChatView() {
     );
   }
 
+  const statusDot = (
+    <StatusDot
+      status={chrome.spawning ? 'running' : chrome.status}
+      pendingAskCount={(chrome.pendingAsks ?? []).length}
+      hasRunningChild={chrome.id === chrome.parentId && chrome.parentHasRunningChild}
+    />
+  );
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <WorktreeMissingDialog conversationId={chrome.parentId} />
@@ -259,28 +294,26 @@ export function ChatView() {
         parentId={chrome.parentId}
         displayedId={chrome.id}
         trailing={
-          <div className="flex min-w-0 shrink-0 items-center gap-1.5 pl-1.5">
-            {project && (
-              <span
-                className="truncate font-mono text-xs text-muted-foreground"
-                title={chrome.parentWorktreePath ?? project.path}
-              >
-                {project.name}
-                {chrome.parentWorktreeBranch ? ` · ${chrome.parentWorktreeBranch}` : ''}
-              </span>
-            )}
-            <StatusDot
-              status={chrome.spawning ? 'running' : chrome.status}
-              pendingAskCount={(chrome.pendingAsks ?? []).length}
-              hasRunningChild={chrome.id === chrome.parentId && chrome.parentHasRunningChild}
-            />
-          </div>
+          project ? (
+            <WorkspaceBadge
+              project={project}
+              conversationId={chrome.parentId}
+              path={chrome.parentWorktreePath ?? project.path}
+              branch={branch}
+              openDisabled={chrome.parentWorktreeMissing}
+            >
+              {statusDot}
+            </WorkspaceBadge>
+          ) : (
+            <div className="flex min-w-0 shrink-0 items-center">{statusDot}</div>
+          )
         }
       />
       <ChatSessionTimeline
         conversationId={chrome.id}
         cwd={toolCwd}
         emptyTitle={project?.name ?? 'EnsoCode'}
+        onSuggestion={project ? pickSuggestion : undefined}
         timelineRef={timelineRef}
       />
 
@@ -307,12 +340,20 @@ export function ChatView() {
               </span>
             </div>
           )}
-          <TaskBar
-            key={chrome.id}
-            sessionId={chrome.id}
-            tasks={chrome.backgroundTasks ?? []}
-            subagents={chrome.subagents ?? []}
-          />
+          <MarkdownLinkContext.Provider
+            value={{
+              conversationId: chrome.id,
+              projectId: chrome.projectId,
+              ...(toolCwd ? { cwd: toolCwd } : {}),
+            }}
+          >
+            <TaskBar
+              key={chrome.id}
+              sessionId={chrome.id}
+              tasks={chrome.backgroundTasks ?? []}
+              subagents={chrome.subagents ?? []}
+            />
+          </MarkdownLinkContext.Provider>
           <ApprovalBar
             key={capabilityApprovals[0]?.requestId ?? 'no-capability-approval'}
             approvals={capabilityApprovals}
@@ -342,8 +383,16 @@ export function ChatView() {
               conversationId={chrome.id}
             />
           )}
+          {!chrome.displayedParentId && (
+            <PlanBar
+              conversationId={chrome.id}
+              planState={chrome.planState}
+              approvalMode={chrome.approvalMode ?? 'full'}
+            />
+          )}
           <MessageQueue conversationId={chrome.id} queued={chrome.queuedMessages ?? []} />
           {chrome.goal && <GoalBar conversationId={chrome.id} goal={chrome.goal} />}
+          <TodoBar key={chrome.id} conversationId={chrome.id} />
           {!chrome.displayedParentId && modelBlockMessage && (
             <div
               role="status"
@@ -364,9 +413,13 @@ export function ChatView() {
               Boolean(chrome.rewinding || chrome.restoringFiles)
             }
             focusKey={chrome.id}
+            planMode={planning}
+            placeholder={planning ? t('Describe the task — a plan comes first') : undefined}
             injectedDraft={chrome.draftText}
             injectedImages={chrome.draftImages}
             onDraftConsumed={() => useSessionsStore.getState().clearDraft(chrome.id)}
+            queuedCount={chrome.queuedMessages?.length ?? 0}
+            onSteerQueued={() => useSessionsStore.getState().steerQueued(chrome.id)}
             initialRecipient={
               chrome.prefillAgentTypeKey === ENSO_AGENT_TYPE_KEY
                 ? ENSO_PREFILL_CANDIDATE
@@ -386,7 +439,16 @@ export function ChatView() {
                         useSessionsStore.getState().setPreset(chrome.id, presetId)
                       }
                     />
-                    <WorktreePicker conversationId={chrome.id} />
+                    <WorktreePicker
+                      conversationId={chrome.id}
+                      onBranchChange={handleBranchChange}
+                    />
+                    <PlanModeToggle
+                      active={chrome.planState?.active ?? false}
+                      onToggle={(active) =>
+                        useSessionsStore.getState().setPlanMode(chrome.id, active)
+                      }
+                    />
                     <ApprovalModePicker
                       mode={chrome.approvalMode ?? 'full'}
                       onSelect={(mode) =>
@@ -414,7 +476,9 @@ export function ChatView() {
                 )}
                 {chrome.displayedParentId && (
                   <span className="text-[11px] text-muted-foreground">
-                    {chrome.agentType ?? 'coworker'}
+                    {chrome.agentType
+                      ? agentTypeDisplayName(chrome.agentType, customAgentTypes)
+                      : 'coworker'}
                     {chrome.lastModelId ? ` · ${chrome.lastModelId}` : ''}
                   </span>
                 )}
@@ -484,5 +548,5 @@ function StatusDot({
   hasRunningChild?: boolean;
 }) {
   const tone = conversationDotTone({ status, pendingAskCount, hasRunningChild });
-  return <ConversationStatusIndicator tone={tone} size="md" title={status} />;
+  return <ConversationStatusIndicator tone={tone} title={status} />;
 }

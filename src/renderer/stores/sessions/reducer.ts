@@ -1,3 +1,5 @@
+import { type PlanState, splitPlanPrefix } from '@shared/planMode';
+import { truncatedProjectionHead } from '@shared/projectedText';
 import {
   type AgentSessionCustomEntry,
   type ApprovalRequestInfo,
@@ -43,12 +45,20 @@ const SKILL_BLOCK =
 const ROLE_PREFIX = /^<role>\n?([\s\S]*?)\n?<\/role>\s*/;
 
 function stripRolePrefix(text: string): string {
-  const match = ROLE_PREFIX.exec(text);
-  return match ? text.slice(match[0].length).trim() : text;
+  const plain = splitPlanPrefix(text).rest;
+  const match = ROLE_PREFIX.exec(plain);
+  return match ? plain.slice(match[0].length).trim() : plain;
 }
 
+// pi prompt 对附图做转换/缩放后会在正文尾部追加 `\n\n[Image …]` 提示行
+const IMAGE_HINTS = /(?:^|\n\n)\[Image[^\n]*\](?:\n\[Image[^\n]*\])*$/;
+
 function sameUserText(optimistic: string, delivered: string): boolean {
-  if (optimistic === delivered || optimistic === stripRolePrefix(delivered)) return true;
+  const plain = stripRolePrefix(delivered);
+  if (optimistic === delivered || optimistic === plain) return true;
+  if (optimistic === plain.replace(IMAGE_HINTS, '')) return true;
+  const head = truncatedProjectionHead(delivered);
+  if (head !== null && optimistic.startsWith(stripRolePrefix(head))) return true;
   const slash = SKILL_SLASH.exec(optimistic);
   const block = SKILL_BLOCK.exec(delivered);
   if (!slash || !block) return false;
@@ -232,6 +242,8 @@ export interface SessionProjection {
   historyBaseIndex?: number;
   /** 上滑翻页在途；不持久化 */
   historyLoading?: boolean;
+  /** 仅父会话：Plan 模式（worker jsonl 折叠结果的投影；未 spawn 时记期望的开关） */
+  planState?: PlanState;
 }
 
 export const emptyProjection: SessionProjection = {
@@ -354,6 +366,7 @@ export function applyAgentEvent(
       toolOutputs: continuingRun ? omitKeys(state.toolOutputs, completedTools) : {},
       toolStartedAt: continuingRun ? omitKeys(state.toolStartedAt ?? {}, completedTools) : {},
       historyBaseIndex: keepPrefix ? localBase : snapBase > 0 ? snapBase : undefined,
+      ...(snapshot.planState ? { planState: snapshot.planState } : {}),
     };
   }
 
@@ -426,6 +439,17 @@ export function applyAgentEvent(
       };
     case 'workspace-branch-context-consumed':
       return { ...state, generation: state.generation ?? identity.generation, lastSeq: event.seq };
+    case 'delivery-settled': {
+      // worker 回执：该投递的 user 消息已上屏；文本匹配没消费掉的回显在此按 id 收回
+      const index = current.messages.findIndex(
+        (message) => message.optimistic && message.deliveryId === event.deliveryId
+      );
+      return {
+        ...current,
+        ...(index === -1 ? {} : { messages: current.messages.toSpliced(index, 1) }),
+        lastSeq: event.seq,
+      };
+    }
     case 'status': {
       const base =
         event.status === 'running'
@@ -636,6 +660,8 @@ export function applyAgentEvent(
         customEntries: [...current.customEntries, event.entry],
         lastSeq: event.seq,
       };
+    case 'plan-state':
+      return { ...current, planState: event.state, lastSeq: event.seq };
     default:
       return { ...current, lastSeq: event.seq };
   }

@@ -101,8 +101,14 @@ function SidePanelSection() {
   const setCompactReadOnlyTools = useSettingsStore((s) => s.setCompactReadOnlyTools);
   const expandLiveEdits = useSettingsStore((s) => s.expandLiveEdits);
   const setExpandLiveEdits = useSettingsStore((s) => s.setExpandLiveEdits);
+  const expandLiveReasoning = useSettingsStore((s) => s.expandLiveReasoning);
+  const setExpandLiveReasoning = useSettingsStore((s) => s.setExpandLiveReasoning);
   const autoCollapseTurns = useSettingsStore((s) => s.autoCollapseTurns);
   const setAutoCollapseTurns = useSettingsStore((s) => s.setAutoCollapseTurns);
+  const collapseCompletedActivity = useSettingsStore((s) => s.collapseCompletedActivity);
+  const setCollapseCompletedActivity = useSettingsStore((s) => s.setCollapseCompletedActivity);
+  const pinUnfinishedTodos = useSettingsStore((s) => s.pinUnfinishedTodos);
+  const setPinUnfinishedTodos = useSettingsStore((s) => s.setPinUnfinishedTodos);
   const generationStallTimeoutMin = useSettingsStore((s) => s.generationStallTimeoutMin);
   const setGenerationStallTimeoutMin = useSettingsStore((s) => s.setGenerationStallTimeoutMin);
   return (
@@ -135,6 +141,15 @@ function SidePanelSection() {
         onChange={setExpandLiveEdits}
       />
       <SwitchRow
+        rowId="general.expandLiveReasoning"
+        title={t('Expand reasoning while streaming')}
+        description={t(
+          'Automatically unfold the thinking block while the model is still reasoning. It collapses again when reasoning ends.'
+        )}
+        checked={expandLiveReasoning}
+        onChange={setExpandLiveReasoning}
+      />
+      <SwitchRow
         rowId="general.autoCollapseTurns"
         title={t('Auto-collapse previous turns')}
         description={t(
@@ -142,6 +157,24 @@ function SidePanelSection() {
         )}
         checked={autoCollapseTurns}
         onChange={setAutoCollapseTurns}
+      />
+      <SwitchRow
+        rowId="general.collapseCompletedActivity"
+        title={t('Collapse activity after reply')}
+        description={t(
+          'When a reply finishes, fold consecutive thinking and tool calls (including edits and commands) into one summary row; failed calls stay visible'
+        )}
+        checked={collapseCompletedActivity}
+        onChange={setCollapseCompletedActivity}
+      />
+      <SwitchRow
+        rowId="general.pinUnfinishedTodos"
+        title={t('Pin unfinished todos')}
+        description={t(
+          'Keep the latest todo list above the input while it has unfinished items, so it does not scroll away with the timeline'
+        )}
+        checked={pinUnfinishedTodos}
+        onChange={setPinUnfinishedTodos}
       />
       <div
         className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5"

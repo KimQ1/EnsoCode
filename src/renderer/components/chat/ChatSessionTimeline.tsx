@@ -3,7 +3,7 @@ import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useOpenChangesOnEdit } from '@/hooks/useOpenChangesOnEdit';
 import { eventToBinding } from '@/lib/keybindings';
 import { useSessionsStore } from '@/stores/sessions';
-import { chatTimelineBusy } from '@/stores/sessions/messageCache';
+import { chatTimelineActivity } from '@/stores/sessions/messageCache';
 import {
   buildTimeline,
   patchStreamingTimeline,
@@ -12,6 +12,7 @@ import {
 } from '@/stores/sessions/timeline';
 import { ChatFindBar, consumePendingFindQuery, OPEN_CHAT_FIND_EVENT } from './ChatFindBar';
 import { timelineSearchHits } from './chatSearch';
+import { MarkdownLinkContext } from './Markdown';
 import { MessageTimeline, type MessageTimelineHandle } from './MessageTimeline';
 
 const EMPTY_MESSAGES: ProjectedMessage[] = [];
@@ -21,13 +22,16 @@ export function ChatSessionTimeline({
   conversationId,
   cwd,
   emptyTitle,
+  onSuggestion,
   timelineRef,
 }: {
   conversationId: string;
   cwd?: string;
   emptyTitle: string;
+  onSuggestion?: (prompt: string) => void;
   timelineRef: RefObject<MessageTimelineHandle | null>;
 }) {
+  const projectId = useSessionsStore((state) => state.conversations[conversationId]?.projectId);
   const messages = useSessionsStore(
     (state) => state.conversations[conversationId]?.messages ?? EMPTY_MESSAGES
   );
@@ -114,7 +118,7 @@ export function ChatSessionTimeline({
   ]);
   useOpenChangesOnEdit(timeline, conversationId);
 
-  const timelineBusy = chatTimelineBusy({
+  const timelineActivity = chatTimelineActivity({
     started,
     sessionFile,
     messages,
@@ -122,7 +126,6 @@ export function ChatSessionTimeline({
     status,
     historyLoadAttempted,
   });
-
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
@@ -192,8 +195,20 @@ export function ChatSessionTimeline({
     return () => window.removeEventListener('keydown', onKey);
   }, [findOpen, stepFind]);
 
+  const markdownLinkContext = useMemo(
+    () =>
+      projectId
+        ? {
+            conversationId,
+            projectId,
+            ...(cwd ? { cwd } : {}),
+          }
+        : null,
+    [conversationId, cwd, projectId]
+  );
+
   return (
-    <>
+    <MarkdownLinkContext.Provider value={markdownLinkContext}>
       {findOpen && (
         <ChatFindBar
           query={findQuery}
@@ -215,18 +230,19 @@ export function ChatSessionTimeline({
         key={conversationId}
         ref={timelineRef}
         items={timeline}
-        busy={timelineBusy}
+        busy={timelineActivity !== null}
+        loading={timelineActivity === 'loading'}
         running={running}
         runStartedAt={runStartedAt}
         lastOutputAt={lastOutputAt}
         error={terminalErrorText(messages, error)}
         emptyTitle={emptyTitle}
+        onSuggestion={onSuggestion}
         onRetryResume={
           !started && sessionFile && status === 'failed'
             ? () => void useSessionsStore.getState().resumeConversation(conversationId)
             : undefined
         }
-        firstItemIndex={historyBaseIndex}
         historyLoading={historyLoading}
         hasOlder={historyBaseIndex > 0}
         onStartReached={
@@ -237,6 +253,6 @@ export function ChatSessionTimeline({
         searchQuery={findOpen ? findQuery : ''}
         activeHit={findOpen ? (findHits[findIndex] ?? null) : null}
       />
-    </>
+    </MarkdownLinkContext.Provider>
   );
 }

@@ -2,10 +2,13 @@ import { toPairProjectEntry } from '@enso/pair';
 import { catalogSyncFingerprint, pairJsonFingerprint } from '@shared/pair/metaSync';
 import { projectDisplayName } from '@shared/projectName';
 import type { PairCatalogPayload } from '@shared/types';
+import type { ProjectedMessage } from '@shared/types/agent';
+import { toSessionUsageStats } from '@/components/chat/usageSegments';
 import { getXtermTheme } from '@/lib/ghosttyTheme';
 import { useOauthCredentialStore } from '@/stores/oauthCredentials';
-import { toPairProviderEntries } from '@/stores/pairCatalogProviders';
+import { pairProviderSyncPlan } from '@/stores/pairCatalogProviders';
 import { useSessionsStore } from '@/stores/sessions';
+import { computeStats, type SessionStats } from '@/stores/sessions/stats';
 import { setPairViewedSession } from '@/stores/sessions/unread';
 import { useSettingsStore } from '@/stores/settings';
 import { applyProjectOrder } from '@/stores/settings/projectOrder';
@@ -27,6 +30,17 @@ const DEBOUNCE_MS = 300;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let bound = false;
 let lastPushFingerprint: string | null = null;
+// 流式期间每 300ms 重建目录：只有消息数组换了引用的会话才重算统计
+const statsCache = new WeakMap<ProjectedMessage[], SessionStats>();
+
+function cachedStats(messages: ProjectedMessage[]): SessionStats {
+  let stats = statsCache.get(messages);
+  if (!stats) {
+    stats = computeStats(messages);
+    statsCache.set(messages, stats);
+  }
+  return stats;
+}
 
 function buildPayload(): PairCatalogPayload {
   const settings = useSettingsStore.getState();
@@ -47,49 +61,55 @@ function buildPayload(): PairCatalogPayload {
   const slashCommands = settings.skills
     .filter((skill) => skill.enabled !== false)
     .map((skill) => ({ name: `/skill:${skill.name}`, description: skill.description }));
-  const toEntry = (c: Conversation) => ({
-    id: c.id,
-    title: c.parentId ? c.coworkerName || c.title : c.title,
-    projectName: projectName.get(c.projectId) ?? '',
-    projectId: c.projectId,
-    ...(toolCwd(c) ? { cwd: toolCwd(c) } : {}),
-    status: c.spawning ? 'running' : c.status,
-    updatedAt: c.messages.at(-1)?.timestamp ?? c.createdAt,
-    ...(c.parentId ? { parentId: c.parentId } : {}),
-    ...(c.pinned === true ? { pinned: true } : {}),
-    ...(c.archived === true ? { archived: true } : {}),
-    // 当前模型与推理档位：手机切换器回显；缺省字段不占帧体积
-    ...(c.lastProviderId ? { providerId: c.lastProviderId } : {}),
-    ...(c.lastModelId ? { modelId: c.lastModelId } : {}),
-    ...(c.reasoningEnabled !== undefined ? { reasoningEnabled: c.reasoningEnabled } : {}),
-    ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
-    ...(c.unread === true ? { unread: true } : {}),
-    ...(c.pendingAsks && c.pendingAsks.length > 0 ? { pendingAskCount: c.pendingAsks.length } : {}),
-    ...(c.pendingApprovals && c.pendingApprovals.length > 0
-      ? { pendingApprovalCount: c.pendingApprovals.length }
-      : {}),
-    // 排队消息：手机队列区展示与操作；图片不下发正文，只给个标记
-    ...(c.queuedMessages?.length
-      ? {
-          queued: c.queuedMessages.map((m) => ({
-            id: m.id,
-            text: m.text,
-            ...(m.images?.length ? { hasImages: true } : {}),
-          })),
-        }
-      : {}),
-    ...(c.goal
-      ? {
-          goal: {
-            text: c.goal.text,
-            status: c.goal.status,
-            ...(c.goal.note ? { note: c.goal.note } : {}),
-            autoTurns: c.goal.autoTurns,
-          },
-        }
-      : {}),
-    ...(slashCommands.length ? { slashCommands } : {}),
-  });
+  const toEntry = (c: Conversation) => {
+    const stats = toSessionUsageStats(cachedStats(c.messages), c.occupancy, c.contextWindow);
+    return {
+      id: c.id,
+      title: c.parentId ? c.coworkerName || c.title : c.title,
+      projectName: projectName.get(c.projectId) ?? '',
+      projectId: c.projectId,
+      ...(toolCwd(c) ? { cwd: toolCwd(c) } : {}),
+      status: c.spawning ? 'running' : c.status,
+      updatedAt: c.messages.at(-1)?.timestamp ?? c.createdAt,
+      ...(c.parentId ? { parentId: c.parentId } : {}),
+      ...(c.pinned === true ? { pinned: true } : {}),
+      ...(c.archived === true ? { archived: true } : {}),
+      // 当前模型与推理档位：手机切换器回显；缺省字段不占帧体积
+      ...(c.lastProviderId ? { providerId: c.lastProviderId } : {}),
+      ...(c.lastModelId ? { modelId: c.lastModelId } : {}),
+      ...(c.reasoningEnabled !== undefined ? { reasoningEnabled: c.reasoningEnabled } : {}),
+      ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
+      ...(c.unread === true ? { unread: true } : {}),
+      ...(c.pendingAsks && c.pendingAsks.length > 0
+        ? { pendingAskCount: c.pendingAsks.length }
+        : {}),
+      ...(c.pendingApprovals && c.pendingApprovals.length > 0
+        ? { pendingApprovalCount: c.pendingApprovals.length }
+        : {}),
+      // 排队消息：手机队列区展示与操作；图片不下发正文，只给个标记
+      ...(c.queuedMessages?.length
+        ? {
+            queued: c.queuedMessages.map((m) => ({
+              id: m.id,
+              text: m.text,
+              ...(m.images?.length ? { hasImages: true } : {}),
+            })),
+          }
+        : {}),
+      ...(c.goal
+        ? {
+            goal: {
+              text: c.goal.text,
+              status: c.goal.status,
+              ...(c.goal.note ? { note: c.goal.note } : {}),
+              autoTurns: c.goal.autoTurns,
+            },
+          }
+        : {}),
+      ...(slashCommands.length ? { slashCommands } : {}),
+      ...(stats ? { stats } : {}),
+    };
+  };
 
   const topLevel = sessions.order
     .map((id) => sessions.conversations[id])
@@ -103,8 +123,9 @@ function buildPayload(): PairCatalogPayload {
 
   const catalog = [...topLevel, ...children].map(toEntry);
 
-  // 与桌面选择器同一套可用口径（启用 + 凭证真实可用 + 启用模型），并剥掉密钥 / 账号 key
-  const providers = toPairProviderEntries(
+  // 与桌面选择器同一套可用口径（启用 + 凭证真实可用 + 启用模型），并剥掉密钥。
+  // OAuth 未就绪的空列表不结算，main 会扣下这一帧，避免手机显示没有模型服务。
+  const providerPlan = pairProviderSyncPlan(
     settings.providers,
     useOauthCredentialStore.getState().snapshot
   );
@@ -118,7 +139,8 @@ function buildPayload(): PairCatalogPayload {
       ...(archivedProjects.has(project.id) ? { archived: true as const } : {}),
     })),
     projectGroups: settings.projectGroups,
-    providers,
+    providers: providerPlan.entries,
+    providersSettled: providerPlan.settled,
     // 仅 main 侧用于 spawn 反查 cwd，不下发手机
     projectPaths: settings.projects.map((p) => ({ id: p.id, path: p.path })),
     // 原样下发（含 sync-terminal：手机也按终端配色推导整套 UI，与桌面一致）；
@@ -138,6 +160,7 @@ function catalogPushFingerprint(payload: PairCatalogPayload): string {
     projects: payload.projects,
     projectGroups: payload.projectGroups,
     providers: payload.providers,
+    providersSettled: payload.providersSettled,
     projectPaths: payload.projectPaths,
     theme: payload.theme,
     terminal: payload.terminal,

@@ -1,5 +1,5 @@
 import { ArrowDown, LoaderCircle } from 'lucide-react';
-import type { ReactNode, Ref } from 'react';
+import type { CSSProperties, ReactNode, Ref } from 'react';
 import {
   Component,
   memo,
@@ -23,13 +23,35 @@ import {
   type TimelineItem,
 } from '@/stores/sessions/timeline';
 import { useSettingsStore } from '@/stores/settings';
+import { EnsoMark } from './EnsoMark';
+import { diffFoldMotion, EMPTY_FOLD_MOTION } from './foldMotion';
 import { ChatSearchHighlightContext } from './highlightQuery';
 import { NavRail } from './NavRail';
-import { isCompactRow, RetryTurnButton, TimelineRow } from './TimelineRow';
+import {
+  isCompactRow,
+  isToolStepRow,
+  ReplyHeader,
+  RetryTurnButton,
+  TimelineRow,
+} from './TimelineRow';
+import { nextTimelineReveal } from './timelineReveal';
+import { nextTimelineRowOrigin, type TimelineRowAnchor } from './timelineRowOrigin';
+import { WelcomeSuggestions } from './WelcomeSuggestions';
 
 /** 消息列/输入区共用的列：阶梯 max-w + 水平 padding。padding 必须在列上而不是 @container 上，否则两侧查询宽度差 2rem，会在断点附近上下错位。默认到 4xl 保持原阅读宽度，更宽再逐级加档。 */
 export const CHAT_COL =
   'enso-chat-col mx-auto w-full max-w-2xl px-4 @min-[56rem]:max-w-3xl @min-[72rem]:max-w-4xl @min-[84rem]:max-w-5xl @min-[96rem]:max-w-6xl @min-[112rem]:max-w-7xl';
+
+/** 可作为一轮回复开头、挂身份头的行 */
+const REPLY_ROW_KINDS: ReadonlySet<TimelineItem['kind']> = new Set([
+  'text',
+  'thinking',
+  'tool',
+  'tool-group',
+]);
+
+/** 探后折叠组动效窗口：超过后行重挂（虚拟化滚回）不再重播 */
+const FOLD_MOTION_MS = 1000;
 
 /** 空状态容器：挂载后播放错峰入场（texts-reveal，rAF 后加 is-shown 触发过渡） */
 function EmptyReveal({ className, children }: { className?: string; children: ReactNode }) {
@@ -44,15 +66,22 @@ function EmptyReveal({ className, children }: { className?: string; children: Re
 /** 贴底判定阈值（px）：与旧实现一致，离底 40px 内视为贴底 */
 const AT_BOTTOM_THRESHOLD = 40;
 
+// 稳定引用。库每次渲染都重发 props；按引用去重的输入不能每次都是新对象。
+const INITIAL_TOP_MOST_ITEM_INDEX = { index: 'LAST', align: 'end' } as const;
+const VIEWPORT_OVERSCAN = { top: 600, bottom: 600 };
+const followChatOutput = (isAtBottom: boolean) => (isAtBottom ? 'auto' : false);
+
 function TimelineList({ style, ...props }: ListProps) {
   const hidden = style?.visibility === 'hidden';
   const [reveal, setReveal] = useState(false);
+  const hiddenSince = useRef<number | null>(null);
   useEffect(() => {
-    if (!hidden) return;
-    // 初始 LAST 定位等待行高稳定；持续测高时不能无限隐藏正文（Footer 不受此门控）。
-    const timer = window.setTimeout(() => setReveal(true), 1000);
+    const next = nextTimelineReveal(Date.now(), hiddenSince.current, hidden, reveal);
+    hiddenSince.current = next.hiddenSince;
+    if (next.delayMs === null) return;
+    const timer = window.setTimeout(() => setReveal(true), next.delayMs);
     return () => window.clearTimeout(timer);
-  }, [hidden]);
+  }, [hidden, reveal]);
   return <div {...props} style={hidden && reveal ? { ...style, visibility: 'visible' } : style} />;
 }
 
@@ -73,6 +102,8 @@ interface MessageTimelineProps {
   ref?: Ref<MessageTimelineHandle>;
   items: TimelineItem[];
   busy: boolean;
+  /** busy 来自加载（冷会话恢复 / 读历史 / 等快照），脚点显示「加载中」而非「生成中」 */
+  loading?: boolean;
   /** 会话 running：进行中的最后一轮工具行不折叠 */
   running: boolean;
   /** 本次 running 的起点，无任何返回时作计时兜底起点 */
@@ -82,6 +113,8 @@ interface MessageTimelineProps {
   error?: string;
   /** 空态标题（项目名） */
   emptyTitle: string;
+  /** 空会话建议卡片的点击回调；不传则不显示建议 */
+  onSuggestion?: (prompt: string) => void;
   /** 空时间线且 resume 失败时：再走一遍 jsonl 回放 */
   onRetryResume?: () => void;
   /**
@@ -100,8 +133,6 @@ interface MessageTimelineProps {
   historyLoading?: boolean;
   /** 还有更早一页；false = 已到第 0 条，顶部给出到头提示 */
   hasOlder?: boolean;
-  /** 当前权威区绝对起点；Virtuoso prepend 时靠它钉住已渲染行 */
-  firstItemIndex?: number;
   searchQuery?: string;
   activeHit?: { key: string; nth: number } | null;
 }
@@ -114,17 +145,18 @@ export function MessageTimeline({
   ref,
   items,
   busy,
+  loading = false,
   running,
   runStartedAt,
   lastOutputAt,
   error,
   emptyTitle,
+  onSuggestion,
   onRetryResume,
   virtualize = true,
   onStartReached,
   historyLoading = false,
   hasOlder,
-  firstItemIndex = 0,
   searchQuery = '',
   activeHit = null,
 }: MessageTimelineProps) {
@@ -172,16 +204,57 @@ export function MessageTimeline({
   // 轮次折叠态：用户显式展开/收起过的轮次（会话内记忆），未记录的轮次按 autoCollapseTurns 默认值
   const [turnOverrides, setTurnOverrides] = useState<ReadonlyMap<string, boolean>>(new Map());
   const autoCollapseTurns = useSettingsStore((s) => s.autoCollapseTurns);
+  const collapseCompletedActivity = useSettingsStore((s) => s.collapseCompletedActivity);
   const compact = useSettingsStore((s) => s.compactReadOnlyTools);
   const folded = useMemo(
     () =>
       foldTimeline(items, running, expandedGroups, {
         compact,
         autoCollapseCompletedTurns: autoCollapseTurns,
+        collapseCompletedActivity,
         turnOverrides,
       }),
-    [items, running, expandedGroups, compact, autoCollapseTurns, turnOverrides]
+    [
+      items,
+      running,
+      expandedGroups,
+      compact,
+      autoCollapseTurns,
+      collapseCompletedActivity,
+      turnOverrides,
+    ]
   );
+  // 探后折叠组动效：渲染期读上一帧 DOM 量折前跨度（提交后旧行已卸载）
+  const foldMotionRef = useRef({
+    state: EMPTY_FOLD_MOTION,
+    collapse: new Map<string, { at: number; height: number; pair: boolean }>(),
+    reveal: new Map<string, number>(),
+  });
+  const foldChildren = useMemo(() => {
+    const motion = foldMotionRef.current;
+    const row = (key: string) =>
+      scrollerRef.current?.querySelector(`[data-nav-key="${CSS.escape(key)}"]`);
+    const diff = diffFoldMotion(motion.state, folded, (from, to) => {
+      const top = row(from)?.getBoundingClientRect().top;
+      const bottom = row(to)?.getBoundingClientRect().bottom;
+      return top === undefined || bottom === undefined ? 0 : bottom - top;
+    });
+    const now = Date.now();
+    motion.state = diff.next;
+    for (const { key, ...rest } of diff.collapses) motion.collapse.set(key, { at: now, ...rest });
+    for (const key of diff.expands) motion.reveal.set(key, now);
+    return diff.children;
+  }, [folded]);
+  // 原点必须用折叠后的行。未折叠的 key 还在，但 Virtuoso 的 data 已经把它们收进组里。
+  const rowAnchor = useRef<TimelineRowAnchor | null>(null);
+  const rowEpoch = useRef(0);
+  const rowOrigin = nextTimelineRowOrigin(
+    rowAnchor.current,
+    folded.map((item) => item.key)
+  );
+  rowAnchor.current = rowOrigin.anchor;
+  if (rowOrigin.remount) rowEpoch.current += 1;
+  const firstItemIndex = rowOrigin.firstItemIndex;
   // 引用必须稳定：TimelineRow 的 memo 比较不含回调
   const setTurnCollapsed = useCallback((key: string, collapsed: boolean) => {
     setTurnOverrides((prev) =>
@@ -327,7 +400,9 @@ export function MessageTimeline({
       return;
     }
     const index = foldedIndexOf(key);
-    if (index >= 0) virtuosoRef.current?.scrollToIndex({ index, align: 'center' });
+    if (index >= 0) {
+      virtuosoRef.current?.scrollToIndex({ index: firstItemIndex + index, align: 'center' });
+    }
   };
   /** 目标藏在折叠轮次里：先展开，等 folded 重算后再滚动（同步滚动拿到的是旧 folded / 旧 DOM） */
   const pendingJumpRef = useRef<string | null>(null);
@@ -388,19 +463,50 @@ export function MessageTimeline({
   // 精简模式：探索类行（组头/只读/思考）之间贴紧排；正文→探索 也收紧（正文自带 hover 操作条占位），
   // 探索→正文留一点距离
   const rowGap = (item: TimelineItem, index: number): string => {
-    if (!compact) return 'pb-4';
     const next = folded[index + 1];
+    // 时间线上相邻的工具节点贴紧，由竖线串起
+    if (next !== undefined && isToolStepRow(item) && isToolStepRow(next)) return 'pb-1';
+    if (!compact) return 'pb-4';
     const nextCompact = next !== undefined && isCompactRow(next);
     if (isCompactRow(item)) return nextCompact ? 'pb-1' : 'pb-2';
     return item.kind === 'text' && nextCompact ? 'pb-1' : 'pb-4';
   };
   const renderRow = (item: TimelineItem, index: number) => {
+    const prev = folded[index - 1];
+    const next = folded[index + 1];
+    const replyHead =
+      prev?.kind === 'user' && !prev.collapsed && REPLY_ROW_KINDS.has(item.kind) ? prev : undefined;
+    const step = isToolStepRow(item);
+    const now = Date.now();
+    const collapse = foldMotionRef.current.collapse.get(item.key);
+    const folding = collapse && now - collapse.at < FOLD_MOTION_MS ? collapse : undefined;
+    const child = foldChildren.get(item.key);
+    const revealAt = child && foldMotionRef.current.reveal.get(child.group);
+    const revealing = child && revealAt !== undefined && now - revealAt < FOLD_MOTION_MS;
     return (
       <div
         key={item.key}
         data-nav-key={item.key}
-        className={cn(CHAT_COL, rowGap(item, index), '[overflow-wrap:anywhere]')}
+        data-reply-head={replyHead ? '' : undefined}
+        data-step-prev={step && prev && isToolStepRow(prev) ? '' : undefined}
+        data-step-next={step && next && isToolStepRow(next) ? '' : undefined}
+        data-fold-collapse={folding ? (folding.pair ? 'pair' : 'toggle') : undefined}
+        style={
+          folding
+            ? ({ '--fold-from': `${folding.height}px` } as CSSProperties)
+            : revealing
+              ? ({ '--fold-i': child.index } as CSSProperties)
+              : undefined
+        }
+        className={cn(
+          CHAT_COL,
+          rowGap(item, index),
+          step && 'enso-step-row',
+          revealing && 't-fold-reveal',
+          '[overflow-wrap:anywhere]'
+        )}
       >
+        {replyHead && <ReplyHeader model={replyHead.replyModel} at={replyHead.replyAt} />}
         <RowErrorBoundary itemKey={item.key}>
           <TimelineRow item={item} onToggleGroup={toggleGroup} onToggleTurn={setTurnCollapsed} />
         </RowErrorBoundary>
@@ -450,9 +556,12 @@ export function MessageTimeline({
   const renderFooter = () => (
     <div className={cn(CHAT_COL, 'pb-6 [overflow-wrap:anywhere]')}>
       {busy && (
-        <div className="flex items-center gap-2.5">
+        <div className="flex min-h-[26px] items-center gap-2 text-[13px]">
           <LoadingDots />
-          {(lastOutputAt ?? runStartedAt) !== undefined && (
+          <span className="t-shimmer" data-text={loading ? t('Loading…') : t('Working…')}>
+            {loading ? t('Loading…') : t('Working…')}
+          </span>
+          {!loading && (lastOutputAt ?? runStartedAt) !== undefined && (
             <ElapsedTimer since={(lastOutputAt ?? runStartedAt) as number} />
           )}
         </div>
@@ -476,8 +585,15 @@ export function MessageTimeline({
       <div className="@container relative min-h-0 flex-1">
         <NavRail items={navItems} activeKey={activeNavKey} onJump={jumpTo} />
         {items.length === 0 && !busy ? (
-          <EmptyReveal className="flex h-full flex-col items-center justify-center gap-2 text-center">
-            <p className="t-stagger-line t-stagger-line--1 text-lg font-medium">{emptyTitle}</p>
+          <EmptyReveal className="flex h-full flex-col items-center justify-center gap-2 overflow-y-auto px-4 text-center">
+            <span className="t-stagger-line t-stagger-line--1 mb-3">
+              <span className="flex size-11 items-center justify-center rounded-[13px] border border-brand/20 bg-brand/8 text-brand dark:bg-brand/14">
+                <EnsoMark className="size-6" />
+              </span>
+            </span>
+            <p className="t-stagger-line t-stagger-line--1 text-[22px] font-semibold tracking-tight">
+              {emptyTitle}
+            </p>
             {error ? (
               <>
                 <p className="t-stagger-line t-stagger-line--2 max-w-md text-sm text-destructive whitespace-pre-wrap">
@@ -490,9 +606,16 @@ export function MessageTimeline({
                 )}
               </>
             ) : (
-              <p className="t-stagger-line t-stagger-line--2 text-sm text-muted-foreground">
-                {t('Ask the agent…')}
-              </p>
+              <>
+                <p className="t-stagger-line t-stagger-line--2 text-sm text-muted-foreground">
+                  {t('Ask the agent…')}
+                </p>
+                {onSuggestion && (
+                  <div className="t-stagger-line t-stagger-line--3 mt-5 w-full">
+                    <WelcomeSuggestions onPick={onSuggestion} />
+                  </div>
+                )}
+              </>
             )}
           </EmptyReveal>
         ) : items.length === 0 && error ? (
@@ -575,6 +698,7 @@ export function MessageTimeline({
           </div>
         ) : (
           <Virtuoso
+            key={rowEpoch.current}
             ref={virtuosoRef}
             data={folded}
             // 不用首条长消息探测整段高度，否则初始定位反复校正，正文隐藏只剩脚点。
@@ -587,20 +711,21 @@ export function MessageTimeline({
               onStartReached();
             }}
             // 贴底时新内容自动跟随（含流式增高）；非贴底不抢滚
-            followOutput={(isAtBottom) => (isAtBottom ? 'auto' : false)}
+            followOutput={followChatOutput}
             atBottomThreshold={AT_BOTTOM_THRESHOLD}
             atBottomStateChange={(value) => {
               setAtBottom(value);
               atBottomRef.current = value;
             }}
-            increaseViewportBy={{ top: 600, bottom: 600 }}
-            initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
+            increaseViewportBy={VIEWPORT_OVERSCAN}
+            initialTopMostItemIndex={INITIAL_TOP_MOST_ITEM_INDEX}
             // 可视范围起点附近的 user 轮次作为导航条高亮
             rangeChanged={({ startIndex }) => {
               if (startIndex > firstItemIndex + 4) startReachedLatch.current = false;
               scheduleActiveNavKey(() => {
+                const dataIndex = Math.max(0, startIndex - firstItemIndex);
                 let current: string | null = null;
-                for (let i = 0; i <= Math.min(startIndex + 1, folded.length - 1); i++) {
+                for (let i = 0; i <= Math.min(dataIndex + 1, folded.length - 1); i++) {
                   if (folded[i]?.kind === 'user') current = folded[i].key;
                 }
                 return current;
@@ -615,17 +740,18 @@ export function MessageTimeline({
               Header: renderHeader,
               Footer: renderFooter,
             }}
-            itemContent={(index, item) => renderRow(item, index)}
+            // Virtuoso 传入的是含 firstItemIndex 的绝对下标，换算回 folded 下标
+            itemContent={(index, item) => renderRow(item, index - firstItemIndex)}
           />
         )}
         {!atBottom && items.length > 0 && (
           <button
             type="button"
             onClick={scrollToBottom}
-            className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-full border bg-background p-2 text-muted-foreground shadow-md transition-colors hover:bg-muted hover:text-foreground"
-            title={t('Scroll to bottom')}
+            className="absolute bottom-4 left-1/2 z-10 inline-flex h-7 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card px-3 text-xs text-muted-foreground shadow-float transition-colors hover:text-foreground"
           >
-            <ArrowDown className="h-4 w-4" />
+            <ArrowDown className="h-3 w-3" />
+            {t('Scroll to bottom')}
           </button>
         )}
       </div>
@@ -675,15 +801,10 @@ function HistoryPageHeader({
 
 function LoadingDots() {
   return (
-    <div className="flex items-center gap-1 py-1">
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60"
-          style={{ animationDelay: `${i * 150}ms` }}
-        />
-      ))}
-    </div>
+    <span className="relative flex size-[22px] shrink-0 items-center justify-center">
+      <span className="absolute size-2 animate-ping rounded-full bg-brand/50" />
+      <span className="relative size-2 rounded-full bg-brand" />
+    </span>
   );
 }
 

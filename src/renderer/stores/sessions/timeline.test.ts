@@ -5,14 +5,15 @@ import {
   completedEditWriteFingerprint,
   foldTimeline,
   historyPageChrome,
-  isReadOnlyCommand,
   parseSandboxOutput,
   patchStreamingTimeline,
   shouldAutoExpandAppliedFileChanges,
   shouldPrefetchOlderHistory,
   shouldShowToolOutputAfterFileChanges,
+  summarizeSandboxCalls,
   type TimelineItem,
   terminalErrorText,
+  thinkingRowExpanded,
 } from './timeline';
 
 const user = (text: string): ProjectedMessage => ({
@@ -62,6 +63,32 @@ describe('buildTimeline', () => {
   });
 
   describe('user 消息发送时间与任务完成耗时统计', () => {
+    it('user 行记录本轮首个 assistant 回复的模型与时间，供回复身份头显示', () => {
+      const timeline = buildTimeline(
+        [
+          user('第一轮'),
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'a' }],
+            model: 'model-a',
+            timestamp: 10,
+          },
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'b' }],
+            model: 'model-b',
+            timestamp: 20,
+          },
+          user('第二轮'),
+        ],
+        false
+      );
+      const users = timeline.filter((item) => item.kind === 'user');
+      expect(users[0]).toMatchObject({ replyModel: 'model-a', replyAt: 10 });
+      expect(users[1]).not.toHaveProperty('replyModel');
+      expect(users[1]).not.toHaveProperty('replyAt');
+    });
+
     it('user 消息保留发送时间戳 timestamp', () => {
       const timeline = buildTimeline(
         [{ role: 'user', content: [{ type: 'text', text: '你好' }], timestamp: 1726700000000 }],
@@ -355,6 +382,16 @@ describe('buildTimeline', () => {
       );
       const singleUser = users(emptyReplyTimeline)[0];
       expect(singleUser.canCollapse).toBe(false);
+
+      // 后面只有 Pi 插入的 system 消息，不算回复
+      const systemOnlyTimeline = buildTimeline(
+        [
+          { role: 'user', content: [{ type: 'text', text: '孤立消息' }] },
+          { role: 'system', content: [] },
+        ],
+        false
+      );
+      expect(users(systemOnlyTimeline)[0].canCollapse).toBe(false);
     });
 
     it('折叠指定轮次：隐藏当前消息的所有回复（tool/text），保留发送信息、时间戳与耗时', () => {
@@ -698,6 +735,18 @@ describe('buildTimeline', () => {
         { name: 'ls', ok: true },
       ],
     });
+  });
+
+  it('exec 调用按工具名首次出现顺序计数', () => {
+    expect(
+      summarizeSandboxCalls([
+        { name: 'grep', ok: true },
+        { name: 'read', ok: true },
+        { name: 'grep', ok: false },
+        { name: 'grep', ok: true },
+      ])
+    ).toBe('grep ×3 read ×1');
+    expect(summarizeSandboxCalls([])).toBe('');
   });
 
   it('Hashline edit 从头部提取路径并从 toolResult 生成 edits', () => {
@@ -1452,65 +1501,6 @@ describe('terminalErrorText', () => {
   });
 });
 
-describe('isReadOnlyCommand', () => {
-  it.each([
-    'ls -la',
-    'rg -n "foo" src',
-    'grep -r foo . | head -20',
-    'cat package.json',
-    'find . -name "*.ts" | wc -l',
-    'git status && git log --oneline -5',
-    'cd packages/phone && ls src',
-    'FOO=1 rg foo 2>/dev/null',
-    'rg foo 2>&1 | sort | uniq -c',
-    '/usr/bin/tree -L 2',
-    'sed -n 1,20p src/a.ts',
-    'git diff --stat',
-    'git remote -v',
-    'git config --get user.name',
-    'LC_ALL=C sort a.txt',
-    "awk -F: '{print $1}' /etc/passwd",
-    'yq .a f.yml',
-  ])('只读：%s', (cmd) => {
-    expect(isReadOnlyCommand(cmd)).toBe(true);
-  });
-
-  it.each([
-    'rm -rf dist',
-    'ls > out.txt',
-    'cat a >> b',
-    'sed -i "s/a/b/" x',
-    'find . -name "*.log" -delete',
-    'find . -exec rm {} \\;',
-    'git commit -m x',
-    'git checkout -- .',
-    'ls && npm install',
-    'echo $(rm -rf x)',
-    'pnpm test',
-    'xargs rm',
-    '',
-    // 绕过向量
-    'ls & rm -rf x',
-    'cat <(rm -rf x)',
-    'env rm -rf x',
-    'awk \'BEGIN{system("rm -rf x")}\' a.txt',
-    "sed 's/a/b/e' a.txt",
-    'sed --in-place=.bak s/a/b/ x',
-    'yq -i .a=1 f.yml',
-    'sort -o out.txt in.txt',
-    'git log --output=/tmp/x',
-    'find . -execdir rm {} \\;',
-    'find . -fprint /tmp/x',
-    'git config --unset user.name',
-    'git remote remove origin',
-    'GIT_EXTERNAL_DIFF=./evil git diff',
-    'rg foo 2>err.txt',
-    'ls\rrm -rf x',
-  ])('非只读：%s', (cmd) => {
-    expect(isReadOnlyCommand(cmd)).toBe(false);
-  });
-});
-
 describe('foldTimeline', () => {
   it.each([false, true])('compact=%s：同一回复的连续思考合并，耗时只计一次', (compact) => {
     const messages: ProjectedMessage[] = [
@@ -1831,6 +1821,25 @@ describe('foldTimeline', () => {
     expect((folded[0] as Extract<TimelineItem, { kind: 'tool-group' }>).exploring).toBe(true);
   });
 
+  it('compact：运行中的尾段在两次调用之间仍标 exploring，被后续内容隔开或结束后才落定', () => {
+    const items = [
+      userItem('u0'),
+      toolItem('a1', 'read'),
+      toolItem('a2', 'grep'),
+      toolItem('a3', 'ls'),
+    ];
+    const exploring = (list: TimelineItem[], running: boolean) =>
+      (
+        foldTimeline(list, running, new Set(), { compact: true }).find(
+          (i) => i.kind === 'tool-group'
+        ) as Extract<TimelineItem, { kind: 'tool-group' }>
+      ).exploring;
+    expect(exploring(items, true)).toBe(true);
+    expect(exploring([...items, thinkingItem('th')], true)).toBe(true);
+    expect(exploring([...items, toolItem('b', 'bash')], true)).toBe(false);
+    expect(exploring(items, false)).toBe(false);
+  });
+
   it('todo 行不进组，平铺在组头之后', () => {
     const items = [toolItem('t1'), toolItem('td', 'todo'), toolItem('t2'), toolItem('t3')];
     const folded = foldTimeline(items, false, new Set());
@@ -1900,6 +1909,10 @@ describe('工具路径摘要相对化', () => {
 
   it('file_path 同样相对化', () => {
     expect(tool({ file_path: `${cwd}/a.ts` }, cwd)).toMatchObject({ summary: 'a.ts' });
+  });
+
+  it('explore_mark 的 goal 作摘要', () => {
+    expect(tool({ goal: 'find auth' })).toMatchObject({ summary: 'find auth' });
   });
 
   it('项目外路径保持绝对', () => {
@@ -2422,3 +2435,260 @@ const userByText = (items: TimelineItem[], text: string): UserItem => {
   if (!found) throw new Error(`user item not found: ${text}`);
   return found;
 };
+
+describe('thinkingRowExpanded', () => {
+  it('关闭自动展开时，流式中也保持收起，结束后仍收起', () => {
+    expect(thinkingRowExpanded(null, true, false)).toBe(false);
+    expect(thinkingRowExpanded(null, false, false)).toBe(false);
+  });
+
+  it('开启后只在流式中展开，结束后自动收起', () => {
+    expect(thinkingRowExpanded(null, true, true)).toBe(true);
+    expect(thinkingRowExpanded(null, false, true)).toBe(false);
+  });
+
+  it('手动点击覆盖自动展开', () => {
+    expect(thinkingRowExpanded(true, true, false)).toBe(true);
+    expect(thinkingRowExpanded(false, true, true)).toBe(false);
+    expect(thinkingRowExpanded(true, false, true)).toBe(true);
+  });
+});
+
+describe('foldTimeline 回答完成后折叠过程（collapseCompletedActivity）', () => {
+  type Group = Extract<TimelineItem, { kind: 'tool-group' }>;
+  const on = { collapseCompletedActivity: true };
+  const kinds = (items: TimelineItem[]) =>
+    items.map((item) => (item.kind === 'tool' ? item.name : item.kind));
+  const timed = (item: TimelineItem, durationMs: number): TimelineItem =>
+    ({ ...item, durationMs }) as TimelineItem;
+  const failed = (key: string): TimelineItem =>
+    ({ ...toolItem(key, 'bash'), state: 'error' }) as TimelineItem;
+
+  it('已完成轮次：思考与任意工具（含 edit/write/todo）连续段折成一行，正文留在组外', () => {
+    const items = [
+      userItem('u'),
+      timed(thinkingItem('t1'), 2000),
+      timed(toolItem('a', 'bash'), 1000),
+      toolItem('b', 'edit', [textItem('x')]),
+      { ...toolItem('c', 'write'), writeContent: 'hi' } as TimelineItem,
+      { ...toolItem('d', 'todo'), todos: [] } as TimelineItem,
+      textItem('answer'),
+    ];
+    const folded = foldTimeline(items, false, new Set(), on);
+    expect(kinds(folded)).toEqual(['user', 'tool-group', 'text']);
+    const group = folded[1] as Group;
+    expect(group.activity).toEqual({ thinking: 1, workedMs: 3000 });
+    expect(group.count).toBe(4);
+    expect(kinds(group.children)).toEqual(['thinking', 'bash', 'edit', 'write', 'todo']);
+  });
+
+  it('展开后按原顺序平铺全部行', () => {
+    const items = [userItem('u'), toolItem('a', 'edit', [textItem('x')]), toolItem('b', 'read')];
+    const collapsed = foldTimeline(items, false, new Set(), on);
+    const key = collapsed[1].key;
+    const expanded = foldTimeline(items, false, new Set([key]), on);
+    expect(kinds(expanded)).toEqual(['user', 'tool-group', 'edit', 'read']);
+  });
+
+  it('中间正文断开分组；只有 1 条的段不折', () => {
+    const items = [
+      userItem('u'),
+      toolItem('a', 'read'),
+      toolItem('b', 'bash'),
+      textItem('mid'),
+      toolItem('c', 'bash'),
+      textItem('answer'),
+    ];
+    expect(kinds(foldTimeline(items, false, new Set(), on))).toEqual([
+      'user',
+      'tool-group',
+      'text',
+      'bash',
+      'text',
+    ]);
+  });
+
+  it('失败的工具、目标信号留在组外并断开分组', () => {
+    const items = [
+      userItem('u'),
+      toolItem('a', 'read'),
+      toolItem('b', 'read'),
+      failed('bad'),
+      toolItem('goal', 'goal_complete'),
+      toolItem('c', 'read'),
+      toolItem('d', 'read'),
+    ];
+    const folded = foldTimeline(items, false, new Set(), on);
+    expect(kinds(folded)).toEqual(['user', 'tool-group', 'bash', 'goal_complete', 'tool-group']);
+  });
+
+  it('正在生成的最新一轮：仍在进行的尾段保持原有行为，历史轮次照常折叠', () => {
+    const items = [
+      userItem('u1'),
+      toolItem('a', 'edit', [textItem('x')]),
+      toolItem('b', 'bash'),
+      textItem('answer'),
+      userItem('u2'),
+      toolItem('c', 'edit', [textItem('x')]),
+      toolItem('d', 'bash'),
+    ];
+    const folded = foldTimeline(items, true, new Set(), on);
+    expect(kinds(folded)).toEqual(['user', 'tool-group', 'text', 'user', 'edit', 'bash']);
+  });
+
+  it('正在生成的最新一轮：被正文隔开的已完成段立即折叠', () => {
+    const items = [
+      userItem('u'),
+      thinkingItem('t1'),
+      toolItem('a', 'edit', [textItem('x')]),
+      toolItem('b', 'bash'),
+      textItem('mid'),
+      toolItem('c', 'edit', [textItem('y')]),
+      toolItem('d', 'bash'),
+    ];
+    expect(kinds(foldTimeline(items, true, new Set(), on))).toEqual([
+      'user',
+      'tool-group',
+      'text',
+      'edit',
+      'bash',
+    ]);
+    expect(kinds(foldTimeline([...items.slice(0, 5)], true, new Set(), on))).toEqual([
+      'user',
+      'tool-group',
+      'text',
+    ]);
+  });
+
+  it('没有耗时打点时 workedMs 为 0；开关关闭时行为不变', () => {
+    const items = [userItem('u'), toolItem('a', 'edit', [textItem('x')]), toolItem('b', 'bash')];
+    const group = foldTimeline(items, false, new Set(), on)[1] as Group;
+    expect(group.activity).toEqual({ thinking: 0, workedMs: 0 });
+    expect(kinds(foldTimeline(items, false, new Set()))).toEqual(['user', 'edit', 'bash']);
+  });
+});
+
+describe('foldTimeline 探索配对折叠（explore_mark → explore_fold）', () => {
+  type Group = Extract<TimelineItem, { kind: 'tool-group' }>;
+  const keys = (items: TimelineItem[]) => items.map((item) => item.key);
+  const mark = (key: string): TimelineItem =>
+    ({ ...toolItem(key, 'explore_mark'), summary: 'find auth' }) as TimelineItem;
+  const fold = (key: string, state = 'ok'): TimelineItem =>
+    ({ ...toolItem(key, 'explore_fold'), state }) as TimelineItem;
+
+  it('成对后 mark 到 fold（含中间正文、思考）收成一个探索组，展开平铺原始行', () => {
+    const items = [
+      userItem('u'),
+      mark('m'),
+      toolItem('r', 'read'),
+      textItem('mid'),
+      thinkingItem('th'),
+      toolItem('b', 'bash'),
+      fold('f'),
+      textItem('answer'),
+    ];
+    const folded = foldTimeline(items, true, new Set());
+    expect(folded.map((item) => item.kind)).toEqual(['user', 'tool-group', 'text']);
+    const group = folded[1] as Group;
+    expect(group.explore).toEqual({ goal: 'find auth' });
+    expect(group.count).toBe(2);
+    expect(keys(group.children)).toEqual(['m', 'r', 'mid', 'th', 'b', 'f']);
+    expect(keys(foldTimeline(items, true, new Set([group.key])))).toEqual([
+      'u',
+      group.key,
+      'm',
+      'r',
+      'mid',
+      'th',
+      'b',
+      'f',
+      'answer',
+    ]);
+  });
+
+  it('fold 未完成、失败或被用户消息隔开时不配对；失败后重试成功仍配对', () => {
+    const live = [userItem('u'), mark('m'), toolItem('r', 'read'), fold('f', 'running')];
+    expect(keys(foldTimeline(live, true, new Set()))).toEqual(['u', 'm', 'r', 'f']);
+    const failed = [mark('m'), fold('bad', 'error'), textItem('x')];
+    expect(keys(foldTimeline(failed, false, new Set()))).toEqual(['m', 'bad', 'x']);
+    const split = [mark('m'), userItem('u'), fold('f')];
+    expect(keys(foldTimeline(split, false, new Set()))).toEqual(['m', 'u', 'f']);
+    const retried = foldTimeline([mark('m'), fold('bad', 'error'), fold('f')], false, new Set());
+    expect(retried).toHaveLength(1);
+    expect((retried[0] as Group).explore).toBeDefined();
+    expect(keys((retried[0] as Group).children)).toEqual(['m', 'bad', 'f']);
+  });
+
+  it('回答完成后探索组并入过程组，逐层展开', () => {
+    const on = { collapseCompletedActivity: true };
+    const items = [
+      userItem('u'),
+      toolItem('a', 'bash'),
+      mark('m'),
+      toolItem('r', 'read'),
+      fold('f'),
+      textItem('answer'),
+    ];
+    const folded = foldTimeline(items, false, new Set(), on);
+    expect(folded.map((item) => item.kind)).toEqual(['user', 'tool-group', 'text']);
+    const activity = folded[1] as Group;
+    expect(activity.activity).toBeDefined();
+    expect(activity.count).toBe(4);
+    const exploreKey = activity.children[1].key;
+    expect(keys(foldTimeline(items, false, new Set([activity.key]), on))).toEqual([
+      'u',
+      activity.key,
+      'a',
+      exploreKey,
+      'answer',
+    ]);
+    expect(keys(foldTimeline(items, false, new Set([activity.key, exploreKey]), on))).toEqual([
+      'u',
+      activity.key,
+      'a',
+      exploreKey,
+      'm',
+      'r',
+      'f',
+      'answer',
+    ]);
+  });
+});
+
+describe('submit_plan 计划卡片', () => {
+  it('从参数取出标题与正文', () => {
+    const items = buildTimeline(
+      [
+        user('规划一下'),
+        {
+          role: 'assistant',
+          stopReason: 'toolUse',
+          content: [
+            {
+              type: 'toolCall',
+              id: 'c1',
+              name: 'submit_plan',
+              arguments: { title: '重构登录', plan: '# 步骤\n1. 改 A' },
+            },
+          ],
+        },
+      ],
+      false
+    );
+    const tool = items.find((item) => item.kind === 'tool');
+    expect(tool && tool.kind === 'tool' ? tool.plan : undefined).toEqual({
+      title: '重构登录',
+      text: '# 步骤\n1. 改 A',
+    });
+  });
+
+  it('已完成轮次的过程折叠不吞计划卡片', () => {
+    const plan = {
+      ...toolItem('p', 'submit_plan'),
+      plan: { title: 'T', text: 'x' },
+    } as TimelineItem;
+    const items = [userItem('u'), toolItem('a', 'read'), toolItem('b', 'grep'), plan];
+    const folded = foldTimeline(items, false, new Set(), { collapseCompletedActivity: true });
+    expect(folded.at(-1)).toBe(plan);
+  });
+});

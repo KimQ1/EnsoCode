@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./shared.css";
 
 @theme {
   --color-background: var(--background);
@@ -307,6 +308,36 @@ html.bg-image-enabled .shiki span {
 /* 聊天列铺满：覆盖 CHAT_COL 的阶梯 max-w，两侧只留 padding */
 html.enso-chat-wide .enso-chat-col {
   max-width: none;
+}
+
+/*
+ * 侧栏项目下的会话竖线：每行画自己那段并向上盖住 gap-y-0.5 行距；有状态点的行在点上下断开，
+ * 与会话区工具时间线同一画法。圆心 x = pl-2 + 半个图标列、y = py-1.5 + 半个行高，均为 1rem；
+ * 全用 rem 跟随界面字号缩放。
+ */
+.enso-conv-tree [data-slot='conversation-row'] {
+  position: relative;
+}
+.enso-conv-tree [data-slot='conversation-row']::before,
+.enso-conv-tree [data-slot='conversation-row']:has([data-slot='conversation-status'])::after {
+  content: '';
+  position: absolute;
+  left: calc(1rem - 0.5px);
+  width: 1px;
+  background-color: var(--color-border);
+  pointer-events: none;
+}
+.enso-conv-tree [data-slot='conversation-row']::before {
+  top: -0.125rem;
+  bottom: 0;
+}
+.enso-conv-tree [data-slot='conversation-row']:has([data-slot='conversation-status'])::before {
+  bottom: auto;
+  height: 0.625rem;
+}
+.enso-conv-tree [data-slot='conversation-row']:has([data-slot='conversation-status'])::after {
+  top: 1.5rem;
+  bottom: 0;
 }
 
 /**
@@ -722,72 +753,6 @@ html.bg-image-enabled [data-slot='composer'] {
   .t-shake-in { animation: none !important; transform: none !important; }
 }
 
-/* ── Shimmer text (15) — Thinking… 流光 ──────────────────────── */
-:root {
-  --shimmer-base: var(--muted-foreground);
-  --shimmer-highlight: var(--foreground);
-}
-.t-shimmer {
-  position: relative;
-  display: inline-block;
-  color: var(--shimmer-base);
-}
-.t-shimmer::before {
-  content: attr(data-text);
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background-image: linear-gradient(
-    90deg,
-    transparent          0%,
-    transparent         40%,
-    var(--shimmer-highlight) 50%,
-    transparent         60%,
-    transparent        100%
-  );
-  background-size: var(--shimmer-band) 100%;
-  background-repeat: no-repeat;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  -webkit-text-fill-color: transparent;
-  animation: t-shimmer var(--shimmer-dur) var(--shimmer-ease) infinite;
-}
-@keyframes t-shimmer {
-  0%   { background-position: 100% 0; }
-  100% { background-position: 0% 0; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .t-shimmer::before { animation: none !important; }
-}
-
-/* ── Accordion expand (21) — 展开内容挂载 reveal ─────────────── */
-@keyframes t-acc-reveal {
-  from { opacity: 0; filter: blur(2px); transform: translateY(4px); }
-  to   { opacity: 1; filter: blur(0);   transform: translateY(0); }
-}
-.t-acc-reveal {
-  animation: t-acc-reveal var(--acc-expand) var(--acc-ease);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .t-acc-reveal { animation: none !important; }
-}
-
-/* ── Streaming text (30) — 流式新增的块级元素柔化落地 ────────── */
-@keyframes t-stream-in {
-  from { opacity: 0; filter: blur(var(--stream-blur)); }
-  to   { opacity: 1; filter: blur(0); }
-}
-.t-stream-live > * {
-  animation: t-stream-in var(--stream-fade) var(--stream-ease);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .t-stream-live > * { animation: none !important; }
-}
-
 /* ── Texts reveal (18) ───────────────────────────────────────── */
 .t-stagger-line {
   display: block;
@@ -801,6 +766,7 @@ html.bg-image-enabled [data-slot='composer'] {
   will-change: transform, opacity, filter;
 }
 .t-stagger-line--2 { transition-delay: var(--stagger-stagger); }
+.t-stagger-line--3 { transition-delay: calc(var(--stagger-stagger) * 2); }
 
 .t-stagger.is-shown .t-stagger-line {
   opacity: 1;

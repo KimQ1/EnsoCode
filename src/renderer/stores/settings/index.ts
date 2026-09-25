@@ -1,3 +1,4 @@
+import { type AccentColor, DEFAULT_ACCENT_COLOR, resolveAccentColor } from '@shared/accentColor';
 import { sanitizeDefaultModel } from '@shared/defaultModel';
 import type { Locale } from '@shared/i18n';
 import { normalizeLocale } from '@shared/i18n';
@@ -14,6 +15,7 @@ import { projectNameFromPath } from '@shared/projectName';
 import { applyIncomingProviders } from '@shared/providerIdentity';
 import { normalizeProxyMode, type ProxyMode } from '@shared/proxy';
 import { parseSmartCompactMode } from '@shared/smartCompactMode';
+import { DEFAULT_SSH_TIMEOUT_SECONDS, normalizeSshTimeoutSeconds } from '@shared/sshTimeout';
 import {
   DEFAULT_STATUS_LINE_SEGMENTS,
   normalizeStatusLineSegments,
@@ -21,7 +23,7 @@ import {
 } from '@shared/statusLine';
 import { parseTerminalShell } from '@shared/terminalShell';
 import { DEFAULT_DISABLED_BUILTIN_TOOLS } from '@shared/types';
-import type { SourceAuthorityProjection } from '@shared/types/agent';
+import type { AgentMode, SourceAuthorityProjection } from '@shared/types/agent';
 import { parseUsageModelPricing } from '@shared/usage/pricing';
 import { parseWindowsLocalShell } from '@shared/windowsLocalShell';
 import { create } from 'zustand';
@@ -54,6 +56,10 @@ import type {
   Theme,
 } from './types';
 
+function normalizeSubagentAllowedModes(modes: readonly AgentMode[]): AgentMode[] {
+  return (['task', 'coworker'] as const).filter((mode) => modes.includes(mode));
+}
+
 export * from './types';
 
 // Apply terminal font settings to app CSS variables
@@ -76,6 +82,7 @@ function applyAppTheme(theme: Theme, terminalTheme: string): void {
 // Apply settings side effects (theme / font / lang) — 初次加载与多窗口同步时调用
 function applySettings(state: {
   theme: Theme;
+  accentColor?: AccentColor;
   terminalTheme: string;
   terminalFontFamily: string;
   terminalFontSize: number;
@@ -90,6 +97,7 @@ function applySettings(state: {
   }
   applyTerminalFont(state.terminalFontFamily, state.terminalFontSize);
   document.documentElement.lang = normalizeLocale(state.language) === 'zh' ? 'zh-CN' : 'en';
+  document.documentElement.dataset.accent = resolveAccentColor(state.accentColor);
   document.documentElement.classList.toggle('enso-chat-wide', Boolean(state.chatWide));
 }
 
@@ -105,6 +113,7 @@ function clampNumber(value: number, min: number, max: number, fallback: number):
 
 const initialState = {
   theme: 'system' as Theme,
+  accentColor: DEFAULT_ACCENT_COLOR,
   language: getDefaultLocale(),
   terminalTheme: 'Dracula',
   terminalFontSize: 14,
@@ -138,10 +147,14 @@ const initialState = {
   openChangesOnFileEdit: false,
   compactReadOnlyTools: true,
   expandLiveEdits: true,
+  expandLiveReasoning: true,
   autoCollapseTurns: false,
+  collapseCompletedActivity: true,
+  pinUnfinishedTodos: true,
   chatWide: false,
   notifyMainAgentOnly: true,
   maxActiveCoworkers: DEFAULT_MAX_ACTIVE_COWORKERS,
+  sshTimeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
   generationStallTimeoutMin: 0,
   autoArchiveIdleDays: DEFAULT_AUTO_ARCHIVE_IDLE_DAYS,
   autoArchiveMergedWorktrees: false,
@@ -183,6 +196,8 @@ const initialState = {
   subagentModels: [] as import('@shared/types').SubagentModelEntry[],
   disabledBuiltinAgentTypes: [] as string[],
   disabledBuiltinTools: [...DEFAULT_DISABLED_BUILTIN_TOOLS] as string[],
+  disabledWorkflowPresets: [] as string[],
+  subagentAllowedModes: ['task', 'coworker'] as import('@shared/types/agent').AgentMode[],
   onboarded: false,
   keybindings: {} as Record<string, string>,
   projects: [] as import('@shared/types').Project[],
@@ -216,6 +231,11 @@ export const useSettingsStore = create<SettingsState>()(
           applyAppTheme(theme, terminalTheme);
         }
         set({ theme });
+      },
+
+      setAccentColor: (accentColor) => {
+        document.documentElement.dataset.accent = accentColor;
+        set({ accentColor });
       },
 
       setLanguage: (language) => {
@@ -285,7 +305,11 @@ export const useSettingsStore = create<SettingsState>()(
       setOpenChangesOnFileEdit: (openChangesOnFileEdit) => set({ openChangesOnFileEdit }),
       setCompactReadOnlyTools: (compactReadOnlyTools) => set({ compactReadOnlyTools }),
       setExpandLiveEdits: (expandLiveEdits) => set({ expandLiveEdits }),
+      setExpandLiveReasoning: (expandLiveReasoning) => set({ expandLiveReasoning }),
       setAutoCollapseTurns: (autoCollapseTurns) => set({ autoCollapseTurns }),
+      setCollapseCompletedActivity: (collapseCompletedActivity) =>
+        set({ collapseCompletedActivity }),
+      setPinUnfinishedTodos: (pinUnfinishedTodos) => set({ pinUnfinishedTodos }),
       setChatWide: (chatWide) => {
         document.documentElement.classList.toggle('enso-chat-wide', chatWide);
         set({ chatWide });
@@ -293,6 +317,8 @@ export const useSettingsStore = create<SettingsState>()(
       setNotifyMainAgentOnly: (notifyMainAgentOnly) => set({ notifyMainAgentOnly }),
       setMaxActiveCoworkers: (value) =>
         set({ maxActiveCoworkers: normalizeMaxActiveCoworkers(value) }),
+      setSshTimeoutSeconds: (value) =>
+        set({ sshTimeoutSeconds: normalizeSshTimeoutSeconds(value) }),
       setGenerationStallTimeoutMin: (minutes) =>
         set({
           generationStallTimeoutMin: Number.isFinite(minutes)
@@ -617,6 +643,16 @@ export const useSettingsStore = create<SettingsState>()(
             : [...new Set([...state.disabledBuiltinTools, id])],
         })),
 
+      toggleWorkflowPreset: (id, enabled) =>
+        set((state) => ({
+          disabledWorkflowPresets: enabled
+            ? state.disabledWorkflowPresets.filter((n) => n !== id)
+            : [...new Set([...state.disabledWorkflowPresets, id])],
+        })),
+
+      setSubagentAllowedModes: (modes) =>
+        set({ subagentAllowedModes: normalizeSubagentAllowedModes(modes) }),
+
       setOnboarded: (onboarded) => set({ onboarded }),
 
       setKeybinding: (action, binding) =>
@@ -818,6 +854,22 @@ export const useSettingsStore = create<SettingsState>()(
         }));
       },
 
+      setProjectSubagentAllowedModes: (projectId, modes) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!modes) {
+              const { subagentAllowedModes: _removed, ...rest } = project;
+              return rest;
+            }
+            return {
+              ...project,
+              subagentAllowedModes: normalizeSubagentAllowedModes(modes),
+            };
+          }),
+        }));
+      },
+
       removeProject: async (id) => {
         const projection = await window.electronAPI.sourceAuthority.read();
         const project = projection.projects.find(
@@ -878,6 +930,10 @@ export const useSettingsStore = create<SettingsState>()(
         if (smartCompactMode !== s.smartCompactMode) {
           useSettingsStore.setState({ smartCompactMode });
         }
+        const accentColor = resolveAccentColor(s.accentColor);
+        if (accentColor !== s.accentColor) {
+          useSettingsStore.setState({ accentColor });
+        }
         const segments = normalizeStatusLineSegments(s.statusLineSegments);
         if (
           segments.length !== s.statusLineSegments?.length ||
@@ -892,6 +948,10 @@ export const useSettingsStore = create<SettingsState>()(
         const maxActiveCoworkers = normalizeMaxActiveCoworkers(s.maxActiveCoworkers);
         if (maxActiveCoworkers !== s.maxActiveCoworkers) {
           useSettingsStore.setState({ maxActiveCoworkers });
+        }
+        const sshTimeoutSeconds = normalizeSshTimeoutSeconds(s.sshTimeoutSeconds);
+        if (sshTimeoutSeconds !== s.sshTimeoutSeconds) {
+          useSettingsStore.setState({ sshTimeoutSeconds });
         }
         const autoArchiveIdleDays = normalizeAutoArchiveIdleDays(s.autoArchiveIdleDays);
         if (autoArchiveIdleDays !== s.autoArchiveIdleDays) {
@@ -927,7 +987,7 @@ export const useSettingsStore = create<SettingsState>()(
 type ProjectEntry = SettingsState['projects'][number];
 
 /**
- * 投影里没有的字段：别名、分组、项目级默认模型/内置工具只存在于渲染侧设置。
+ * 投影里没有的字段：别名、分组、项目级默认模型/内置工具与 Agent 模式只存在于渲染侧设置。
  * 重建 projects 时不原样带回就会被 source-authority 广播抹掉（新建对话必定触发一次广播）。
  */
 const LOCAL_PROJECT_KEYS = [
@@ -937,6 +997,7 @@ const LOCAL_PROJECT_KEYS = [
   'defaultReasoningEnabled',
   'defaultThinkingLevel',
   'disabledBuiltinTools',
+  'subagentAllowedModes',
 ] as const satisfies readonly (keyof ProjectEntry)[];
 
 function localProjectFields(previous: ProjectEntry | undefined): Partial<ProjectEntry> {
